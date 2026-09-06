@@ -272,8 +272,10 @@ function escapeMarkdownLabel(name: string): string {
  * comp-bar of [attach] [mode chip] … [assignee] [send]. The mode chip is a
  * borderless filled control carrying the pending mode's hue; the composer chrome
  * itself stays neutral. Cmd/Ctrl+. and Shift+Tab cycle modes (captured before
- * Lexical); Cmd/Ctrl+Enter posts via the editor's native onSubmit; plain Enter
- * stays a newline / next list item. Pasted or dropped images upload through
+ * Lexical); Enter posts via the editor's native onSubmit (Cmd/Ctrl+Enter posts
+ * too, and keeps working while the mention list is open); Shift+Enter is the
+ * newline / next list item. An IME's commit keystroke never sends. Pasted or
+ * dropped images upload through
  * `onAttachImage` (or the `onImageUpload` fallback) and land inline at the
  * caret via the editor's image plugin; non-image files render as shadcn
  * base/attachment chips (kind icon · name · size, remove ×, uploading/error
@@ -1059,7 +1061,7 @@ export function TaskChatComposer({
                     ? "Waiting for upload to finish"
                     : uploadFailed
                       ? "Remove the failed attachment to send"
-                      : "Send (⌘+Enter)"
+                      : "Send (Enter · Shift+Enter for a new line)"
               }
               aria-label={
                 queuedEdit

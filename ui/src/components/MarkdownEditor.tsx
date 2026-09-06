@@ -1304,10 +1304,14 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
           }}
           onBlur={() => onBlur?.()}
           onKeyDown={(event) => {
-            if (onSubmit && event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
-              event.preventDefault();
-              onSubmit();
-            }
+            if (!onSubmit || event.key !== "Enter") return;
+            // Never submit mid-composition: an IME commits its candidate with Enter,
+            // and that keydown must reach the input, not the send button.
+            if (event.nativeEvent.isComposing) return;
+            // Shift+Enter stays a newline.
+            if (event.shiftKey) return;
+            event.preventDefault();
+            onSubmit();
           }}
           className={cn(
             "min-h-(--sz-12rem) w-full resize-none bg-transparent px-3 pb-3 pt-2 font-mono text-sm leading-6 outline-none",
@@ -1329,7 +1333,7 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
       )}
       onKeyDownCapture={(e) => {
         if (readOnly) return;
-        // Cmd/Ctrl+Enter to submit
+        // Cmd/Ctrl+Enter always submits, even while the mention list is open.
         if (onSubmit && e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
           e.preventDefault();
           e.stopPropagation();
@@ -1383,6 +1387,18 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
               return;
             }
           }
+          // Mention list is open: Enter belongs to it, never to submit.
+          if (e.key === "Enter") return;
+        }
+
+        // Plain Enter submits (chat convention, matches the board composer).
+        // Runs last so the mention list above keeps first claim on Enter.
+        if (onSubmit && e.key === "Enter" && !e.shiftKey && !e.altKey) {
+          // An IME commits its candidate with Enter — that keystroke is not a send.
+          if (e.nativeEvent.isComposing) return;
+          e.preventDefault();
+          e.stopPropagation();
+          onSubmit();
         }
       }}
       onDragEnter={(evt) => {
