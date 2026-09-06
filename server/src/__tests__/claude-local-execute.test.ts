@@ -456,6 +456,7 @@ describe("claude execute", () => {
         runtime: { sessionId: "11111111-1111-4111-8111-111111111111", sessionParams: null, sessionDisplayId: null, taskKey: null },
         config: {
           engine: "cli",
+          resumeSessions: true,
           command: commandPath,
           cwd: workspace,
           env: { PAPERCLIP_TEST_CAPTURE_PATH: capturePath },
@@ -470,6 +471,38 @@ describe("claude execute", () => {
       const captured = JSON.parse(await fs.readFile(capturePath, "utf-8"));
       expect(captured.argv).not.toContain("--append-system-prompt-file");
       expect(captured.argv).toContain("--resume");
+    } finally {
+      restore();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not resume a local session when resumeSessions is not enabled", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-exec-resume-off-"));
+    const { workspace, commandPath, capturePath, restore } = await setupExecuteEnv(root);
+    const logs: string[] = [];
+    try {
+      await execute({
+        runId: "run-resume-off",
+        agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: { engine: "cli" } },
+        runtime: { sessionId: "11111111-1111-4111-8111-111111111111", sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: {
+          engine: "cli",
+          command: commandPath,
+          cwd: workspace,
+          env: { PAPERCLIP_TEST_CAPTURE_PATH: capturePath },
+          promptTemplate: "Do work.",
+        },
+        context: {},
+        authToken: "tok",
+        onLog: async (_stream, chunk) => {
+          logs.push(chunk);
+        },
+        onMeta: async () => {},
+      });
+      const captured = JSON.parse(await fs.readFile(capturePath, "utf-8"));
+      expect(captured.argv).not.toContain("--resume");
+      expect(logs.join("")).toContain("adapterConfig.resumeSessions is not enabled");
     } finally {
       restore();
       await fs.rm(root, { recursive: true, force: true });
@@ -526,6 +559,7 @@ describe("claude execute", () => {
         runtime: { sessionId: "11111111-1111-4111-8111-111111111111", sessionParams: null, sessionDisplayId: null, taskKey: null },
         config: {
           engine: "cli",
+          resumeSessions: true,
           command: commandPath,
           cwd: workspace,
           env: {},
@@ -559,6 +593,7 @@ describe("claude execute", () => {
         runtime: { sessionId: "11111111-1111-4111-8111-111111111111", sessionParams: null, sessionDisplayId: null, taskKey: null },
         config: {
           engine: "cli",
+          resumeSessions: true,
           command: commandPath,
           cwd: workspace,
           env: {
@@ -1116,6 +1151,7 @@ describe("claude execute", () => {
         },
         config: {
           engine: "cli",
+          resumeSessions: true,
           command: commandPath,
           cwd: workspace,
           instructionsFilePath: instructionsPath,
@@ -1157,6 +1193,7 @@ describe("claude execute", () => {
         },
         config: {
           engine: "cli",
+          resumeSessions: true,
           command: commandPath,
           cwd: workspace,
           instructionsFilePath: instructionsPath,
@@ -1603,6 +1640,7 @@ describe("claude execute", () => {
         runtime: { sessionId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", sessionParams: null, sessionDisplayId: null, taskKey: null },
         config: {
           engine: "cli",
+          resumeSessions: true,
           command: commandPath,
           cwd: workspace,
           env: {
@@ -1699,6 +1737,7 @@ describe("claude execute", () => {
         },
         config: {
           engine: "cli",
+          resumeSessions: true,
           command: commandPath,
           cwd: workspace,
           env: { PAPERCLIP_TEST_CAPTURE_PATH: capturePath },

@@ -436,6 +436,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const chrome = asBoolean(config.chrome, false);
   const maxTurns = asNumber(config.maxTurnsPerRun, 0);
   const dangerouslySkipPermissions = asBoolean(config.dangerouslySkipPermissions, true);
+  // Per-agent opt-in: resume the saved Claude session on later heartbeats.
+  // Off by default so agents that have not been enabled keep starting fresh.
+  const resumeSessions = asBoolean(config.resumeSessions, false);
+  const resumeSessionsIsMistyped =
+    config.resumeSessions !== undefined && typeof config.resumeSessions !== "boolean";
   const configEnv = parseObject(config.env);
   const workspaceContext = parseObject(context.paperclipWorkspace);
   const workspaceCwd = asString(workspaceContext.cwd, "");
@@ -773,6 +778,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : runtimeMcpServerIdentity === runtimeMcpIdentity;
   const isValidUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(runtimeSessionId);
   const canResumeSession =
+    resumeSessions &&
     runtimeSessionId.length > 0 &&
     isValidUuid &&
     hasMatchingPromptBundle &&
@@ -784,6 +790,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }) &&
     adapterExecutionTargetSessionMatches(runtimeRemoteExecution, runtimeExecutionTarget);
   const sessionId = canResumeSession ? runtimeSessionId : null;
+  if (resumeSessionsIsMistyped) {
+    await onLog(
+      "stderr",
+      `[paperclip] adapterConfig.resumeSessions must be a JSON boolean; got ${typeof config.resumeSessions}. Treating it as false.\n`,
+    );
+  }
+  if (runtimeSessionId && isValidUuid && !resumeSessions) {
+    await onLog(
+      "stdout",
+      "[paperclip] Saved Claude session ignored: adapterConfig.resumeSessions is not enabled for this agent.\n",
+    );
+  }
   if (runtimeSessionId && !isValidUuid) {
     await onLog(
       "stdout",
@@ -792,6 +810,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
   if (
     executionTargetIsRemote &&
+    resumeSessions &&
     runtimeSessionId &&
     isValidUuid &&
     !canResumeSession
@@ -810,10 +829,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       "stdout",
       `[paperclip] Claude session "${runtimeSessionId}" does not match the current remote execution identity and will not be resumed in "${effectiveExecutionCwd}". Starting a fresh remote session.\n`,
     );
-  } else if (runtimeSessionId && isValidUuid && !canResumeSession) {
+  } else if (
+    resumeSessions &&
+    runtimeSessionId &&
+    isValidUuid &&
+    !canResumeSession &&
+    hasMatchingPromptBundle &&
+    hasMatchingMcpServers
+  ) {
     await onLog(
       "stdout",
-      `[paperclip] Claude session "${runtimeSessionId}" was saved for cwd "${runtimeSessionCwd}" and will not be resumed in "${effectiveExecutionCwd}".\n`,
+      `[paperclip] Claude session "${runtimeSessionId}" does not match the current execution target and will not be resumed in "${effectiveExecutionCwd}".\n`,
     );
   }
   if (runtimeSessionId && runtimePromptBundleKey.length > 0 && runtimePromptBundleKey !== promptBundle.bundleKey) {
