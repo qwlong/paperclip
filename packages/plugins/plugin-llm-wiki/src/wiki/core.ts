@@ -1,4 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import type { Agent, AgentSessionEvent, Issue, IssueComment, PluginContext, PluginEvent, PluginLocalFolderEntry, Project, ToolResult, ToolRunContext } from "@paperclipai/plugin-sdk";
 import type { IssueDocument, PluginIssueOriginKind, PluginManagedRoutineResolution, PluginManagedSkillResolution } from "@paperclipai/plugin-sdk/types";
 import {
@@ -1646,8 +1648,100 @@ async function resolveSelectedProject(ctx: PluginContext, companyId: string, bin
   return ctx.projects.get(binding.resolvedId, companyId);
 }
 
+function frontmatterTitle(contents: string): string | null {
+  // Only look at a leading YAML frontmatter block, so a stray "title:" in the
+  // body cannot masquerade as the page title.
+  const block = contents.match(/^---\r?\n([\s\S]*?)\r?\n---/)?.[1];
+  if (!block) return null;
+  const value = block.match(/^title:\s*(.+?)\s*$/m)?.[1];
+  if (!value) return null;
+  return value.replace(/^["']|["']$/g, "").trim() || null;
+}
+
+// qmd prints one result as a `qmd://collection/path` line followed by indented
+// `Title:` / `Score:` lines. Paths come back relative to the indexed
+// collection, so callers add the prefix that makes them readable again.
+// Parsing is deliberately tolerant: an unrecognised line is dropped rather
+// than failing the whole query.
+// qmd resolves its index and collection config from the user's cache and
+// config directories unless told otherwise, and it only prefers a
+// project-local index when one already exists. Passing a cwd is therefore not
+// isolation: a missing or unreadable .qmd directory silently widens a query to
+// every collection on the machine, including other companies' workspaces.
+// Pinning both paths inside the company's own wiki root makes the boundary
+// hold even when the index is absent.
+export function qmdEnv(root: string, base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  return { ...base, INDEX_PATH: `${root}/.qmd/index.sqlite`, QMD_CONFIG_DIR: `${root}/.qmd` };
+}
+
+// Both wiki writers read a document, check it, then replace it whole. That
+// sequence is not atomic: two callers can interleave between the read and the
+// write, each pass its own stale-hash check, and the later write wins — so an
+// entry silently disappears while both callers are told they succeeded.
+// wiki_append_log cannot even report it, since it takes no expectedHash.
+//
+// Serialising per document closes the window. The scope this covers is exactly
+// the plugin worker, which the host spawns once per plugin rather than once per
+// company, so every write that goes through a wiki tool is ordered. It does NOT
+// order writes made outside the plugin — an agent editing the file over Bash
+// still races, and that is a reason to route writes through the tools, not a
+// claim that the file is protected.
+const documentLocks = new Map<string, Promise<unknown>>();
+
+export function documentLockKey(companyId: string, wikiId: string, spaceId: string, path: string): string {
+  return `${companyId}\u0000${wikiId}\u0000${spaceId}\u0000${path}`;
+}
+
+export async function withDocumentLock<T>(key: string, run: () => Promise<T>): Promise<T> {
+  const previous = documentLocks.get(key) ?? Promise.resolve();
+  // Swallow the predecessor's rejection here only: a failed write must not
+  // cascade into the next caller, but its own caller still sees the error.
+  const attempt = previous.catch(() => undefined).then(run);
+  const settled = attempt.catch(() => undefined);
+  documentLocks.set(key, settled);
+  try {
+    return await attempt;
+  } finally {
+    // Only the tail clears the entry. Comparing against the promise this call
+    // stored is what makes that check work: `get(key)` is always a promise, so
+    // testing it for undefined would never fire and the map would grow forever.
+    if (documentLocks.get(key) === settled) documentLocks.delete(key);
+  }
+}
+
+export function documentLockCount(): number {
+  return documentLocks.size;
+}
+
+export function parseQmdResults(
+  stdout: string,
+  limit: number,
+): Array<{ path: string; title: string | null; score: number | null }> {
+  const results: Array<{ path: string; title: string | null; score: number | null }> = [];
+  let current: { path: string; title: string | null; score: number | null } | null = null;
+  for (const line of stdout.split("\n")) {
+    const location = line.match(/^qmd:\/\/[^/]+\/(.+?)(?::\d+)?\s*(?:#[0-9a-f]+)?\s*$/);
+    if (location?.[1]) {
+      if (current) results.push(current);
+      current = { path: location[1], title: null, score: null };
+      continue;
+    }
+    if (!current) continue;
+    const title = line.match(/^\s*Title:\s*(.+?)\s*$/);
+    if (title?.[1]) current.title = title[1];
+    const score = line.match(/^\s*Score:\s*(\d+(?:\.\d+)?)%/);
+    if (score?.[1]) current.score = Number(score[1]);
+  }
+  if (current) results.push(current);
+  return results.slice(0, limit);
+}
+
 function inferTitle(path: string, contents: string): string {
-  const heading = contents.match(/^#\s+(.+)$/m)?.[1]?.trim();
+  // Frontmatter wins: pages written by maintainers carry their real (often
+  // non-ASCII) title there, while the body may open at any heading level.
+  const front = frontmatterTitle(contents);
+  if (front) return front;
+  const heading = contents.match(/^#{1,3}\s+(.+)$/m)?.[1]?.trim();
   if (heading) return heading;
   const filename = path.split("/").pop()?.replace(/\.md$/i, "") ?? path;
   return filename.replace(/[-_]+/g, " ");
@@ -1844,21 +1938,25 @@ export async function writeWikiPage(ctx: PluginContext, input: WritePageInput) {
   const space = await resolveSpace(ctx, { companyId: input.companyId, wikiId, spaceSlug: input.spaceSlug });
   const path = assertPagePath(input.path);
   assertPageWriteAllowed(path, input.writer);
-  const current = await readCurrentWithHash(ctx, input.companyId, path, space);
-  assertExpectedHash(input.expectedHash, current.hash, path);
-  await ctx.localFolders.writeTextAtomic(input.companyId, WIKI_ROOT_FOLDER_KEY, spaceRelativePath(space, path), input.contents);
-  const metadata = await upsertPageMetadata(ctx, {
-    companyId: input.companyId,
-    wikiId,
-    spaceId: space.id,
-    path,
-    contents: input.contents,
-    summary: input.summary,
-    sourceRefs: input.sourceRefs,
-    operationId: input.operationId,
+  // The hash check and the write must not be separated by another writer, or
+  // both writers pass their check and the later one silently wins.
+  return withDocumentLock(documentLockKey(input.companyId, wikiId, space.id, path), async () => {
+    const current = await readCurrentWithHash(ctx, input.companyId, path, space);
+    assertExpectedHash(input.expectedHash, current.hash, path);
+    await ctx.localFolders.writeTextAtomic(input.companyId, WIKI_ROOT_FOLDER_KEY, spaceRelativePath(space, path), input.contents);
+    const metadata = await upsertPageMetadata(ctx, {
+      companyId: input.companyId,
+      wikiId,
+      spaceId: space.id,
+      path,
+      contents: input.contents,
+      summary: input.summary,
+      sourceRefs: input.sourceRefs,
+      operationId: input.operationId,
+    });
+    await upsertWikiInstance(ctx, { companyId: input.companyId, wikiId });
+    return { status: "ok", wikiId, spaceSlug: space.slug, path, previousHash: current.hash, ...metadata };
   });
-  await upsertWikiInstance(ctx, { companyId: input.companyId, wikiId });
-  return { status: "ok", wikiId, spaceSlug: space.slug, path, previousHash: current.hash, ...metadata };
 }
 
 export async function captureWikiSource(ctx: PluginContext, input: CaptureSourceInput) {
@@ -1870,6 +1968,45 @@ export async function captureWikiSource(ctx: PluginContext, input: CaptureSource
   const rawPath = input.rawPath
     ? assertRawPath(input.rawPath)
     : assertRawPath(`raw/${new Date().toISOString().slice(0, 10)}-${slugify(title)}-${hash.slice(0, 8)}.md`);
+
+  // raw/ holds what a source actually said, before anyone distilled it, so a
+  // second capture at the same path is either the same evidence again or an
+  // attempt to rewrite it. Serialising the write would order those two cases
+  // without telling them apart; the content is what decides.
+  return withDocumentLock(documentLockKey(input.companyId, wikiId, space.id, rawPath), async () => {
+    let existing: string | null = null;
+    try {
+      existing = await ctx.localFolders.readText(input.companyId, WIKI_ROOT_FOLDER_KEY, spaceRelativePath(space, rawPath));
+    } catch {
+      existing = null;
+    }
+    if (existing !== null && contentHash(existing) !== hash) {
+      throw new Error(
+        `Refusing to overwrite captured evidence at ${rawPath}: it was already captured with different contents. Capture under a new path, or read the existing source first.`,
+      );
+    }
+    if (existing !== null) {
+      // Same bytes: the capture already happened. Report the existing source
+      // rather than writing a duplicate row for identical evidence.
+      const [row] = await ctx.db.query<{ id: string }>(
+        `SELECT id FROM ${tableName(ctx.db.namespace, "wiki_sources")}
+          WHERE company_id = $1 AND wiki_id = $2 AND space_id = $3 AND raw_path = $4
+          ORDER BY created_at DESC LIMIT 1`,
+        [input.companyId, wikiId, space.id, rawPath],
+      );
+      if (row?.id) {
+        return { status: "ok", sourceId: row.id, wikiId, spaceSlug: space.slug, rawPath, hash, title, deduplicated: true };
+      }
+    }
+    return captureWikiSourceWrite(ctx, { ...input, wikiId, space, title, hash, rawPath });
+  });
+}
+
+async function captureWikiSourceWrite(
+  ctx: PluginContext,
+  input: CaptureSourceInput & { wikiId: string; space: WikiSpace; title: string; hash: string; rawPath: string },
+) {
+  const { wikiId, space, title, hash, rawPath } = input;
   await ctx.localFolders.writeTextAtomic(input.companyId, WIKI_ROOT_FOLDER_KEY, spaceRelativePath(space, rawPath), input.contents);
   await upsertWikiInstance(ctx, { companyId: input.companyId, wikiId });
   const sourceId = randomUUID();
@@ -4082,6 +4219,57 @@ function toolCompanyId(runCtx: ToolRunContext | undefined, params: ToolParams): 
 }
 
 export async function registerWikiTools(ctx: PluginContext) {
+  // Semantic search runs out-of-process against qmd, a local markdown search
+  // engine (BM25 + vectors + LLM rerank). Two things matter here:
+  //
+  //   Isolation is physical, not filtered. The index lives inside the company's
+  //   own wiki root and qmd runs with that directory as its cwd, so one
+  //   company's query cannot reach another company's pages even if every
+  //   parameter above is wrong. A filter can be written wrong; a path cannot.
+  //
+  //   Failures are reported, never swallowed. A missing binary, a missing
+  //   index, and an empty result set are three different answers, and a
+  //   maintainer that cannot tell them apart will invent facts to fill the gap.
+  const runQmd = promisify(execFile);
+
+  const QMD_TIMEOUT_MS = 120_000;
+
+  async function qmd(root: string, args: string[]): Promise<string> {
+    try {
+      const { stdout } = await runQmd("qmd", args, {
+        cwd: root,
+        timeout: QMD_TIMEOUT_MS,
+        maxBuffer: 8 * 1024 * 1024,
+        env: qmdEnv(root),
+      });
+      return stdout;
+    } catch (error) {
+      const err = error as NodeJS.ErrnoException & { stderr?: string; killed?: boolean };
+      if (err.code === "ENOENT") {
+        throw new Error(
+          "wiki_query needs the `qmd` command on PATH and it was not found. Report this instead of falling back to reading files directly.",
+        );
+      }
+      if (err.killed) {
+        throw new Error(`qmd ${args[0]} timed out after ${QMD_TIMEOUT_MS / 1000}s in ${root}.`);
+      }
+      const detail = (err.stderr ?? err.message ?? "").trim();
+      throw new Error(`qmd ${args[0]} failed: ${detail || "no output"}`);
+    }
+  }
+
+  async function wikiRootRealPath(companyId: string): Promise<string> {
+    const status = await ctx.localFolders.status(companyId, WIKI_ROOT_FOLDER_KEY);
+    const root = status.realPath ?? status.path;
+    if (!status.configured || !root) {
+      throw new Error("The wiki root folder is not configured for this company; configure it in plugin settings first.");
+    }
+    if (!status.readable) {
+      throw new Error(`The configured wiki root is not readable: ${root}`);
+    }
+    return root;
+  }
+
   ctx.tools.register("wiki_search", {
     displayName: "Search Wiki",
     description: "Search indexed wiki page and source metadata.",
@@ -4108,6 +4296,51 @@ export async function registerWikiTools(ctx: PluginContext) {
     return {
       content: rows.length ? rows.map((row) => `${row.kind}: ${row.path}${row.title ? ` - ${row.title}` : ""}`).join("\n") : "No wiki matches found.",
       data: { companyId, wikiId, spaceSlug: space.slug, query, results: rows },
+    };
+  });
+
+  ctx.tools.register("wiki_query", {
+    displayName: "Query Wiki (semantic)",
+    description: "Semantic search over wiki page contents via a local qmd index.",
+    parametersSchema: ctx.manifest.tools?.find((tool) => tool.name === "wiki_query")?.parametersSchema ?? { type: "object" },
+  }, async (params: unknown, runCtx: ToolRunContext): Promise<ToolResult> => {
+    const input = params as ToolParams;
+    const companyId = toolCompanyId(runCtx, input);
+    const wikiId = normalizeWikiId(input.wikiId);
+    const space = await resolveSpace(ctx, { companyId, wikiId, spaceSlug: input.spaceSlug as string | null | undefined });
+    const query = requireString(input.query, "query");
+    const limit = normalizeLimit(input.limit, 10, 50);
+    const root = await wikiRootRealPath(companyId);
+
+    // Creating the index is cheap and loads no models, so it is safe to do on
+    // demand. Building embeddings is neither, which is why it stays behind an
+    // explicit refresh instead of running on every query.
+    const indexed = await ctx.localFolders
+      .list(companyId, WIKI_ROOT_FOLDER_KEY, { relativePath: ".qmd", maxEntries: 1 })
+      .then(() => true)
+      .catch(() => false);
+    if (!indexed) {
+      await qmd(root, ["init"]);
+      await qmd(root, ["collection", "add", "./wiki", "--name", "wiki"]);
+    }
+
+    const refreshed = input.refresh === true || !indexed;
+    if (refreshed) {
+      await qmd(root, ["update"]);
+      await qmd(root, ["embed"]);
+    }
+
+    // The collection is rooted at ./wiki, so qmd returns paths relative to it;
+    // re-add the prefix so every path here can be handed to wiki_read_page.
+    const results = parseQmdResults(await qmd(root, ["query", query]), limit)
+      .map((row) => ({ ...row, path: `wiki/${row.path}` }));
+    return {
+      content: results.length
+        ? results.map((row) => `${row.path}${row.title ? ` - ${row.title}` : ""}${row.score == null ? "" : ` (${row.score}%)`}`).join("\n")
+        : refreshed
+          ? "No semantic matches found."
+          : "No semantic matches found. The index may predate recent writes; retry with refresh=true.",
+      data: { companyId, wikiId, spaceSlug: space.slug, query, refreshed, results },
     };
   });
 
@@ -4219,23 +4452,30 @@ export async function registerWikiTools(ctx: PluginContext) {
     const wikiId = normalizeWikiId(input.wikiId);
     const space = await resolveSpace(ctx, { companyId, wikiId, spaceSlug: input.spaceSlug as string | null | undefined });
     const entry = requireString(input.entry, "entry");
-    let current = "";
-    try {
-      current = await ctx.localFolders.readText(companyId, WIKI_ROOT_FOLDER_KEY, spaceRelativePath(space, "wiki/log.md"));
-    } catch {
-      current = "# Log\n\nAppend-only chronological record of wiki operations.\n";
-    }
-    const next = `${current.trimEnd()}\n\n- ${new Date().toISOString()} ${entry}\n`;
-    await ctx.localFolders.writeTextAtomic(companyId, WIKI_ROOT_FOLDER_KEY, spaceRelativePath(space, "wiki/log.md"), next);
-    await upsertPageMetadata(ctx, {
-      companyId,
-      wikiId,
-      spaceId: space.id,
-      path: "wiki/log.md",
-      contents: next,
-      summary: "Append log entry",
+    // Appending is a read-modify-write of the whole log, so two overlapping
+    // callers would each append to the same snapshot and one entry would
+    // vanish while both callers were told it succeeded. This tool takes no
+    // expectedHash, so serialising is the only thing standing between a
+    // maintainer and silently losing its own note.
+    return withDocumentLock(documentLockKey(companyId, wikiId, space.id, "wiki/log.md"), async () => {
+      let current = "";
+      try {
+        current = await ctx.localFolders.readText(companyId, WIKI_ROOT_FOLDER_KEY, spaceRelativePath(space, "wiki/log.md"));
+      } catch {
+        current = "# Log\n\nAppend-only chronological record of wiki operations.\n";
+      }
+      const next = `${current.trimEnd()}\n\n- ${new Date().toISOString()} ${entry}\n`;
+      await ctx.localFolders.writeTextAtomic(companyId, WIKI_ROOT_FOLDER_KEY, spaceRelativePath(space, "wiki/log.md"), next);
+      await upsertPageMetadata(ctx, {
+        companyId,
+        wikiId,
+        spaceId: space.id,
+        path: "wiki/log.md",
+        contents: next,
+        summary: "Append log entry",
+      });
+      return { content: "Appended log entry", data: { companyId, wikiId, spaceSlug: space.slug, hash: contentHash(next) } };
     });
-    return { content: "Appended log entry", data: { companyId, wikiId, spaceSlug: space.slug, hash: contentHash(next) } };
   });
 
   ctx.tools.register("wiki_update_index", {

@@ -333,6 +333,22 @@ const manifest: PaperclipPluginManifestV1 = {
       }
     },
     {
+      name: "wiki_query",
+      displayName: "Query Wiki (semantic)",
+      description: "Semantic search over wiki page contents via a local qmd index. Use this when you do not know a page's title — it matches meaning, not spelling, and works for non-ASCII content that wiki_search cannot match. Slower and heavier than wiki_search (seconds, loads local models), so prefer wiki_search when you already know roughly what the page is called. Set refresh=true after writing pages, otherwise results reflect the last index build.",
+      parametersSchema: {
+        type: "object",
+        properties: {
+          wikiId: { type: "string" },
+          spaceSlug: { type: "string" },
+          query: { type: "string" },
+          limit: { type: "number" },
+          refresh: { type: "boolean" }
+        },
+        required: ["wikiId", "query"]
+      }
+    },
+    {
       name: "wiki_read_page",
       displayName: "Read Wiki Page",
       description: "Read a markdown wiki page from one wiki space. Operation agents should pass the issue's spaceSlug; omitting it uses the default space.",

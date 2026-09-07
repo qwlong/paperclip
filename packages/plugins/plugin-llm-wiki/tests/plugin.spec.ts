@@ -31,6 +31,7 @@ import {
 import { SettingsPage, SidebarLink, WikiPage, WikiRouteSidebar } from "../src/ui/index.js";
 import plugin from "../src/worker.js";
 import { OPERATION_ORIGIN_KIND, type WikiSkillResource } from "../src/wiki.js";
+import { documentLockCount, parseQmdResults, qmdEnv, withDocumentLock } from "../src/wiki/core.js";
 
 const COMPANY_ID = "11111111-1111-4111-8111-111111111111";
 const OTHER_COMPANY_ID = "99999999-9999-4999-8999-999999999999";
@@ -707,6 +708,7 @@ describe("LLM Wiki plugin scaffold", () => {
     }
     expect(manifest.tools?.map((tool) => tool.name)).toEqual([
       "wiki_search",
+      "wiki_query",
       "wiki_read_page",
       "wiki_write_page",
       "wiki_propose_patch",
@@ -3485,6 +3487,329 @@ Duplicate headings receive stable suffixes.
     expect(files.get("wiki/concepts/plugin-boundaries.md")).toContain("Plugin Boundaries");
     expect(harness.dbExecutes.some((execute) => execute.sql.includes("wiki_pages"))).toBe(true);
     expect(harness.dbExecutes.some((execute) => execute.sql.includes("wiki_page_revisions"))).toBe(true);
+  });
+
+  // A page's title is what search matches on, so deriving it from the filename
+  // silently makes every non-ASCII page unfindable: the slug is ASCII even when
+  // the page is not. Maintainer-written pages carry their real title in
+  // frontmatter and often open at "##", so both must be honoured.
+  it("derives page titles from frontmatter, then any heading, then the filename", async () => {
+    const cases = [
+      {
+        name: "frontmatter wins over a body heading",
+        path: "wiki/facts/mem84-baidu-referral.md",
+        contents: "---\ntitle: 假设：搜一搜关注可能是百度推广的延迟兑现（未验证）\nstatus: hypothesis\n---\n\n## 结论\n\n正文。\n",
+        expected: "假设：搜一搜关注可能是百度推广的延迟兑现（未验证）",
+      },
+      {
+        name: "a quoted frontmatter title is unquoted",
+        path: "wiki/facts/quoted.md",
+        contents: '---\ntitle: "纪念宝 worship"\n---\n\n正文。\n',
+        expected: "纪念宝 worship",
+      },
+      {
+        name: "a level-two heading is used when there is no frontmatter title",
+        path: "wiki/concepts/no-frontmatter.md",
+        contents: "## 二级标题也算\n\n正文。\n",
+        expected: "二级标题也算",
+      },
+      {
+        name: "a title-looking line in the body is not mistaken for frontmatter",
+        path: "wiki/concepts/body-title.md",
+        contents: "# Real Heading\n\ntitle: not the title\n",
+        expected: "Real Heading",
+      },
+      {
+        name: "the filename is the last resort",
+        path: "wiki/concepts/last-resort_page.md",
+        contents: "no heading, no frontmatter\n",
+        expected: "last resort page",
+      },
+    ];
+
+    for (const testCase of cases) {
+      const harness = createTestHarness({ manifest });
+      harness.ctx.localFolders.readText = async () => {
+        throw new Error("missing");
+      };
+      harness.ctx.localFolders.writeTextAtomic = async () =>
+        harness.ctx.localFolders.status(COMPANY_ID, "wiki-root");
+      await plugin.definition.setup(harness.ctx);
+
+      await harness.executeTool("wiki_write_page", {
+        wikiId: "default",
+        path: testCase.path,
+        contents: testCase.contents,
+      }, { companyId: COMPANY_ID });
+
+      const upsert = harness.dbExecutes.find((execute) => execute.sql.includes("wiki_pages"));
+      expect(upsert, testCase.name).toBeDefined();
+      expect(upsert?.params, testCase.name).toEqual(expect.arrayContaining([testCase.expected]));
+    }
+  });
+
+  // wiki_query shells out, so its failure modes are the interesting part: a
+  // maintainer that cannot tell "no matches" from "the search engine is not
+  // installed" will quietly fall back to guessing.
+  it("parses qmd output and reports every failure mode distinctly", () => {
+    const stdout = [
+      "qmd://wiki/facts/mem84-baidu.md:24 #7d62eb",
+      "   Title: 假设：搜一搜关注可能是百度推广的延迟兑现（未验证）",
+      "   Score:  96%",
+      "",
+      "qmd://wiki/facts/mem2-superseded.md #d0ec45",
+      "   Title: 【已被替代】旧结论",
+      "   Score:  50%",
+    ].join("\n");
+
+    const results = parseQmdResults(stdout, 10);
+    expect(results).toEqual([
+      { path: "facts/mem84-baidu.md", title: "假设：搜一搜关注可能是百度推广的延迟兑现（未验证）", score: 96 },
+      { path: "facts/mem2-superseded.md", title: "【已被替代】旧结论", score: 50 },
+    ]);
+    // The line:number suffix and the content hash are stripped, so the path is
+    // usable as-is by wiki_read_page.
+    expect(results[0]?.path).not.toContain(":24");
+    expect(results[0]?.path).not.toContain("#");
+    // A non-ASCII title survives parsing — the whole reason this tool exists.
+    expect(results[0]?.title).toContain("百度");
+    expect(parseQmdResults(stdout, 1)).toHaveLength(1);
+    expect(parseQmdResults("", 10)).toEqual([]);
+    expect(parseQmdResults("garbage without a location line\n   Score: 99%", 10)).toEqual([]);
+  });
+
+  // Passing a cwd is not isolation. qmd falls back to a machine-wide index and
+  // config under the user's cache/config dirs, and only prefers a project-local
+  // index when one already exists — so a deleted .qmd directory would silently
+  // widen a company's query to every collection on the machine. Both paths must
+  // be pinned, for every company, on every invocation.
+  it("pins the qmd index and config inside the company's own wiki root", () => {
+    const rootA = "/instances/default/companies/aaaa/wiki-root";
+    const rootB = "/instances/default/companies/bbbb/wiki-root";
+    const base = { PATH: "/usr/bin", INDEX_PATH: "/somewhere/global/index.sqlite", QMD_CONFIG_DIR: "/somewhere/global" };
+
+    const envA = qmdEnv(rootA, base);
+    expect(envA.INDEX_PATH).toBe(`${rootA}/.qmd/index.sqlite`);
+    expect(envA.QMD_CONFIG_DIR).toBe(`${rootA}/.qmd`);
+    // An inherited global setting must not survive — that is the leak.
+    expect(envA.INDEX_PATH).not.toContain("global");
+    expect(envA.QMD_CONFIG_DIR).not.toContain("global");
+    // Everything else the process needs is still inherited.
+    expect(envA.PATH).toBe("/usr/bin");
+
+    const envB = qmdEnv(rootB, base);
+    expect(envB.INDEX_PATH).not.toBe(envA.INDEX_PATH);
+    expect(envB.QMD_CONFIG_DIR).not.toBe(envA.QMD_CONFIG_DIR);
+    expect(envB.INDEX_PATH?.startsWith(rootB)).toBe(true);
+  });
+
+  // A stale-hash check that runs before the write is not a lock. Two calls that
+  // interleave between reading and writing both pass their checks and the later
+  // write wins, so "the second sequential write was rejected" says nothing about
+  // concurrent writers. These tests pin the behaviour as it actually is, so a
+  // future claim of safety has to change them first.
+  // A stale-hash check that runs before the write is not a lock: two callers
+  // that interleave between the read and the write each pass their own check
+  // and the later write wins. Both wiki writers replace the whole document, so
+  // the fix is to serialise per document. These tests drive the interleaving
+  // deterministically — the first write is held until the second caller has
+  // entered — so they fail if the serialisation is removed rather than
+  // depending on scheduling luck.
+  it("keeps both entries when two wiki_append_log calls overlap", async () => {
+    const harness = createTestHarness({ manifest });
+    let contents = "# Log\n";
+    let reads = 0;
+    let writes = 0;
+    let markSecondEntered: () => void = () => {};
+    const secondEntered = new Promise<void>((resolve) => {
+      markSecondEntered = resolve;
+    });
+
+    harness.ctx.localFolders.readText = async () => {
+      reads += 1;
+      if (reads === 2) markSecondEntered();
+      return contents;
+    };
+    harness.ctx.localFolders.writeTextAtomic = async (_companyId, _folderKey, _relativePath, next) => {
+      writes += 1;
+      // Without the lock the second caller has already read by now and this
+      // wait resolves; with the lock it cannot have, so fall through on a tick.
+      if (writes === 1) await Promise.race([secondEntered, Promise.resolve()]);
+      contents = next;
+      return harness.ctx.localFolders.status(COMPANY_ID, "wiki-root");
+    };
+    await plugin.definition.setup(harness.ctx);
+
+    const outcomes = await Promise.all([
+      harness.executeTool("wiki_append_log", { wikiId: "default", entry: "ENTRY-A" }, { companyId: COMPANY_ID })
+        .then(() => "accepted", () => "rejected"),
+      harness.executeTool("wiki_append_log", { wikiId: "default", entry: "ENTRY-B" }, { companyId: COMPANY_ID })
+        .then(() => "accepted", () => "rejected"),
+    ]);
+
+    expect(outcomes).toEqual(["accepted", "accepted"]);
+    // Serialised: the second caller reads what the first one wrote, so nothing
+    // is lost. append_log declares no expectedHash, so a lost entry here would
+    // be undetectable by the caller.
+    expect(["ENTRY-A", "ENTRY-B"].filter((entry) => contents.includes(entry))).toEqual(["ENTRY-A", "ENTRY-B"]);
+  });
+
+  it("rejects the overlapping wiki_write_page instead of overwriting it", async () => {
+    const harness = createTestHarness({ manifest });
+    const path = "wiki/concepts/overlap.md";
+    let contents: string | null = null;
+    harness.ctx.localFolders.readText = async () => {
+      if (contents == null) throw new Error("missing");
+      return contents;
+    };
+    harness.ctx.localFolders.writeTextAtomic = async (_companyId, _folderKey, _relativePath, next) => {
+      contents = next;
+      return harness.ctx.localFolders.status(COMPANY_ID, "wiki-root");
+    };
+    await plugin.definition.setup(harness.ctx);
+
+    const seedHash = await harness
+      .executeTool<{ data?: { hash: string } }>("wiki_write_page", { wikiId: "default", path, contents: "v1" }, { companyId: COMPANY_ID })
+      .then((result) => result.data?.hash);
+    expect(seedHash).toHaveLength(64);
+
+    // Both writers carry the hash that was current when they read. Serialised,
+    // the first one lands and the second one's hash is now stale, so it is
+    // refused rather than silently overwriting the first writer's page.
+    const outcomes = await Promise.all([
+      harness.executeTool("wiki_write_page", { wikiId: "default", path, contents: "v2-from-A", expectedHash: seedHash }, { companyId: COMPANY_ID })
+        .then(() => "accepted", (error: unknown) => (error instanceof Error && error.message.includes("Refusing to overwrite") ? "rejected" : `unexpected: ${String(error)}`)),
+      harness.executeTool("wiki_write_page", { wikiId: "default", path, contents: "v2-from-B", expectedHash: seedHash }, { companyId: COMPANY_ID })
+        .then(() => "accepted", (error: unknown) => (error instanceof Error && error.message.includes("Refusing to overwrite") ? "rejected" : `unexpected: ${String(error)}`)),
+    ]);
+
+    expect(outcomes.filter((outcome) => outcome === "accepted")).toHaveLength(1);
+    expect(outcomes.filter((outcome) => outcome === "rejected")).toHaveLength(1);
+    expect(contents === "v2-from-A" || contents === "v2-from-B").toBe(true);
+  });
+
+  // The map must not grow one entry per document written, for the lifetime of
+  // the worker. Only the tail clears the entry, which is why the check compares
+  // promise identity rather than testing for undefined.
+  it("does not leak a lock entry per document", async () => {
+    const before = documentLockCount();
+    await Promise.all([
+      withDocumentLock("doc-a", async () => "ok"),
+      withDocumentLock("doc-a", async () => "ok"),
+      withDocumentLock("doc-b", async () => "ok"),
+      withDocumentLock("doc-c", async () => {
+        throw new Error("write failed");
+      }).catch(() => "handled"),
+    ]);
+    expect(documentLockCount()).toBe(before);
+  });
+
+  // raw/ is the evidence layer: what a source actually said, before anyone
+  // distilled it. Serialising writes to it is not enough — two serialised
+  // writers still leave the second one silently replacing the first one's
+  // evidence. The semantics that matter are about the content, not the order:
+  //
+  //   same path + same content      → idempotent, and no second source row
+  //   same path + different content → refused; evidence is not rewritten
+  //
+  // A path generated by the plugin already carries the content hash, so it can
+  // only ever collide with an identical capture.
+  describe("captureWikiSource same-path semantics", () => {
+    function harnessWithFiles() {
+      const harness = createTestHarness({ manifest });
+      const files = new Map<string, string>();
+      harness.ctx.localFolders.readText = async (_companyId, _folderKey, relativePath) => {
+        const value = files.get(relativePath);
+        if (value == null) throw new Error("missing");
+        return value;
+      };
+      harness.ctx.localFolders.writeTextAtomic = async (_companyId, _folderKey, relativePath, contents) => {
+        files.set(relativePath, contents);
+        return harness.ctx.localFolders.status(COMPANY_ID, "wiki-root");
+      };
+      return { harness, files };
+    }
+
+    const sourceRows = (harness: ReturnType<typeof createTestHarness>) =>
+      harness.dbExecutes.filter((execute) => execute.sql.includes("wiki_sources"));
+
+    it("is idempotent for the same path and the same contents", async () => {
+      const { harness, files } = harnessWithFiles();
+      // The harness returns [] for every query, which would send an identical
+      // capture down the insert path. Return the existing row so the
+      // deduplication branch is the one under test.
+      harness.ctx.db.query = (async (sql: string) =>
+        sql.includes("wiki_sources") ? [{ id: "existing-source-id" }] : []) as typeof harness.ctx.db.query;
+      await plugin.definition.setup(harness.ctx);
+      const params = { wikiId: "default", rawPath: "raw/2026-09-07-note.md", contents: "evidence body", title: "note" };
+
+      await harness.performAction("capture-source", { ...params, companyId: COMPANY_ID });
+      const writesAfterFirst = [...files.keys()].length;
+      const rowsAfterFirst = sourceRows(harness).length;
+
+      const second = await harness.performAction<{ sourceId: string; deduplicated?: boolean }>(
+        "capture-source",
+        { ...params, companyId: COMPANY_ID },
+      );
+
+      expect(files.get("raw/2026-09-07-note.md")).toBe("evidence body");
+      expect([...files.keys()]).toHaveLength(writesAfterFirst);
+      // The repeat reports the capture that already exists instead of writing
+      // a second row for identical bytes.
+      expect(second.deduplicated).toBe(true);
+      expect(second.sourceId).toBe("existing-source-id");
+      expect(sourceRows(harness)).toHaveLength(rowsAfterFirst);
+    });
+
+    it("refuses to replace captured evidence at the same path with different contents", async () => {
+      const { harness, files } = harnessWithFiles();
+      await plugin.definition.setup(harness.ctx);
+      await harness.performAction("capture-source", {
+        companyId: COMPANY_ID,
+        wikiId: "default",
+        rawPath: "raw/2026-09-07-note.md",
+        contents: "original evidence",
+        title: "note",
+      });
+
+      await expect(
+        harness.performAction("capture-source", {
+          companyId: COMPANY_ID,
+          wikiId: "default",
+          rawPath: "raw/2026-09-07-note.md",
+          contents: "rewritten evidence",
+          title: "note",
+        }),
+      ).rejects.toThrow(/already captured|different contents/i);
+
+      // The point of the refusal: the first capture is still there.
+      expect(files.get("raw/2026-09-07-note.md")).toBe("original evidence");
+    });
+  });
+
+  it("refuses to run wiki_query when the wiki root is not configured", async () => {
+    const harness = createTestHarness({ manifest });
+    harness.ctx.localFolders.status = async () => ({
+      folderKey: "wiki-root",
+      configured: false,
+      path: null,
+      realPath: null,
+      access: "readWrite" as const,
+      readable: false,
+      writable: false,
+      requiredDirectories: [],
+      requiredFiles: [],
+      missingDirectories: [],
+      missingFiles: [],
+      healthy: false,
+      problems: [],
+      checkedAt: new Date().toISOString(),
+    });
+    await plugin.definition.setup(harness.ctx);
+
+    await expect(
+      harness.executeTool("wiki_query", { wikiId: "default", query: "百度止损线" }, { companyId: COMPANY_ID }),
+    ).rejects.toThrow("not configured");
   });
 
   // The company a wiki tool acts on comes from the agent run context that the
