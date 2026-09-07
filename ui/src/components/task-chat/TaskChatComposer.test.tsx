@@ -226,7 +226,7 @@ function typeText(value: string) {
 
 function pressKey(
   key: string,
-  modifiers: { metaKey?: boolean; ctrlKey?: boolean; shiftKey?: boolean } = {},
+  modifiers: { metaKey?: boolean; ctrlKey?: boolean; shiftKey?: boolean; isComposing?: boolean } = {},
 ) {
   flushSync(() => {
     editable().dispatchEvent(
@@ -386,13 +386,39 @@ describe("TaskChatComposer", () => {
     expect(onAdd).toHaveBeenCalledWith("hello", undefined, undefined);
   });
 
-  it("does not submit on plain Enter or Shift+Enter (newline stays with the editor)", async () => {
+  it("submits on plain Enter", async () => {
     const onAdd = vi.fn().mockResolvedValue(undefined);
     render(<TaskChatComposer onAdd={onAdd} workMode="standard" />);
 
     typeText("line one");
     pressKey("Enter");
+    await flushAsync();
+    await flushAsync();
+
+    expect(onAdd).toHaveBeenCalledWith("line one", undefined, undefined);
+    expect(editable().textContent).toBe("");
+  });
+
+  it("does not submit on Shift+Enter (newline stays with the editor)", async () => {
+    const onAdd = vi.fn().mockResolvedValue(undefined);
+    render(<TaskChatComposer onAdd={onAdd} workMode="standard" />);
+
+    typeText("line one");
     pressKey("Enter", { shiftKey: true });
+    await flushAsync();
+
+    expect(onAdd).not.toHaveBeenCalled();
+    expect(editable().textContent).toBe("line one");
+  });
+
+  // An IME commits a candidate with Enter. Sending there would cut a CJK word
+  // in half mid-composition, so the composing keystroke must never post.
+  it("does not submit on the Enter that commits an IME composition", async () => {
+    const onAdd = vi.fn().mockResolvedValue(undefined);
+    render(<TaskChatComposer onAdd={onAdd} workMode="standard" />);
+
+    typeText("line one");
+    pressKey("Enter", { isComposing: true });
     await flushAsync();
 
     expect(onAdd).not.toHaveBeenCalled();
