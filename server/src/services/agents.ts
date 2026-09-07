@@ -22,6 +22,7 @@ import {
   getAgentWorkEligibility,
   isUuidLike,
   normalizeAgentApiKeyScope,
+  hasNonAsciiContent,
   normalizeAgentUrlKey,
   type AgentEligibilityAgent,
   type AgentApiKeyScope,
@@ -298,10 +299,17 @@ export function hasAgentShortnameCollision(
 ): boolean {
   const candidateShortname = normalizeAgentUrlKey(candidateName);
   if (!candidateShortname) return false;
+  // A name carrying non-ASCII content gets a short-id suffix in deriveAgentUrlKey,
+  // so its url key is unique by construction and cannot collide. Comparing the
+  // stripped latin remainder instead reports a collision between names a reader
+  // sees as different: "增长 · GetMemorial" and "工程师 · GetMemorial" both
+  // normalize to "getmemorial". Projects already resolve this the same way.
+  if (hasNonAsciiContent(candidateName)) return false;
 
   return existingAgents.some((agent) => {
     if (agent.status === "terminated") return false;
     if (options?.excludeAgentId && agent.id === options.excludeAgentId) return false;
+    if (hasNonAsciiContent(agent.name)) return false;
     return normalizeAgentUrlKey(agent.name) === candidateShortname;
   });
 }

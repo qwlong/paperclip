@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { deriveAgentUrlKey } from "@paperclipai/shared";
 import { hasAgentShortnameCollision, deduplicateAgentName } from "../services/agents.ts";
 
 describe("hasAgentShortnameCollision", () => {
@@ -34,6 +35,22 @@ describe("hasAgentShortnameCollision", () => {
     ]);
     expect(collision).toBe(false);
   });
+
+  it("does not collide two non-ASCII names that share a latin remainder", () => {
+    // Both normalize to "getmemorial" once the CJK is stripped, but a reader sees
+    // two different agents and deriveAgentUrlKey gives each a short-id suffix.
+    const collision = hasAgentShortnameCollision("工程师 · GetMemorial", [
+      { id: "a1", name: "增长 · GetMemorial", status: "idle" },
+    ]);
+    expect(collision).toBe(false);
+  });
+
+  it("still collides when both names are ASCII", () => {
+    const collision = hasAgentShortnameCollision("Engineer GetMemorial", [
+      { id: "a1", name: "engineer-getmemorial", status: "idle" },
+    ]);
+    expect(collision).toBe(true);
+  });
 });
 
 describe("deduplicateAgentName", () => {
@@ -65,5 +82,30 @@ describe("deduplicateAgentName", () => {
       { id: "a1", name: "openclaw", status: "terminated" },
     ]);
     expect(name).toBe("OpenClaw");
+  });
+});
+
+describe("deriveAgentUrlKey", () => {
+  const ID_A = "e25fba85-eafd-4be4-b714-000000000001";
+  const ID_B = "e3229c92-dc46-41ad-9ee3-000000000002";
+
+  it("keeps the plain slug for an ASCII name", () => {
+    expect(deriveAgentUrlKey("Engineer GetMemorial", ID_A)).toBe("engineer-getmemorial");
+  });
+
+  it("suffixes a short id when the name carries non-ASCII content", () => {
+    expect(deriveAgentUrlKey("增长 · GetMemorial", ID_A)).toBe("getmemorial-e25fba85");
+    expect(deriveAgentUrlKey("工程师 · GetMemorial", ID_B)).toBe("getmemorial-e3229c92");
+  });
+
+  it("falls back to the short id when normalization leaves nothing", () => {
+    // Previously this returned the whole agent id, so the agent had no usable
+    // short handle at all.
+    expect(deriveAgentUrlKey("增长 · 纪念宝", ID_A)).toBe("e25fba85");
+  });
+
+  it("keeps the documented fallbacks", () => {
+    expect(deriveAgentUrlKey(null, null)).toBe("agent");
+    expect(deriveAgentUrlKey("", "Legacy Name")).toBe("legacy-name");
   });
 });
