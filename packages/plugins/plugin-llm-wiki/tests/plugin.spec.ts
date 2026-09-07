@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createTestHarness } from "@paperclipai/plugin-sdk/testing";
 import type { Agent, Issue, PluginManagedRoutineResolution, Project } from "@paperclipai/plugin-sdk";
 import manifest, {
@@ -1512,6 +1512,39 @@ Duplicate headings receive stable suffixes.
     });
   });
 
+  describe("wiki tool company authorization", () => {
+    const toolNames = [
+      "wiki_search", "wiki_read_page", "wiki_write_page", "wiki_propose_patch",
+      "wiki_list_sources", "wiki_read_source", "wiki_append_log", "wiki_update_index",
+      "wiki_list_backlinks", "wiki_list_pages",
+    ];
+
+    it.each(toolNames)("%s rejects another company's parameters before accessing storage", async (name) => {
+      const harness = createTestHarness({ manifest });
+      await plugin.definition.setup(harness.ctx);
+      const query = vi.spyOn(harness.ctx.db, "query");
+      const execute = vi.spyOn(harness.ctx.db, "execute");
+      const read = vi.spyOn(harness.ctx.localFolders, "readText");
+      const write = vi.spyOn(harness.ctx.localFolders, "writeTextAtomic");
+      await expect(harness.executeTool(name, {
+        companyId: OTHER_COMPANY_ID, wikiId: "default", query: "test",
+        path: "wiki/test.md", rawPath: "raw/test.md", contents: "test", entry: "test",
+      }, { companyId: COMPANY_ID })).rejects.toThrow("Wiki tool company does not match run context");
+      expect(query).not.toHaveBeenCalled();
+      expect(execute).not.toHaveBeenCalled();
+      expect(read).not.toHaveBeenCalled();
+      expect(write).not.toHaveBeenCalled();
+    });
+
+    it.each(toolNames)("%s rejects an empty trusted company", async (name) => {
+      const harness = createTestHarness({ manifest });
+      await plugin.definition.setup(harness.ctx);
+      await expect(harness.executeTool(name, {
+        companyId: COMPANY_ID, wikiId: "default",
+      }, { companyId: "" })).rejects.toThrow("Wiki tool requires a trusted company context");
+    });
+  });
+
   it("registers worker data, actions, and tools", async () => {
     const harness = createTestHarness({ manifest });
     await plugin.definition.setup(harness.ctx);
@@ -1526,7 +1559,7 @@ Duplicate headings receive stable suffixes.
     const pages = await harness.executeTool<{ content?: string }>("wiki_list_pages", {
       companyId: COMPANY_ID,
       wikiId: "default",
-    });
+    }, { companyId: COMPANY_ID });
     expect(pages.content).toBe("No pages indexed yet.");
   });
 
@@ -3474,7 +3507,7 @@ Duplicate headings receive stable suffixes.
       path: "wiki/concepts/plugin-boundaries.md",
       contents: "# New Title\n",
       expectedHash: "stale",
-    });
+    }, { companyId: COMPANY_ID });
     await expect(staleWrite).rejects.toThrow("Refusing to overwrite");
 
     const result = await harness.executeTool<{ data?: { hash: string } }>("wiki_write_page", {
@@ -3482,7 +3515,7 @@ Duplicate headings receive stable suffixes.
       wikiId: "default",
       path: "wiki/concepts/plugin-boundaries.md",
       contents: "# Plugin Boundaries\n\nSee [Knowledge](wiki/areas/knowledge.md).",
-    });
+    }, { companyId: COMPANY_ID });
 
     expect(result.data?.hash).toHaveLength(64);
     expect(files.get("wiki/concepts/plugin-boundaries.md")).toContain("Plugin Boundaries");
@@ -3512,7 +3545,7 @@ Duplicate headings receive stable suffixes.
       wikiId: "default",
       path: "AGENTS.md",
       contents: "# LLM Wiki Maintainer\n\nCompromised instructions.\n",
-    })).rejects.toThrow("Refusing to overwrite protected wiki control file AGENTS.md");
+    }, { companyId: COMPANY_ID })).rejects.toThrow("Refusing to overwrite protected wiki control file AGENTS.md");
 
     const result = await harness.performAction<{ hash: string }>("write-page", {
       companyId: COMPANY_ID,

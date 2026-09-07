@@ -4057,7 +4057,22 @@ export async function fileQueryAnswerAsPage(ctx: PluginContext, input: FileQuery
 }
 
 export async function registerWikiTools(ctx: PluginContext) {
-  ctx.tools.register("wiki_search", {
+  // Tool arguments are model-controlled; authorize before any storage access.
+  const register: PluginContext["tools"]["register"] = (name, declaration, handler) => {
+    ctx.tools.register(name, declaration, async (params, runCtx) => {
+      const companyId = runCtx?.companyId;
+      if (typeof companyId !== "string" || !companyId.trim()) {
+        throw new Error("Wiki tool requires a trusted company context");
+      }
+      const input = params as ToolParams | null;
+      if (!input || input.companyId !== companyId) {
+        throw new Error("Wiki tool company does not match run context");
+      }
+      return handler({ ...input, companyId }, runCtx);
+    });
+  };
+
+  register("wiki_search", {
     displayName: "Search Wiki",
     description: "Search indexed wiki page and source metadata.",
     parametersSchema: ctx.manifest.tools?.find((tool) => tool.name === "wiki_search")?.parametersSchema ?? { type: "object" },
@@ -4086,7 +4101,7 @@ export async function registerWikiTools(ctx: PluginContext) {
     };
   });
 
-  ctx.tools.register("wiki_read_page", {
+  register("wiki_read_page", {
     displayName: "Read Wiki Page",
     description: "Read a markdown wiki page from the configured local wiki root.",
     parametersSchema: ctx.manifest.tools?.find((tool) => tool.name === "wiki_read_page")?.parametersSchema ?? { type: "object" },
@@ -4100,7 +4115,7 @@ export async function registerWikiTools(ctx: PluginContext) {
     return { content: contents, data: { companyId, wikiId, spaceSlug: space.slug, path, hash: contentHash(contents) } };
   });
 
-  ctx.tools.register("wiki_write_page", {
+  register("wiki_write_page", {
     displayName: "Write Wiki Page",
     description: "Atomically write a markdown wiki page after plugin path validation.",
     parametersSchema: ctx.manifest.tools?.find((tool) => tool.name === "wiki_write_page")?.parametersSchema ?? { type: "object" },
@@ -4119,7 +4134,7 @@ export async function registerWikiTools(ctx: PluginContext) {
     return { content: `Wrote ${result.path}`, data: result };
   });
 
-  ctx.tools.register("wiki_propose_patch", {
+  register("wiki_propose_patch", {
     displayName: "Propose Wiki Patch",
     description: "Return a structured proposed page write without changing files.",
     parametersSchema: ctx.manifest.tools?.find((tool) => tool.name === "wiki_propose_patch")?.parametersSchema ?? { type: "object" },
@@ -4146,7 +4161,7 @@ export async function registerWikiTools(ctx: PluginContext) {
     };
   });
 
-  ctx.tools.register("wiki_list_sources", {
+  register("wiki_list_sources", {
     displayName: "List Wiki Sources",
     description: "Return captured raw source metadata from the plugin index.",
     parametersSchema: ctx.manifest.tools?.find((tool) => tool.name === "wiki_list_sources")?.parametersSchema ?? { type: "object" },
@@ -4170,7 +4185,7 @@ export async function registerWikiTools(ctx: PluginContext) {
     };
   });
 
-  ctx.tools.register("wiki_read_source", {
+  register("wiki_read_source", {
     displayName: "Read Wiki Source",
     description: "Read a captured raw source from the configured local wiki root.",
     parametersSchema: ctx.manifest.tools?.find((tool) => tool.name === "wiki_read_source")?.parametersSchema ?? { type: "object" },
@@ -4184,7 +4199,7 @@ export async function registerWikiTools(ctx: PluginContext) {
     return { content: contents, data: { companyId, wikiId, spaceSlug: space.slug, rawPath, hash: contentHash(contents) } };
   });
 
-  ctx.tools.register("wiki_append_log", {
+  register("wiki_append_log", {
     displayName: "Append Wiki Log",
     description: "Append a maintenance note to wiki/log.md.",
     parametersSchema: ctx.manifest.tools?.find((tool) => tool.name === "wiki_append_log")?.parametersSchema ?? { type: "object" },
@@ -4213,7 +4228,7 @@ export async function registerWikiTools(ctx: PluginContext) {
     return { content: "Appended log entry", data: { companyId, wikiId, spaceSlug: space.slug, hash: contentHash(next) } };
   });
 
-  ctx.tools.register("wiki_update_index", {
+  register("wiki_update_index", {
     displayName: "Update Wiki Index",
     description: "Atomically replace wiki/index.md with optional hash conflict checks.",
     parametersSchema: ctx.manifest.tools?.find((tool) => tool.name === "wiki_update_index")?.parametersSchema ?? { type: "object" },
@@ -4231,7 +4246,7 @@ export async function registerWikiTools(ctx: PluginContext) {
     return { content: "Updated wiki/index.md", data: result };
   });
 
-  ctx.tools.register("wiki_list_backlinks", {
+  register("wiki_list_backlinks", {
     displayName: "List Wiki Backlinks",
     description: "Return indexed backlinks for a wiki page.",
     parametersSchema: ctx.manifest.tools?.find((tool) => tool.name === "wiki_list_backlinks")?.parametersSchema ?? { type: "object" },
@@ -4255,7 +4270,7 @@ export async function registerWikiTools(ctx: PluginContext) {
     };
   });
 
-  ctx.tools.register("wiki_list_pages", {
+  register("wiki_list_pages", {
     displayName: "List Wiki Pages",
     description: "Return the known page index from plugin metadata.",
     parametersSchema: ctx.manifest.tools?.find((tool) => tool.name === "wiki_list_pages")?.parametersSchema ?? { type: "object" },
