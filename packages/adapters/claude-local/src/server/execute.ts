@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
@@ -89,6 +90,15 @@ import {
   readClaudeCommandVersion,
 } from "./cli-capabilities.js";
 import { resolveClaudeDesiredSkillNames } from "./skills.js";
+
+// Must stay byte-identical across runs: Claude Code derives part of the first
+// system block from the first user message, and any change here invalidates
+// the shared prompt-cache prefix for every agent that opted in.
+const STABLE_FRESH_SESSION_PROMPT =
+  "Paperclip heartbeat. The wake payload and task context for this run are in the file named by the " +
+  "environment variable PAPERCLIP_WAKE_PROMPT_FILE. Before doing anything else, run " +
+  "`cat \"$PAPERCLIP_WAKE_PROMPT_FILE\"` with the Bash tool, then treat its contents exactly as if " +
+  "they had been given here as the user message.";
 import { isBedrockModelId } from "./models.js";
 import { prepareClaudePromptBundle } from "./prompt-cache.js";
 import { buildClaudeExecutionPermissionArgs } from "./permissions.js";
@@ -439,6 +449,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // Per-agent opt-in: resume the saved Claude session on later heartbeats.
   // Off by default so agents that have not been enabled keep starting fresh.
   const resumeSessions = asBoolean(config.resumeSessions, false);
+  // Per-agent opt-in: skip --resume when the saved session has been idle longer
+  // than this many minutes. The Anthropic prompt cache (1h TTL) has expired by
+  // then, so resuming rewrites the whole transcript at the cache-write price.
+  // 0 keeps the previous behaviour (always resume when otherwise eligible).
+  const maxResumeIdleMinutes = asNumber(config.maxResumeIdleMinutes, 0);
+  // Per-agent opt-in: send a byte-identical stdin prompt on fresh sessions and
+  // hand the per-run wake prompt over in a file. The per-run text otherwise sits
+  // before Claude Code's only message cache breakpoint, so the CLAUDE.md block
+  // and SessionStart output are rewritten on every fresh session.
+  const stableFreshSessionPrompt = asBoolean(config.stableFreshSessionPrompt, false);
   const resumeSessionsIsMistyped =
     config.resumeSessions !== undefined && typeof config.resumeSessions !== "boolean";
   const configEnv = parseObject(config.env);
@@ -777,8 +797,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ? runtimeMcpServers.length === 0
       : runtimeMcpServerIdentity === runtimeMcpIdentity;
   const isValidUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(runtimeSessionId);
+  const runtimeSessionLastUsedMs = Date.parse(asString(runtimeSessionParams.lastUsedAt, ""));
+  const sessionIdleMinutes = Number.isFinite(runtimeSessionLastUsedMs)
+    ? (Date.now() - runtimeSessionLastUsedMs) / 60_000
+    : null;
+  const sessionIdleTooLong =
+    maxResumeIdleMinutes > 0 && sessionIdleMinutes !== null && sessionIdleMinutes > maxResumeIdleMinutes;
   const canResumeSession =
     resumeSessions &&
+    !sessionIdleTooLong &&
     runtimeSessionId.length > 0 &&
     isValidUuid &&
     hasMatchingPromptBundle &&
@@ -790,6 +817,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }) &&
     adapterExecutionTargetSessionMatches(runtimeRemoteExecution, runtimeExecutionTarget);
   const sessionId = canResumeSession ? runtimeSessionId : null;
+  if (runtimeSessionId && isValidUuid && resumeSessions && sessionIdleTooLong) {
+    await onLog(
+      "stdout",
+      `[paperclip] Claude session "${runtimeSessionId}" has been idle ${Math.round(sessionIdleMinutes ?? 0)} min (limit ${maxResumeIdleMinutes}); starting a fresh session instead of resuming.\n`,
+    );
+  }
   if (resumeSessionsIsMistyped) {
     await onLog(
       "stderr",
@@ -952,6 +985,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const runAttempt = async (resumeSessionId: string | null) => {
     const attemptInstructionsFilePath = resumeSessionId ? undefined : effectiveInstructionsFilePath;
     const args = buildClaudeArgs(resumeSessionId, attemptInstructionsFilePath);
+    let attemptStdin = prompt;
+    const attemptEnv = { ...env };
+    if (stableFreshSessionPrompt && !resumeSessionId && !executionTargetIsRemote) {
+      const wakePromptFile = path.join(
+        asString(env.PAPERCLIP_RUN_SCRATCH_DIR, "") || os.tmpdir(),
+        `paperclip-wake-prompt-${runId}.md`,
+      );
+      await fs.writeFile(wakePromptFile, prompt, "utf8");
+      attemptEnv.PAPERCLIP_WAKE_PROMPT_FILE = wakePromptFile;
+      attemptStdin = STABLE_FRESH_SESSION_PROMPT;
+    }
     const commandNotes: string[] = [];
     if (!resumeSessionId) {
       commandNotes.push(`Using stable Claude prompt bundle ${promptBundle.bundleKey}.`);
@@ -987,8 +1031,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
       cwd,
-      env,
-      stdin: prompt,
+      env: attemptEnv,
+      stdin: attemptStdin,
       timeoutSec,
       graceSec,
       onSpawn,
@@ -1165,6 +1209,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         cwd,
         promptBundleKey: promptBundle.bundleKey,
         mcpServerIdentity: runtimeMcpIdentity,
+        lastUsedAt: new Date().toISOString(),
         ...(executionTargetIsRemote
           ? {
               remoteExecution: adapterExecutionTargetSessionIdentity(runtimeExecutionTarget),
