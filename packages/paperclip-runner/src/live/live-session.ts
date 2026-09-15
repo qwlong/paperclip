@@ -924,7 +924,7 @@ export class CapabilityLiveSessionService {
               ? "aws_agentcore_harness_api"
           : input.provider === "acpx" ? "acpx_runtime" : "codex_app_server",
         providerVersion: input.provider === "opencode"
-          ? "1.18.17"
+          ? "1.18.29"
           : input.provider === "claude_managed"
             ? input.managedProfile!.agentVersion
             : input.provider === "aws_agentcore"
@@ -1550,7 +1550,6 @@ export class CapabilityLiveSession {
     // Arm the provider timeout only after bounded preflight succeeds. The
     // admission token excludes concurrent sends before this point.
     const terminal = this.#armTurnWaiter();
-    void terminal.catch(() => undefined);
     try {
       response = await admission.transport.request("turn/start", {
         threadId: this.#providerThreadId,
@@ -1996,7 +1995,7 @@ export class CapabilityLiveSession {
 
   #armTurnWaiter(): Promise<Omit<CapabilityLiveTurnResult, "snapshot">> {
     if (this.#turnWaiter !== null) throw new Error("Capability live session already has a turn waiter");
-    return new Promise<Omit<CapabilityLiveTurnResult, "snapshot">>((resolve, reject) => {
+    const terminal = new Promise<Omit<CapabilityLiveTurnResult, "snapshot">>((resolve, reject) => {
       const timer = setTimeout(() => {
         const waiter = this.#turnWaiter;
         this.#turnWaiter = null;
@@ -2011,6 +2010,13 @@ export class CapabilityLiveSession {
       }, this.#config.turnTimeoutMs);
       this.#turnWaiter = { resolve, reject, timer, assistantText: "", draftId: null };
     });
+    // A caller may await this promise only after another `await` of its own
+    // (see `reconcileActiveTurn`). The timer above can reject before that
+    // point, so attach a no-op handler here, at creation, on every call
+    // site. `.catch()` returns a new promise; the original stays rejected
+    // and a later `await terminal` still observes it.
+    terminal.catch(() => undefined);
+    return terminal;
   }
 
   /** Interrupts and durably reconciles a checkpointed active turn after restart. */
@@ -2382,7 +2388,8 @@ export class CapabilityLiveSession {
         config: createSkilllessCodexThreadConfig(this.#config.workingDirectory),
         permissions: CODEX_PERMISSION_PROFILE,
         runtimeWorkspaceRoots: [this.#config.workingDirectory],
-        baseInstructions: LIVE_BASE_INSTRUCTIONS,
+        baseInstructions:
+          this.#transportOptions.baseInstructions ?? LIVE_BASE_INSTRUCTIONS,
         persistExtendedHistory: true,
       });
       const resumedThread = record(resumed.thread);
@@ -2407,7 +2414,8 @@ export class CapabilityLiveSession {
         permissions: CODEX_PERMISSION_PROFILE,
         runtimeWorkspaceRoots: [this.#config.workingDirectory],
         approvalPolicy: "never",
-        baseInstructions: LIVE_BASE_INSTRUCTIONS,
+        baseInstructions:
+          this.#transportOptions.baseInstructions ?? LIVE_BASE_INSTRUCTIONS,
         completionContract: LIVE_COMPLETION_CONTRACT,
         dynamicTools: [
           ...tools.map(dynamicToolSpec),
