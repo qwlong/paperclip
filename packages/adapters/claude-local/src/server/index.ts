@@ -117,6 +117,11 @@ export const sessionCodec: AdapterSessionCodec = {
       readNonEmptyString(record.mcpServerIdentity) ?? readNonEmptyString(record.mcp_server_identity);
     const remoteExecution =
       readRemoteExecutionIdentity(record.remoteExecution) ?? readRemoteExecutionIdentity(record.remote_execution);
+    // Preserve the idle-resume timestamp written by execute.ts. Without it
+    // sessionIdleMinutes is always null and adapterConfig.maxResumeIdleMinutes
+    // can never fire.
+    const lastUsedAt =
+      readNonEmptyString(record.lastUsedAt) ?? readNonEmptyString(record.last_used_at);
     return {
       sessionId,
       ...(cwd ? { cwd } : {}),
@@ -126,6 +131,7 @@ export const sessionCodec: AdapterSessionCodec = {
       ...(repoRef ? { repoRef } : {}),
       ...(mcpServerIdentity ? { mcpServerIdentity } : {}),
       ...(remoteExecution ? { remoteExecution } : {}),
+      ...(lastUsedAt ? { lastUsedAt } : {}),
     };
   },
   serialize(params: Record<string, unknown> | null) {
@@ -146,6 +152,8 @@ export const sessionCodec: AdapterSessionCodec = {
       readNonEmptyString(params.mcpServerIdentity) ?? readNonEmptyString(params.mcp_server_identity);
     const remoteExecution =
       readRemoteExecutionIdentity(params.remoteExecution) ?? readRemoteExecutionIdentity(params.remote_execution);
+    const lastUsedAt =
+      readNonEmptyString(params.lastUsedAt) ?? readNonEmptyString(params.last_used_at);
     return {
       sessionId,
       ...(cwd ? { cwd } : {}),
@@ -155,6 +163,7 @@ export const sessionCodec: AdapterSessionCodec = {
       ...(repoRef ? { repoRef } : {}),
       ...(mcpServerIdentity ? { mcpServerIdentity } : {}),
       ...(remoteExecution ? { remoteExecution } : {}),
+      ...(lastUsedAt ? { lastUsedAt } : {}),
     };
   },
   getDisplayId(params: Record<string, unknown> | null) {
