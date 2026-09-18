@@ -514,6 +514,85 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     }
   });
 
+  it("does not share a git snapshot across rows with different branch metadata", async () => {
+    const seeded = await seedTerminalWorkspace();
+    const otherIssueId = randomUUID();
+    const otherWorkspaceId = randomUUID();
+    // Same working tree, different branch/base metadata: the status snapshot
+    // alone is path-dependent, but `isMergedIntoBase`/`branchName` are not, so
+    // the second row must not inherit the first row's delivery verdict.
+    await db.insert(executionWorkspaces).values({
+      id: otherWorkspaceId,
+      companyId: seeded.companyId,
+      projectId: seeded.projectId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "other-branch-row",
+      status: "active",
+      cwd: seeded.worktreePath,
+      providerRef: seeded.worktreePath,
+      providerType: "git_worktree",
+      repoUrl: "https://github.com/paperclipai/paperclip.git",
+      baseRef: "main",
+      branchName: "other-delivery",
+    });
+    await db.insert(issues).values({
+      id: otherIssueId,
+      companyId: seeded.companyId,
+      projectId: seeded.projectId,
+      identifier: `${seeded.identifier}-other`,
+      title: "Second row over the same tree with different branch metadata",
+      status: "done",
+      priority: "medium",
+      executionWorkspaceId: otherWorkspaceId,
+    });
+    await db
+      .update(executionWorkspaces)
+      .set({ sourceIssueId: otherIssueId })
+      .where(eq(executionWorkspaces.id, otherWorkspaceId));
+
+    const runSpy = vi.spyOn(workspaceGitOperationScheduler, "run");
+    const scansForPath = () =>
+      runSpy.mock.calls.filter(([input]) => {
+        const call = input as { operation?: string; workspacePath?: string };
+        return (
+          call.operation === "execution_workspaces.close_readiness_status"
+          && typeof call.workspacePath === "string"
+          && path.resolve(call.workspacePath) === path.resolve(seeded.worktreePath)
+        );
+      }).length;
+    try {
+      await svc.sweepTerminalWorkspaces();
+      expect(scansForPath()).toBe(2);
+    } finally {
+      runSpy.mockRestore();
+    }
+  });
+
+  it("retries a failed reaper git inspection instead of suppressing it for the cooldown", async () => {
+    const seeded = await seedTerminalWorkspace();
+    const runSpy = vi.spyOn(workspaceGitOperationScheduler, "run");
+    const countReadinessScans = () =>
+      runSpy.mock.calls.filter(
+        ([input]) =>
+          (input as { operation?: string }).operation === "execution_workspaces.close_readiness_status",
+      ).length;
+    try {
+      // A transient scheduler/Git failure must not count as an inspection, or
+      // the cooldown would delay cleanup for five minutes on one blip.
+      runSpy.mockRejectedValue(new Error("synthetic scan failure"));
+      await svc.sweepTerminalWorkspaces();
+      const scansAfterFirst = countReadinessScans();
+      const second = await svc.sweepTerminalWorkspaces();
+      expect(scansAfterFirst).toBeGreaterThanOrEqual(1);
+      expect(countReadinessScans()).toBeGreaterThan(scansAfterFirst);
+      expect(second.skippedRecentlyInspected).toBe(0);
+      expect(seeded.executionWorkspaceId).toBeTruthy();
+    } finally {
+      runSpy.mockRestore();
+    }
+  });
+
   it("serves a repeated close-readiness scan from the scheduler cache", async () => {
     const seeded = await seedTerminalWorkspace();
     const runSpy = vi.spyOn(workspaceGitOperationScheduler, "run");

@@ -416,13 +416,21 @@ async function runExpensiveGitStatus(input: {
    * Callers that need strict freshness simply omit this (default stays 0).
    */
   cacheTtlMs?: number;
+  /**
+   * Correctness-sensitive callers must not join an in-flight scan either: a Git
+   * change can land after that scan captured its status. Defaults to true when
+   * caching is disabled, since "no cache" means "no reuse of an earlier read".
+   */
+  bypassSingleFlight?: boolean;
 }) {
+  const cacheTtlMs = Math.max(0, Math.min(60_000, input.cacheTtlMs ?? 0));
   return workspaceGitOperationScheduler.run({
     workspacePath: input.cwd,
     args: input.args,
     operation: input.operation,
     fairnessKeys: input.fairnessKeys,
-    cacheTtlMs: Math.max(0, Math.min(60_000, input.cacheTtlMs ?? 0)),
+    cacheTtlMs,
+    bypassSingleFlight: input.bypassSingleFlight ?? cacheTtlMs === 0,
     // Nested task worktrees can exceed the scheduler's 1 MiB default.
     // Keep exact file counts for readiness and reconciliation checks.
     maxStdoutBytes: 32 * 1024 * 1024,
@@ -2763,13 +2771,22 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           result.skippedRecentlyInspected += 1;
           continue;
         }
-        recordReaperGitInspection(workspace, sweepNowMs);
         // One git read per directory per sweep: the rows that share a working
-        // tree share the snapshot it produced.
-        const gitReadinessKey =
+        // tree share the snapshot it produced. The snapshot also carries the
+        // row's branch, base ref, and runtime ownership, so two rows over the
+        // same directory with different delivery metadata must not share it;
+        // otherwise one row could inherit the other's `merged_by_ancestry`.
+        const createdByRuntime = workspace.providerType === "git_worktree"
+          ? isRuntimeOwnedGitBranch(workspace.metadata)
+          : workspace.metadata?.createdByRuntime === true;
+        const gitReadinessKey = [
           readNullableString(workspace.providerRef)
-          ?? readNullableString(workspace.cwd)
-          ?? `workspace:${workspace.id}`;
+            ?? readNullableString(workspace.cwd)
+            ?? `workspace:${workspace.id}`,
+          `base:${readNullableString(workspace.baseRef) ?? ""}`,
+          `branch:${readNullableString(workspace.branchName) ?? ""}`,
+          `runtime:${createdByRuntime}`,
+        ].join("\u0000");
         let gitReadiness = perSweepGitReadiness.get(gitReadinessKey);
         if (!gitReadiness) {
           gitReadiness = inspectGitCloseReadiness(executionWorkspace);
@@ -2777,9 +2794,13 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         }
         const { git, statusInspectionSucceeded } = await gitReadiness;
         if (!statusInspectionSucceeded) {
+          // A transient scheduler/Git failure is not an inspection: leave the
+          // row unrecorded so the next sweep retries it instead of being
+          // suppressed for the whole cooldown window.
           result.skippedUndelivered += 1;
           continue;
         }
+        recordReaperGitInspection(workspace, sweepNowMs);
         // The reaper archives workspaces, so it stays on live Git
         // state. Only read and display callers use the bounded cache TTL.
         const assessment = await assessDelivery(workspace, git, {
