@@ -10,7 +10,7 @@ import { describe, expect, it } from "vitest";
 // must also be a real file: the skill audit rejects symlinks and skill
 // copies skip them, so a linked helper disappears wherever a skill is copied.
 const SKILLS_ROOT = fileURLToPath(new URL("../../../skills", import.meta.url));
-const RELATIVE_REF = /`((?:scripts|references)\/(?!\.\.\.`)[^`\s]+)`/g;
+const RELATIVE_REF = /`(?:(?:bash|sh|node|python3?) )?((?:scripts|references)\/(?!\.\.\.`)[^`\s]+)`/g;
 
 function bundledSkillReferences() {
   return fs
