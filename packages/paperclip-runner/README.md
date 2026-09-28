@@ -56,6 +56,19 @@ stdin/stdout bridge admits the pinned Claude and Codex ACPX profiles. It
 validates the exact model, session identity, tool catalog, structured input,
 and terminal settlement at the process boundary. Pi remains unavailable.
 
+Remote Codex sessions relay assigned app tools through the server's configured
+gateway. Small catalogs are sent directly. When a catalog would exceed the
+runner's 256-operation or 768 KiB contract limit, the server exposes
+`paperclip_search_assigned_tools` and `paperclip_call_assigned_tool` instead.
+Search returns bounded pages of names, descriptions, and input schemas. Each
+page intersects the session's pinned assignments with current gateway grants.
+An individual schema that exceeds a page returns an `inputSchemaRef`. The same
+search tool retrieves that schema in chunks via `schemaTool` and
+`schemaOffset`; discovery can continue past the large tool.
+Calls retain task ownership, work-mode restrictions, gateway authorization,
+approvals, and audit. Core task tools and the runner's completion tools keep
+their reserved space; no assigned tools are silently removed to fit the limit.
+
 Native Claude skill assignments travel in the runtime-context snapshot through
 runnerd to the ACPX sidecar. After acquiring the provider lifetime lease, the
 host materializes the assigned bundles under the isolated Claude home's
@@ -69,14 +82,19 @@ alias during selection and verification. Users can keep selecting models from
 the normal Claude catalog or entering custom IDs; unavailable models still fail
 at the provider rather than silently falling back.
 
-For ACPX Claude, `approve-reads` is shown as **Allow Paperclip reads**. The host
-intersects the run's public tools with the implementation catalog's read effects
-and writes exact MCP permission rules into the isolated Claude settings. The
-`paperclip` connection is always the runner's authenticated tool bridge; ambient
-MCP configuration is excluded. Tool hints and provider permission metadata cannot
-grant access. Unassigned tools, writes, external tools, and provider-native
-operations do not receive automatic read permission. Protocol completion and
-task-delivery controls keep their existing separate allowance.
+ACPX Claude defaults to `approve-all`, shown as **Full auto (approve all)**.
+OpenCode defaults to `allow`; native Codex defaults to `never` (no approval
+pauses). These defaults cover all assigned tools and connections, including
+provider-native operations. Full auto is resolved consistently for agent
+creation, adapter conversion, direct driver launches, and fresh/resumed turns.
+Explicitly stored restrictive modes still apply.
+
+The runner's authenticated bridge and controller still enforce company access,
+action claims, task modes, and governed approvals. Provider permission defaults
+do not change workspace isolation or grant credentials or connection access.
+`approve-paperclip` remains an optional narrower mode for assigned planning and
+task tools; `approve-reads` allows assigned reads; `deny-all` rejects requests.
+None of these restrictive modes is the default.
 
 This runtime has no interactive permission handler. An operation that still
 requires approval stops the turn with `approval_required`. The server marks the
@@ -408,3 +426,5 @@ then open the protocol inspector to review events and reducer state. Expand a
 Terminal row and its nested **Debug details** disclosure to inspect every
 canonical event retained for that command. The header marker `🖇️ v0.1.2`
 identifies the current console iteration.
+
+`create_task` accepts an optional initial `status` of `backlog` or `todo`. Use `backlog` when the user wants a saved task or plan without execution: assignment and the initial plan are committed without scheduling a wake, even when dependencies are already complete. Omitting status preserves immediate delegation (`todo`, or `blocked` for unresolved dependencies).
