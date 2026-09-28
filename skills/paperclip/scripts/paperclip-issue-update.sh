@@ -1,0 +1,1 @@
+../../../scripts/paperclip-issue-update.sh
