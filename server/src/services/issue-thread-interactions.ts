@@ -1,4 +1,5 @@
 import { currentContinuationOrigins } from "./execution-continuation.js";
+import { assertAgentRunWriteAllowed } from "../agent-run-cancellation.js";
 import { connectionIntentDeliveries } from "@paperclipai/db";
 import { isDeepStrictEqual } from "node:util";
 import {
@@ -94,6 +95,7 @@ import {
   type ActivityPublication,
 } from "./activity-log.js";
 import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
+import { getNativeReviewAssignment } from "./native-runtime/native-review-participant.js";
 import {
   assertIssueReviewVerdictActorAllowed,
   isIssueReviewVerdictInteraction,
@@ -139,6 +141,14 @@ type InteractionActor = {
   suggestedTaskEffectsAuthorized?: boolean;
   resolutionDetails?: Record<string, unknown>;
 };
+
+async function assertInteractionRunWriteAllowed(tx: Db, issue: { id: string; companyId: string }, actor: InteractionActor) {
+  if (!actor.agentId || !actor.runId) return;
+  // Keep the same issue -> run lock order as task mutation and checkout.
+  await tx.select({ id: issues.id }).from(issues)
+    .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("update");
+  await assertAgentRunWriteAllowed(tx, issue.companyId, actor);
+}
 
 type CreateInteractionOptions = {
   /** Keep independently owned pending cards actionable. Internal runtime bridges use this. */
@@ -458,6 +468,7 @@ type IssueResolutionContext = {
   id: string;
   companyId: string;
   status: string;
+  executionRunId: string | null;
   workMode: string;
   assigneeAgentId: string | null;
   assigneeUserId: string | null;
@@ -484,6 +495,15 @@ async function assertRequestConfirmationResolutionAllowedUnderLock(
     (await isIssueReviewVerdictInteraction(tx, { issue, interaction }));
 
   assertInteractionResolutionAllowed(interaction, actor);
+  if (actor.agentId && isNativeCompletionReview(interaction)) {
+    const target = (interaction.payload as { target?: { revisionId?: string } }).target;
+    if (!actor.runId || !await getNativeReviewAssignment(tx, {
+      companyId: issue.companyId, issueId: issue.id, agentId: actor.agentId,
+      contextSnapshot: { nativeReviewInteractionId: interaction.id, nativeReviewDecisionId: target?.revisionId },
+      actingRunId: actor.runId,
+      issueExecutionRunId: issue.executionRunId,
+    })) throw conflict("This completion review is no longer current or assigned to this agent.");
+  }
   if (!isReviewVerdict) return;
 
   const verdictActor = actor.agentId
@@ -2092,6 +2112,7 @@ export function issueThreadInteractionService(
     const now = new Date();
     const postCommitActivityPublications: ActivityPublication[] = [];
     const result = await db.transaction(async (tx) => {
+      await assertInteractionRunWriteAllowed(tx as unknown as Db, args.issue, args.actor);
       await args.mutationOptions?.beforeResolveInTransaction?.(tx);
       // Policy mutations and review transitions use the same issue-row lock,
       // so the authoritative review policy and requester are stable through
@@ -2103,6 +2124,7 @@ export function issueThreadInteractionService(
           id: issues.id,
           companyId: issues.companyId,
           status: issues.status,
+          executionRunId: issues.executionRunId,
           workMode: issues.workMode,
           assigneeAgentId: issues.assigneeAgentId,
           assigneeUserId: issues.assigneeUserId,
@@ -2369,12 +2391,14 @@ export function issueThreadInteractionService(
 
     const now = new Date();
     const updated = await db.transaction(async (tx) => {
+      await assertInteractionRunWriteAllowed(tx as unknown as Db, args.issue, args.actor);
       await args.mutationOptions?.beforeResolveInTransaction?.(tx);
       const issueContext = await tx
         .select({
           id: issues.id,
           companyId: issues.companyId,
           status: issues.status,
+          executionRunId: issues.executionRunId,
           workMode: issues.workMode,
           assigneeAgentId: issues.assigneeAgentId,
           assigneeUserId: issues.assigneeUserId,
@@ -3455,6 +3479,7 @@ export function issueThreadInteractionService(
         // Idempotent reuse above stays allowed so retries of a pre-close
         // create keep returning the (by now expired) original.
         const result = await db.transaction(async (tx) => {
+          await assertInteractionRunWriteAllowed(tx as unknown as Db, issue, actor);
           const [issueRow] = await tx
             .select({ status: issues.status })
             .from(issues)
@@ -3795,6 +3820,7 @@ export function issueThreadInteractionService(
       const createdWakeTargets: IssueWakeTarget[] = [];
 
       await db.transaction(async (tx) => {
+        await assertInteractionRunWriteAllowed(tx as unknown as Db, issue, actor);
         const resolvedAt = new Date();
         const [claimed] = await tx
           .update(issueThreadInteractions)
@@ -3952,6 +3978,7 @@ export function issueThreadInteractionService(
       assertIssueOpenForInteractionResolution(issue);
       const data = submitIssueThreadInteractionVerdictsSchema.parse(input);
       const submission = await db.transaction(async (tx) => {
+        await assertInteractionRunWriteAllowed(tx as unknown as Db, issue, actor);
         const current = await tx
           .select()
           .from(issueThreadInteractions)
@@ -4089,8 +4116,9 @@ export function issueThreadInteractionService(
         throw interactionTerminalError(current);
       }
 
-      const [updated] = await db
-        .update(issueThreadInteractions)
+      const [updated] = await db.transaction(async (tx) => {
+        await assertInteractionRunWriteAllowed(tx as unknown as Db, issue, actor);
+        return tx.update(issueThreadInteractions)
         .set({
           status: "rejected",
           result: {
@@ -4110,6 +4138,7 @@ export function issueThreadInteractionService(
           ),
         )
         .returning();
+      });
 
       if (!updated) {
         throw interactionAlreadyResolvedError();
@@ -4651,6 +4680,7 @@ export function issueThreadInteractionService(
       // review queue while the card is still pending, and an executable
       // request must not outlive a withdrawn card.
       const updated = await db.transaction(async (tx) => {
+        await assertInteractionRunWriteAllowed(tx as unknown as Db, issue, actor);
         await resolveLinkedToolActionRequests(tx, current, {
           status: "cancelled",
           fromStatuses: ["pending", "approved"],
@@ -4758,6 +4788,7 @@ export function issueThreadInteractionService(
       });
 
       const updated = await db.transaction(async (tx) => {
+        await assertInteractionRunWriteAllowed(tx as unknown as Db, issue, actor);
         await mutationOptions.beforeResolveInTransaction?.(tx);
         const resolvedAt = new Date();
         const [row] = await tx
@@ -4833,6 +4864,7 @@ export function issueThreadInteractionService(
       const reason = data.reason?.trim() || null;
       const now = new Date();
       const updated = await db.transaction(async (tx) => {
+        await assertInteractionRunWriteAllowed(tx as unknown as Db, issue, actor);
         await resolveLinkedToolActionRequests(tx, current, {
           status: "cancelled",
           fromStatuses: ["pending", "approved"],
@@ -4929,6 +4961,7 @@ export function issueThreadInteractionService(
 
       const reason = data.reason?.trim() || null;
       const updated = await db.transaction(async (tx) => {
+        await assertInteractionRunWriteAllowed(tx as unknown as Db, issue, actor);
         const resolvedAt = new Date();
         const [row] = await tx
           .update(issueThreadInteractions)
