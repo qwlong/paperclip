@@ -1,7 +1,13 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { randomUUID } from "node:crypto";
+import { sql, type SQLWrapper } from "drizzle-orm";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { REDACTED_EVENT_VALUE } from "../redaction.js";
-import type { Db } from "@paperclipai/db";
+import { agents, companies, createDb, heartbeatRuns, type Db } from "@paperclipai/db";
 import { PgDialect } from "drizzle-orm/pg-core";
+import {
+  getEmbeddedPostgresTestSupport,
+  startEmbeddedPostgresTestDatabase,
+} from "./helpers/embedded-postgres.js";
 import { createRunSecretRedactionRegistry, redactRegisteredSecretValues } from "../services/run-secret-redaction.js";
 
 const secret = "q2a-exact-secret-value";
@@ -123,5 +129,104 @@ describe("batched run secret redaction", () => {
     expect(select).not.toHaveBeenCalled();
     resolveVersion.mockRejectedValueOnce(new Error("unavailable"));
     await expect(registry.redactForRuns("company", [{ id: "a", text: secret }])).rejects.toThrow("unavailable");
+  });
+});
+
+const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
+const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+
+describeEmbeddedPostgres("issue run secret redaction lookup", () => {
+  let db!: ReturnType<typeof createDb>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-run-secret-redaction-");
+    db = createDb(tempDb.connectionString);
+  }, 20_000);
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  async function seedCompany() {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `S${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "RedactionRunner",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const insertRun = (contextSnapshot: Record<string, unknown>) =>
+      db.insert(heartbeatRuns).values({ companyId, agentId, status: "succeeded", contextSnapshot });
+    return { companyId, insertRun };
+  }
+
+  const registered = (value: string) => ({
+    paperclipSecretRedactions: [{ fingerprintSha256: value, material: { value } }],
+  });
+
+  it("applies the registries of runs linked to the issue by either context key, and no others", async () => {
+    const issueId = randomUUID();
+    const otherIssueId = randomUUID();
+    const { companyId, insertRun } = await seedCompany();
+    const other = await seedCompany();
+    await insertRun({ issueId, ...registered("by-issue-id") });
+    await insertRun({ issueId: otherIssueId, paperclipIssue: { id: issueId }, ...registered("by-paperclip-issue") });
+    await insertRun({ issueId, paperclipIssue: { id: issueId } });
+    await insertRun({ issueId: otherIssueId, ...registered("other-issue") });
+    await other.insertRun({ issueId, ...registered("other-company") });
+
+    const registry = createRunSecretRedactionRegistry(db);
+    const text = "by-issue-id by-paperclip-issue other-issue other-company";
+    expect(await registry.redactForIssue(companyId, issueId, text))
+      .toBe(`${REDACTED_EVENT_VALUE} ${REDACTED_EVENT_VALUE} other-issue other-company`);
+    expect(await registry.redactForIssue(companyId, randomUUID(), text)).toBe(text);
+  });
+
+  it("finds an issue's registries through an index instead of reading every run's context", async () => {
+    const { companyId, insertRun } = await seedCompany();
+    await insertRun({ issueId: randomUUID(), ...registered("secret") });
+    let lookup: SQLWrapper | null = null;
+    const capturingDb = {
+      select: (fields: never) => ({
+        from: (table: never) => {
+          const query = db.select(fields).from(table);
+          lookup = query;
+          return query;
+        },
+      }),
+    } as unknown as Db;
+    await createRunSecretRedactionRegistry(capturingDb).redactForIssue(companyId, randomUUID(), "text");
+    expect(lookup).not.toBeNull();
+
+    const plan = await db.transaction(async (tx) => {
+      await tx.execute(sql`SET LOCAL enable_seqscan = off`);
+      return tx.execute(sql`EXPLAIN (COSTS OFF) ${lookup}`);
+    });
+    const planText = [...plan].map((row) => Object.values(row)[0]).join("\n");
+    expect(planText).not.toMatch(/Seq Scan on heartbeat_runs/);
+    const scannedIndexes = [...planText.matchAll(/(?:Index Scan using|Index Scan on) (\S+)/g)].map((m) => m[1]);
+    expect(scannedIndexes.length).toBeGreaterThan(0);
+    const indexDefs = await db.execute(sql`
+      SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'heartbeat_runs'
+    `);
+    const defByName = new Map([...indexDefs].map((row) => [row.indexname as string, row.indexdef as string]));
+    // Every index the lookup reads must hold only runs that carry a registry;
+    // any other index reaches runs whose multi-megabyte contexts get detoasted.
+    for (const name of scannedIndexes) {
+      expect(defByName.get(name)).toContain("? 'paperclipSecretRedactions'");
+    }
   });
 });
