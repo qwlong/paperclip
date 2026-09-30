@@ -1086,6 +1086,123 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     expect(mockAdapterExecute.mock.calls.length).toBeGreaterThanOrEqual(1);
   });
 
+  it("starts the agent's other queued runs when one queued run cannot be claimed", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const unclaimableIssueId = randomUUID();
+    const readyIssueId = randomUUID();
+    const unclaimableWakeupRequestId = randomUUID();
+    const readyWakeupRequestId = randomUUID();
+    const unclaimableRunId = randomUUID();
+    const readyRunId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Engineer",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 2 } },
+      permissions: {},
+    });
+    await db.insert(issues).values([
+      {
+        id: unclaimableIssueId,
+        companyId,
+        title: "Interrupted task",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        responsibleUserId: "responsible-user",
+      },
+      {
+        id: readyIssueId,
+        companyId,
+        title: "Ready task",
+        status: "todo",
+        priority: "low",
+        assigneeAgentId: agentId,
+        responsibleUserId: "responsible-user",
+      },
+    ]);
+    // An interrupt key whose receipt does not exist: identity resolution rejects
+    // this run on every claim attempt.
+    await db.insert(agentWakeupRequests).values([
+      {
+        id: unclaimableWakeupRequestId,
+        companyId,
+        agentId,
+        source: "on_demand",
+        triggerDetail: "manual",
+        reason: "issue_commented",
+        payload: { issueId: unclaimableIssueId },
+        status: "queued",
+        idempotencyKey: `queued-comment-interrupt:${randomUUID()}`,
+        requestedByActorType: "user",
+        requestedByActorId: "board-user",
+      },
+      {
+        id: readyWakeupRequestId,
+        companyId,
+        agentId,
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        payload: { issueId: readyIssueId },
+        status: "queued",
+      },
+    ]);
+    await db.insert(heartbeatRuns).values([
+      {
+        id: unclaimableRunId,
+        companyId,
+        agentId,
+        invocationSource: "on_demand",
+        triggerDetail: "manual",
+        status: "queued",
+        wakeupRequestId: unclaimableWakeupRequestId,
+        contextSnapshot: { issueId: unclaimableIssueId, wakeReason: "issue_commented" },
+      },
+      {
+        id: readyRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        wakeupRequestId: readyWakeupRequestId,
+        contextSnapshot: { issueId: readyIssueId, wakeReason: "issue_assigned" },
+      },
+    ]);
+    await db.update(agentWakeupRequests).set({ runId: unclaimableRunId })
+      .where(eq(agentWakeupRequests.id, unclaimableWakeupRequestId));
+    await db.update(agentWakeupRequests).set({ runId: readyRunId })
+      .where(eq(agentWakeupRequests.id, readyWakeupRequestId));
+
+    await heartbeat.resumeQueuedRuns();
+
+    const readySucceeded = await waitForCondition(async () => {
+      const [run] = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, readyRunId));
+      return run?.status === "succeeded";
+    }, 15_000);
+    const [unclaimable] = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, unclaimableRunId));
+
+    // Precondition: the unclaimable run really was rejected, not started.
+    expect(unclaimable?.status).toBe("queued");
+    expect(readySucceeded).toBe(true);
+  });
+
   it("suppresses normal wakeups while allowing comment interaction wakes under a pause hold", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();

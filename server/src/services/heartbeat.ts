@@ -19877,7 +19877,12 @@ export function heartbeatService(
       const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
       for (const queuedRun of prioritizedRuns) {
         if (claimedRuns.length >= availableSlots) break;
-        const claimed = await claimQueuedRun(queuedRun, companyAgents);
+        // One run that cannot be claimed must not strand the runs behind it
+        // or the runs this pass already claimed.
+        const claimed = await claimQueuedRun(queuedRun, companyAgents).catch((err) => {
+          logger.warn({ err, runId: queuedRun.id }, "failed to claim queued heartbeat run");
+          return null;
+        });
         if (claimed) claimedRuns.push(claimed);
       }
       if (claimedRuns.length === 0) return [];
