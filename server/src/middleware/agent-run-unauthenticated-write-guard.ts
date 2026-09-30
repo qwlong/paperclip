@@ -137,25 +137,45 @@ export async function readProcessTable(): Promise<Map<number, ProcessInfo>> {
   return table;
 }
 
-/**
- * Loads a value at most once per `ttlMs`, sharing one load between concurrent
- * callers. A caller passing `freshAfter` gets a load that started no earlier.
- * Failed loads are not kept.
- */
 type Snapshot<T> = (freshAfter: number) => Promise<T>;
 
+/**
+ * Reuses a read for `SNAPSHOT_TTL_MS` after it finishes. A caller passing
+ * `freshAfter` gets a read that started no earlier. At most one read runs at a
+ * time; callers that need a newer one share a single read queued behind it.
+ * Failed reads are not kept.
+ */
 function snapshot<T>(load: () => Promise<T>, now: () => number): Snapshot<T> {
-  let current: { startedAt: number; value: Promise<T> } | null = null;
+  let latest: { startedAt: number; finishedAt: number; value: T } | null = null;
+  let inFlight: { startedAt: number; value: Promise<T> } | null = null;
+  let queued: Promise<T> | null = null;
+
+  function start(): Promise<T> {
+    const startedAt = now();
+    const value = load().then((result) => {
+      latest = { startedAt, finishedAt: now(), value: result };
+      return result;
+    });
+    const entry = { startedAt, value };
+    inFlight = entry;
+    value.then(
+      () => { if (inFlight === entry) inFlight = null; },
+      () => { if (inFlight === entry) inFlight = null; },
+    );
+    return value;
+  }
+
   return (freshAfter) => {
-    const time = now();
-    if (!current || current.startedAt < freshAfter || time - current.startedAt > SNAPSHOT_TTL_MS) {
-      const entry = { startedAt: time, value: load() };
-      current = entry;
-      entry.value.catch(() => {
-        if (current === entry) current = null;
-      });
+    if (latest && latest.startedAt >= freshAfter && now() - latest.finishedAt <= SNAPSHOT_TTL_MS) {
+      return Promise.resolve(latest.value);
     }
-    return current.value;
+    if (!inFlight) return start();
+    if (inFlight.startedAt >= freshAfter) return inFlight.value;
+    queued ??= inFlight.value.then(() => undefined, () => undefined).then(() => {
+      queued = null;
+      return start();
+    });
+    return queued;
   };
 }
 
@@ -166,8 +186,9 @@ function snapshot<T>(load: () => Promise<T>, now: () => number): Snapshot<T> {
  * process group leader that started when the run recorded are trusted, so a
  * remote run's pid or a reused pid never matches.
  *
- * Runs, connections and processes are each read at most once a second, and
- * again for a connection first seen after the last read.
+ * Runs, connections and processes are each reused for a second after a read,
+ * and read again for a connection first seen since; a connection's peer is
+ * read once.
  */
 export function createPeerRunResolver(deps: {
   listRunningRunProcesses: () => Promise<RunningRunProcess[]>;
@@ -181,6 +202,8 @@ export function createPeerRunResolver(deps: {
   const processes = snapshot(deps.readProcessTable ?? readProcessTable, now);
   const connectionsByPort = new Map<number, Snapshot<Map<string, number>>>();
   const firstSeen = new WeakMap<Socket, number>();
+  // A connection's peer process never changes.
+  const peerPidBySocket = new WeakMap<Socket, number>();
 
   function connections(port: number, freshAfter: number) {
     let forPort = connectionsByPort.get(port);
@@ -197,19 +220,23 @@ export function createPeerRunResolver(deps: {
       seenAt = now();
       firstSeen.set(socket, seenAt);
     }
-    const candidates = (await runs(-Infinity)).filter(
+    const candidates = (await runs(seenAt)).filter(
       (run) => run.processGroupId === run.processPid && run.processStartedAt !== null,
     );
     if (candidates.length === 0 || !socket.localPort) return null;
 
-    const peerPid = (await connections(socket.localPort, seenAt)).get(clientConnectionKey(socket));
-    if (peerPid === undefined) return null;
+    let peerPid = peerPidBySocket.get(socket);
+    if (peerPid === undefined) {
+      peerPid = (await connections(socket.localPort, seenAt)).get(clientConnectionKey(socket));
+      if (peerPid === undefined) return null;
+      peerPidBySocket.set(socket, peerPid);
+    }
     const table = await processes(seenAt);
 
     const runByPid = new Map<number, RunningRunProcess>();
     for (const run of candidates) {
       const info = table.get(run.processPid);
-      if (info?.startedAtMs == null) continue;
+      if (info?.pgid !== run.processPid || info.startedAtMs === null) continue;
       if (Math.abs(info.startedAtMs - run.processStartedAt!.getTime()) > START_TIME_TOLERANCE_MS) continue;
       runByPid.set(run.processPid, run);
     }

@@ -282,7 +282,7 @@ describe("createPeerRunResolver", () => {
     expect(readConnectionPids).toHaveBeenCalledTimes(2);
   });
 
-  it("rereads processes for a peer the current process table has not seen", async () => {
+  it("rereads processes for a connection first seen after the last read", async () => {
     const newer = new Map([...processTable, [70, proc(20, 20)]]);
     const readProcessTable = vi.fn().mockResolvedValueOnce(processTable).mockResolvedValueOnce(newer);
     const readConnectionPids = vi.fn(async () => new Map([[connection(), 40], [connection(5002), 70]]));
@@ -294,8 +294,93 @@ describe("createPeerRunResolver", () => {
   });
 
   it("returns null for a connection that is still unknown after rereading", async () => {
-    const { resolve } = resolverWith();
+    const { resolve, deps, advance } = resolverWith();
+    await resolve(socket());
+    advance(10);
     await expect(resolve(socket(6000))).resolves.toBeNull();
+    expect(deps.readConnectionPids).toHaveBeenCalledTimes(2);
+  });
+
+  it("runs at most one read at a time, plus one queued for connections that arrive during it", async () => {
+    let finishRead!: () => void;
+    const reads: Array<Promise<void>> = [];
+    const readConnectionPids = vi.fn(() => {
+      const read = new Promise<void>((done) => { finishRead = done; });
+      reads.push(read);
+      return read.then(() => new Map([
+        [connection(), 40], [connection(5002), 40], [connection(5003), 40], [connection(5004), 40],
+      ]));
+    });
+    const { resolve, advance } = resolverWith({ readConnectionPids });
+
+    const pending = [resolve(socket())];
+    for (const port of [5002, 5003, 5004]) {
+      await Promise.resolve();
+      advance(5);
+      pending.push(resolve(socket(port)));
+    }
+    await vi.waitFor(() => expect(readConnectionPids).toHaveBeenCalledTimes(1));
+    finishRead();
+    await vi.waitFor(() => expect(readConnectionPids).toHaveBeenCalledTimes(2));
+    finishRead();
+
+    await expect(Promise.all(pending)).resolves.toEqual([MATCH, MATCH, MATCH, MATCH]);
+    expect(readConnectionPids).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps a read fresh for a second after it finishes, however long it took", async () => {
+    let clock = 1_000_000;
+    const readProcessTable = vi.fn(async () => {
+      clock += 1_500;
+      return processTable;
+    });
+    const { resolve } = resolverWith({ readProcessTable, now: () => clock });
+    const keptAlive = socket();
+    await resolve(keptAlive);
+    clock += 500;
+    await resolve(keptAlive);
+    expect(readProcessTable).toHaveBeenCalledTimes(1);
+  });
+
+  it("sees a run that started after the last read on a connection opened since", async () => {
+    const listRunningRunProcesses = vi.fn()
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([RUN_PROCESS]);
+    const { resolve, advance } = resolverWith({ listRunningRunProcesses });
+    await expect(resolve(socket())).resolves.toBeNull();
+    advance(10);
+    await expect(resolve(socket())).resolves.toEqual(MATCH);
+  });
+
+  it("reads a kept-alive connection's peer only once", async () => {
+    const { resolve, deps, advance } = resolverWith();
+    const keptAlive = socket();
+    await resolve(keptAlive);
+    advance(5_000);
+    await expect(resolve(keptAlive)).resolves.toEqual(MATCH);
+    expect(deps.readConnectionPids).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not trust a run whose pid no longer leads a process group", async () => {
+    const { resolve } = resolverWith({
+      readProcessTable: vi.fn(async () => new Map([...processTable, [20, proc(10, 10, STARTED_AT)]])),
+    });
+    await expect(resolve(socket())).resolves.toBeNull();
+  });
+
+  it.each([
+    { label: "matches a start time recorded from the spawn clock", offsetMs: 900, expected: MATCH },
+    { label: "does not match a start time three seconds off", offsetMs: 3_000, expected: null },
+  ])("$label", async ({ offsetMs, expected }) => {
+    const { resolve } = resolverWith({
+      listRunningRunProcesses: vi.fn(async () => [{ ...RUN_PROCESS, processStartedAt: new Date(STARTED_AT + offsetMs) }]),
+    });
+    await expect(resolve(socket())).resolves.toEqual(expected);
+  });
+
+  it("matches a connection the server sees through an IPv4-mapped address", async () => {
+    const { resolve } = resolverWith();
+    await expect(resolve(socket(CLIENT_PORT, "::ffff:127.0.0.1"))).resolves.toEqual(MATCH);
   });
 
   it("retries a failed read on the next request instead of caching the failure", async () => {
