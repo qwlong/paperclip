@@ -9,11 +9,14 @@ type BuildCommitCommand = () => string | null;
 
 const SHORT_SHA_RE = /^[0-9a-f]{7,40}$/i;
 
-function defaultGitCommand() {
+// `git log -1` reads only the commit object. `git show` diffs a merge against
+// its parents even with `-s`, which scales with the size of the merge.
+export function readHeadCommitMetadata(cwd?: string) {
   return execFileSync(
     "git",
-    ["show", "-s", "--format=%H%n%h%n%s%n%cI", "HEAD"],
+    ["log", "-1", "--format=%H%n%h%n%s%n%cI", "HEAD"],
     {
+      cwd,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
       timeout: 1500,
@@ -107,7 +110,7 @@ function parseGitInfo(
 }
 
 function readGitInfo(
-  gitCommand: GitCommand = defaultGitCommand,
+  gitCommand: GitCommand = readHeadCommitMetadata,
   gitStatusCommand: GitCommand = defaultGitStatusCommand,
   gitBranchCommand: GitCommand = defaultGitBranchCommand,
   buildCommitCommand: BuildCommitCommand = readBuildCommit,
@@ -169,7 +172,7 @@ export function createServerInfoSnapshot(
 // stale. Re-read git HEAD on demand, throttled by a short TTL so frequent health
 // polls don't spawn git on every request.
 const GIT_INFO_CACHE_TTL_MS = 3000;
-const processStartedAt = new Date().toISOString();
+export const serverProcessStartedAt = new Date().toISOString();
 let gitInfoCache: { value: ServerGitInfo; expiresAt: number } | null = null;
 
 export function getServerInfoSnapshot(
@@ -193,7 +196,7 @@ export function getServerInfoSnapshot(
       expiresAt: now + GIT_INFO_CACHE_TTL_MS,
     };
   }
-  return { processStartedAt, git: gitInfoCache.value };
+  return { processStartedAt: serverProcessStartedAt, git: gitInfoCache.value };
 }
 
 export function resetServerInfoCacheForTests(): void {

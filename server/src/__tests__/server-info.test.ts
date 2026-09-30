@@ -1,7 +1,12 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   createServerInfoSnapshot,
   getServerInfoSnapshot,
+  readHeadCommitMetadata,
   resetServerInfoCacheForTests,
 } from "../server-info.js";
 
@@ -199,5 +204,97 @@ describe("getServerInfoSnapshot", () => {
     const first = getServerInfoSnapshot({ now: 0, gitCommand: gitCommandFor("aaaaaaa", "a") });
     const second = getServerInfoSnapshot({ now: 5000, gitCommand: gitCommandFor("bbbbbbb", "b") });
     expect(second.processStartedAt).toBe(first.processStartedAt);
+  });
+});
+
+describe("readHeadCommitMetadata", () => {
+  let repo: string;
+
+  function git(args: string[], input?: string): string {
+    return execFileSync("git", args, {
+      cwd: repo,
+      input,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        GIT_AUTHOR_NAME: "t",
+        GIT_AUTHOR_EMAIL: "t@example.com",
+        GIT_COMMITTER_NAME: "t",
+        GIT_COMMITTER_EMAIL: "t@example.com",
+        GIT_COMMITTER_DATE: "2026-06-25T17:00:00-07:00",
+      },
+    }).trim();
+  }
+
+  function tree(entries: string, allowMissing = false): string {
+    return git(["mktree", ...(allowMissing ? ["--missing"] : [])], entries);
+  }
+
+  beforeEach(() => {
+    repo = mkdtempSync(path.join(tmpdir(), "server-info-head-"));
+    git(["init", "-q"]);
+  });
+
+  afterEach(() => {
+    rmSync(repo, { recursive: true, force: true });
+  });
+
+  // A merge whose parent points at a tree that is not in the object store: any
+  // command that diffs the merge against its parents fails, so the read only
+  // succeeds if it never walks trees. Walking trees is what made a large merge
+  // HEAD cost hundreds of milliseconds of blocked event loop per refresh.
+  function commitMergeWithUnreadableParentTree(): string {
+    const leaf = (content: string) =>
+      tree(`100644 blob ${git(["hash-object", "-w", "--stdin"], content)}\tf\n`);
+    const root = git(["commit-tree", tree(""), "-m", "root"]);
+    const left = git(["commit-tree", tree(`040000 tree ${leaf("a")}\td\n`), "-p", root, "-m", "left"]);
+    const right = git([
+      "commit-tree",
+      tree(`040000 tree ${"2".repeat(40)}\td\n`, true),
+      "-p",
+      root,
+      "-m",
+      "right",
+    ]);
+    const merge = git([
+      "commit-tree",
+      tree(`040000 tree ${leaf("c")}\td\n`),
+      "-p",
+      left,
+      "-p",
+      right,
+      "-m",
+      "Merge upstream",
+    ]);
+    git(["update-ref", "HEAD", merge]);
+    return merge;
+  }
+
+  it("reads a merge HEAD without diffing it against its parents", () => {
+    const merge = commitMergeWithUnreadableParentTree();
+    // Precondition: diffing this merge really fails, so the fixture can tell.
+    expect(() => git(["show", "-s", "--format=%H", "HEAD"])).toThrow();
+
+    const snapshot = createServerInfoSnapshot({
+      gitCommand: () => readHeadCommitMetadata(repo),
+      gitStatusCommand: () => "",
+      gitBranchCommand: () => "main",
+    });
+
+    expect(snapshot.git).toEqual({
+      available: true,
+      fullSha: merge,
+      shortSha: merge.slice(0, 7),
+      branchName: "main",
+      subject: "Merge upstream",
+      committedAt: "2026-06-26T00:00:00.000Z",
+      localChanges: {
+        available: true,
+        hasLocalChanges: false,
+        stagedFileCount: 0,
+        unstagedFileCount: 0,
+        untrackedFileCount: 0,
+      },
+    });
   });
 });
