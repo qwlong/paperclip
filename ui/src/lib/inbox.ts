@@ -14,8 +14,22 @@ import {
   type IssueFilterWorkspaceContext,
 } from "./issue-filters";
 import { formatAssigneeUserLabel } from "./assignees";
+import {
+  getRecentTouchedIssues,
+  issueLastActivityTimestamp,
+  normalizeTimestamp,
+  RECENT_ISSUES_LIMIT,
+  sortIssuesByMostRecentActivity,
+} from "@paperclipai/shared";
 
-export const RECENT_ISSUES_LIMIT = 100;
+export {
+  getRecentTouchedIssues,
+  issueLastActivityTimestamp,
+  normalizeTimestamp,
+  RECENT_ISSUES_LIMIT,
+  sortIssuesByMostRecentActivity,
+};
+
 export const FAILED_RUN_STATUSES = new Set(["failed", "timed_out"]);
 export const ACTIONABLE_APPROVAL_STATUSES = new Set(["pending", "revision_requested"]);
 export const DISMISSED_KEY = "paperclip:inbox:dismissed";
@@ -743,32 +757,6 @@ export function getLatestFailedRunsByAgent(runs: HeartbeatRun[]): HeartbeatRun[]
   return Array.from(latestByAgent.values()).filter((run) => FAILED_RUN_STATUSES.has(run.status));
 }
 
-export function normalizeTimestamp(value: string | Date | null | undefined): number {
-  if (!value) return 0;
-  const timestamp = new Date(value).getTime();
-  return Number.isFinite(timestamp) ? timestamp : 0;
-}
-
-export function issueLastActivityTimestamp(issue: Issue): number {
-  const lastActivityAt = normalizeTimestamp(issue.lastActivityAt);
-  if (lastActivityAt > 0) return lastActivityAt;
-
-  const lastExternalCommentAt = normalizeTimestamp(issue.lastExternalCommentAt);
-  if (lastExternalCommentAt > 0) return lastExternalCommentAt;
-
-  return normalizeTimestamp(issue.updatedAt);
-}
-
-export function sortIssuesByMostRecentActivity(a: Issue, b: Issue): number {
-  const activityDiff = issueLastActivityTimestamp(b) - issueLastActivityTimestamp(a);
-  if (activityDiff !== 0) return activityDiff;
-  return normalizeTimestamp(b.updatedAt) - normalizeTimestamp(a.updatedAt);
-}
-
-export function getRecentTouchedIssues(issues: Issue[]): Issue[] {
-  return [...issues].sort(sortIssuesByMostRecentActivity).slice(0, RECENT_ISSUES_LIMIT);
-}
-
 export function getUnreadTouchedIssues(issues: Issue[]): Issue[] {
   return issues.filter((issue) => issue.isUnreadForMe);
 }
@@ -1266,7 +1254,7 @@ export function computeInboxBadgeData({
   joinRequests,
   dashboard,
   heartbeatRuns,
-  mineIssues,
+  unreadMineIssueCount,
   dismissedAlerts,
   dismissedAtByKey,
   currentUserId,
@@ -1275,7 +1263,7 @@ export function computeInboxBadgeData({
   joinRequests: JoinRequest[];
   dashboard: DashboardSummary | undefined;
   heartbeatRuns: HeartbeatRun[];
-  mineIssues: Issue[];
+  unreadMineIssueCount: number;
   dismissedAlerts: Set<string>;
   dismissedAtByKey: ReadonlyMap<string, number>;
   currentUserId?: string | null;
@@ -1292,7 +1280,6 @@ export function computeInboxBadgeData({
   const visibleJoinRequests = joinRequests.filter(
     (jr) => !isInboxEntityDismissed(dismissedAtByKey, `join:${jr.id}`, jr.updatedAt ?? jr.createdAt),
   ).length;
-  const visibleMineIssues = mineIssues.filter((issue) => issue.isUnreadForMe).length;
   const agentErrorCount = dashboard?.agents.error ?? 0;
   const monthBudgetCents = dashboard?.costs.monthBudgetCents ?? 0;
   const monthUtilizationPercent = dashboard?.costs.monthUtilizationPercent ?? 0;
@@ -1308,11 +1295,11 @@ export function computeInboxBadgeData({
 
   return {
     // The inbox badge reflects personal/actionable work, not company-wide health alerts.
-    inbox: actionableApprovals + visibleJoinRequests + failedRuns + visibleMineIssues,
+    inbox: actionableApprovals + visibleJoinRequests + failedRuns + unreadMineIssueCount,
     approvals: actionableApprovals,
     failedRuns,
     joinRequests: visibleJoinRequests,
-    mineIssues: visibleMineIssues,
+    mineIssues: unreadMineIssueCount,
     alerts,
   };
 }

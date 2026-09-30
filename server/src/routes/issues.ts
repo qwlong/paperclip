@@ -2,7 +2,13 @@ import { queuedInteractionId, readQueuedInteractionResponse, hasQueuedInteractio
 import { deliverConversationComments, isConversation } from "../services/agent-conversations.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
-import { extractIssueReferenceIdentifiers, requiresExecutionReconciliation } from "@paperclipai/shared";
+import {
+  countUnreadRecentTouchedIssues,
+  extractIssueReferenceIdentifiers,
+  INBOX_MINE_ISSUE_STATUS_FILTER,
+  INBOX_TOUCHED_ISSUE_FETCH_LIMIT,
+  requiresExecutionReconciliation,
+} from "@paperclipai/shared";
 import {
   validateExecutionReconciliation,
   markExecutionReconciliation,
@@ -8272,6 +8278,29 @@ export function issueRoutes(
       identicalInFlightCount: coordinated.identicalInFlightCount,
     });
     res.json(coordinated.response.body);
+  });
+
+  // The Inbox badge needs only this number, not the touched-issue list.
+  router.get("/companies/:companyId/issues/inbox-unread-count", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    if (req.actor.type !== "board" || !req.actor.userId) {
+      res.status(403).json({ error: "inbox-unread-count requires board authentication" });
+      return;
+    }
+    const userId = req.actor.userId;
+    if (await actorCanReadCompanyScope(req, companyId)) {
+      res.json({ count: await svc.countInboxUnreadIssues(companyId, userId) });
+      return;
+    }
+    const rows = await svc.list(companyId, {
+      touchedByUserId: userId,
+      inboxArchivedByUserId: userId,
+      status: INBOX_MINE_ISSUE_STATUS_FILTER,
+      limit: INBOX_TOUCHED_ISSUE_FETCH_LIMIT,
+    });
+    const visible = await filterIssuesForActor(req, rows);
+    res.json({ count: countUnreadRecentTouchedIssues(visible) });
   });
 
   router.get("/companies/:companyId/issues/count", async (req, res) => {

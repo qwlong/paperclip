@@ -96,11 +96,14 @@ import {
   clampIssueRequestDepth,
   extractAgentMentionIds,
   extractProjectMentionIds,
+  INBOX_MINE_ISSUE_STATUS_FILTER,
+  INBOX_TOUCHED_ISSUE_FETCH_LIMIT,
   issueCommentAuthorTypeSchema,
   issueCommentMetadataSchema,
   issueCommentPresentationSchema,
   isUuidLike,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
+  RECENT_ISSUES_LIMIT,
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import { isForeignKeyViolation } from "../db-errors.js";
@@ -2957,6 +2960,27 @@ function issueCanonicalLastActivityAtExpr(companyId: string) {
       COALESCE(${latestLogAt}, to_timestamp(0))
     )
   `;
+}
+
+/** Mirrors `deriveIssueUserContext().isUnreadForMe`, at the millisecond precision it compares. */
+function inboxUnreadForUserExpr(companyId: string, userId: string) {
+  const myLastTouchAt = myLastTouchAtExpr(companyId, userId);
+  return sql<boolean>`
+    date_trunc('milliseconds', (
+      SELECT MAX(${issueComments.createdAt})
+      FROM ${issueComments}
+      WHERE ${issueComments.issueId} = ${issues.id}
+        AND ${issueComments.companyId} = ${companyId}
+        AND (
+          ${issueComments.authorUserId} IS NULL
+          OR ${issueComments.authorUserId} <> ${userId}
+        )
+    )) > NULLIF(${myLastTouchAt}, to_timestamp(0))
+  `;
+}
+
+function issuePriorityRankExpr() {
+  return sql<number>`CASE ${issues.priority} WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END`;
 }
 
 function unreadForUserCondition(companyId: string, userId: string) {
@@ -7997,7 +8021,7 @@ export function issueService(db: Db) {
       ) {
         conditions.push(ne(issues.originKind, "routine_execution"));
       }
-      const priorityOrder = sql`CASE ${issues.priority} WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END`;
+      const priorityOrder = issuePriorityRankExpr();
       const searchOrder = sql<number>`-task_search.score`;
       const issueSource = db.select(issueListSelect).from(issues);
       const searchedSource = hasSearch
@@ -8170,6 +8194,64 @@ export function issueService(db: Db) {
           }),
         };
       });
+    },
+
+    /**
+     * The unread issues among the ones the Inbox "mine" list shows: the same
+     * prefetch `list` returns for the Inbox, then its most recently active
+     * `RECENT_ISSUES_LIMIT`, ordered as `getRecentTouchedIssues` orders them.
+     */
+    countInboxUnreadIssues: async (companyId: string, userId: string) => {
+      const priorityRank = issuePriorityRankExpr();
+      const lastActivityAt = issueCanonicalLastActivityAtExpr(companyId);
+      const prefetch = db
+        .select({
+          id: issues.id,
+          priorityRank: sql<number>`${priorityRank}`.as("priority_rank"),
+          lastActivityAt: sql<Date>`${lastActivityAt}`.as("last_activity_at"),
+          lastActivityMs: sql<Date>`date_trunc('milliseconds', ${lastActivityAt})`.as("last_activity_ms"),
+          updatedAt: sql<Date>`${issues.updatedAt}`.as("updated_at_raw"),
+          updatedMs: sql<Date>`date_trunc('milliseconds', ${issues.updatedAt})`.as("updated_ms"),
+          unread: sql<boolean>`${inboxUnreadForUserExpr(companyId, userId)}`.as("unread"),
+        })
+        .from(issues)
+        .where(
+          and(
+            eq(issues.companyId, companyId),
+            visibleIssueCondition(),
+            isNull(issues.conversationAgentId),
+            inArray(issues.status, parseStatusFilter(INBOX_MINE_ISSUE_STATUS_FILTER)),
+            touchedByUserCondition(companyId, userId),
+            inboxVisibleForUserCondition(companyId, userId),
+            nonPluginOperationIssueCondition(),
+          ),
+        )
+        .orderBy(
+          ...issueListOrderBy(companyId, {
+            hasSearch: false,
+            priorityOrder: priorityRank,
+            searchOrder: sql`0`,
+          }),
+        )
+        .limit(INBOX_TOUCHED_ISSUE_FETCH_LIMIT)
+        .as("inbox_prefetch");
+      const recent = db
+        .select({ unread: prefetch.unread })
+        .from(prefetch)
+        .orderBy(
+          desc(prefetch.lastActivityMs),
+          desc(prefetch.updatedMs),
+          asc(prefetch.priorityRank),
+          desc(prefetch.lastActivityAt),
+          desc(prefetch.updatedAt),
+          desc(prefetch.id),
+        )
+        .limit(RECENT_ISSUES_LIMIT)
+        .as("inbox_recent");
+      const [row] = await db
+        .select({ count: sql<number>`(count(*) FILTER (WHERE ${recent.unread}))::int` })
+        .from(recent);
+      return row?.count ?? 0;
     },
 
     count: async (companyId: string, filters?: IssueFilters) => {

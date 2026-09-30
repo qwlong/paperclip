@@ -1680,6 +1680,17 @@ export {
 } from "./issue-references.js";
 
 export {
+  countUnreadRecentTouchedIssues,
+  getRecentTouchedIssues,
+  INBOX_TOUCHED_ISSUE_FETCH_LIMIT,
+  issueLastActivityTimestamp,
+  normalizeTimestamp,
+  RECENT_ISSUES_LIMIT,
+  sortIssuesByMostRecentActivity,
+  type InboxActivityFields,
+} from "./inbox-recent-issues.js";
+
+export {
   anchorSnapshotToSelector,
   createDocumentAnchorSelector,
   normalizeAnchorText,
