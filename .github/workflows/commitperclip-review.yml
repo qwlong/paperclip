@@ -14,6 +14,8 @@ permissions:
 
 jobs:
   review:
+    # The commitperclip bot and its key exist only on the upstream repository.
+    if: github.repository == 'paperclipai/paperclip'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
