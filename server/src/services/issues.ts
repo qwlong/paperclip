@@ -6566,6 +6566,167 @@ async function countBlockedInboxIssues(
   }, 0);
 }
 
+/** The filters the Inbox "mine" list requests for `userId`. */
+export function inboxMineIssueFilters(userId: string): IssueFilters {
+  return {
+    touchedByUserId: userId,
+    inboxArchivedByUserId: userId,
+    status: INBOX_MINE_ISSUE_STATUS_FILTER,
+    limit: INBOX_TOUCHED_ISSUE_FETCH_LIMIT,
+  };
+}
+
+/**
+ * The WHERE conditions `list` applies for `filters`, or null when they match
+ * nothing. Anything that must pick exactly the rows `list` returns uses these.
+ */
+async function issueListConditions(
+  db: Db,
+  companyId: string,
+  filters: IssueFilters | undefined,
+): Promise<SQL[] | null> {
+  const conditions = [
+    eq(issues.companyId, companyId),
+    visibleIssueCondition(),
+  ];
+  if (!filters?.q?.trim()) {
+    conditions.push(isNull(issues.conversationAgentId));
+    if (!filters?.touchedByUserId && !filters?.unreadForUserId && !filters?.inboxArchivedByUserId) {
+      conditions.push(nonIdleSlackIssueCondition());
+    }
+  }
+  if (filters?.afterId) conditions.push(gt(issues.id, filters.afterId));
+  const assigneeAgentFilter = parseIssueAssigneeAgentFilter(
+    filters?.assigneeAgentId,
+  );
+  assertValidAssigneeAgentFilter(assigneeAgentFilter);
+  const touchedByUserId = filters?.touchedByUserId?.trim() || undefined;
+  const inboxArchivedByUserId =
+    filters?.inboxArchivedByUserId?.trim() || undefined;
+  const unreadForUserId = filters?.unreadForUserId?.trim() || undefined;
+  if (filters?.createdFromIssueId) {
+    conditions.push(createdFromIssueCondition(companyId, filters.createdFromIssueId));
+  }
+  if (filters?.descendantOf) {
+    conditions.push(sql<boolean>`
+      ${issues.id} IN (
+        WITH RECURSIVE descendants(id) AS (
+          SELECT ${issues.id}
+          FROM ${issues}
+          WHERE ${issues.companyId} = ${companyId}
+            AND ${issues.parentId} = ${filters.descendantOf}
+          UNION
+          SELECT ${issues.id}
+          FROM ${issues}
+          JOIN descendants ON ${issues.parentId} = descendants.id
+          WHERE ${issues.companyId} = ${companyId}
+        )
+        SELECT id FROM descendants
+      )
+    `);
+  }
+  const lowTrustCondition = lowTrustBoundaryIssueCondition(
+    companyId,
+    filters?.lowTrustBoundary,
+  );
+  if (lowTrustCondition) conditions.push(lowTrustCondition);
+  const statuses = parseStatusFilter(filters?.status);
+  if (statuses.length === 1) {
+    conditions.push(eq(issues.status, statuses[0]));
+  } else if (statuses.length > 1) {
+    conditions.push(inArray(issues.status, statuses));
+  }
+  if (assigneeAgentFilter === null) {
+    conditions.push(isNull(issues.assigneeAgentId));
+  } else if (assigneeAgentFilter) {
+    conditions.push(eq(issues.assigneeAgentId, assigneeAgentFilter));
+  }
+  if (filters?.participantAgentId) {
+    conditions.push(
+      participatedByAgentCondition(companyId, filters.participantAgentId),
+    );
+  }
+  if (filters?.assigneeUserId) {
+    conditions.push(eq(issues.assigneeUserId, filters.assigneeUserId));
+  }
+  if (touchedByUserId) {
+    conditions.push(touchedByUserCondition(companyId, touchedByUserId));
+  }
+  if (inboxArchivedByUserId) {
+    conditions.push(
+      inboxVisibleForUserCondition(companyId, inboxArchivedByUserId),
+    );
+  }
+  if (unreadForUserId) {
+    conditions.push(unreadForUserCondition(companyId, unreadForUserId));
+  }
+  if (filters?.projectId)
+    conditions.push(eq(issues.projectId, filters.projectId));
+  if (filters?.workspaceId) {
+    conditions.push(
+      or(
+        eq(issues.executionWorkspaceId, filters.workspaceId),
+        eq(issues.projectWorkspaceId, filters.workspaceId),
+      )!,
+    );
+  }
+  if (filters?.executionWorkspaceId) {
+    conditions.push(
+      eq(issues.executionWorkspaceId, filters.executionWorkspaceId),
+    );
+  }
+  if (filters?.parentId)
+    conditions.push(eq(issues.parentId, filters.parentId));
+  if (filters?.originKind)
+    conditions.push(eq(issues.originKind, filters.originKind));
+  if (filters?.originKindPrefix)
+    conditions.push(
+      like(issues.originKind, `${filters.originKindPrefix}%`),
+    );
+  if (filters?.originId)
+    conditions.push(eq(issues.originId, filters.originId));
+  if (filters?.hasPlanDocument !== undefined) {
+    conditions.push(
+      hasPlanDocumentCondition(companyId, filters.hasPlanDocument),
+    );
+  }
+  if (!shouldIncludePluginOperationIssues(filters)) {
+    conditions.push(nonPluginOperationIssueCondition());
+  }
+  if (filters?.labelId) {
+    const labeledIssueIds = await db
+      .select({ issueId: issueLabels.issueId })
+      .from(issueLabels)
+      .where(
+        and(
+          eq(issueLabels.companyId, companyId),
+          eq(issueLabels.labelId, filters.labelId),
+        ),
+      );
+    if (labeledIssueIds.length === 0) return null;
+    conditions.push(
+      inArray(
+        issues.id,
+        labeledIssueIds.map((row) => row.issueId),
+      ),
+    );
+  }
+  if (filters?.updatedSince) {
+    const since = new Date(filters.updatedSince);
+    if (Number.isFinite(since.getTime())) {
+      conditions.push(gt(issues.updatedAt, since));
+    }
+  }
+  if (
+    filters?.excludeRoutineExecutions &&
+    !filters?.originKind &&
+    !filters?.originId
+  ) {
+    conditions.push(ne(issues.originKind, "routine_execution"));
+  }
+  return conditions;
+}
+
 export function issueService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
@@ -7864,21 +8025,6 @@ export function issueService(db: Db) {
         });
       }
 
-      const conditions = [
-        eq(issues.companyId, companyId),
-        visibleIssueCondition(),
-      ];
-      if (!filters?.q?.trim()) {
-        conditions.push(isNull(issues.conversationAgentId));
-        if (!filters?.touchedByUserId && !filters?.unreadForUserId && !filters?.inboxArchivedByUserId) {
-          conditions.push(nonIdleSlackIssueCondition());
-        }
-      }
-      if (filters?.afterId) conditions.push(gt(issues.id, filters.afterId));
-      const assigneeAgentFilter = parseIssueAssigneeAgentFilter(
-        filters?.assigneeAgentId,
-      );
-      assertValidAssigneeAgentFilter(assigneeAgentFilter);
       const limit =
         typeof filters?.limit === "number" && Number.isFinite(filters.limit)
           ? Math.max(1, Math.floor(filters.limit))
@@ -7901,126 +8047,8 @@ export function issueService(db: Db) {
       const rawSearch = filters?.q?.trim() ?? "";
       const hasSearch = rawSearch.length > 0;
       const taskSearch = parseTaskSearch(rawSearch);
-      if (filters?.createdFromIssueId) {
-        conditions.push(createdFromIssueCondition(companyId, filters.createdFromIssueId));
-      }
-      if (filters?.descendantOf) {
-        conditions.push(sql<boolean>`
-          ${issues.id} IN (
-            WITH RECURSIVE descendants(id) AS (
-              SELECT ${issues.id}
-              FROM ${issues}
-              WHERE ${issues.companyId} = ${companyId}
-                AND ${issues.parentId} = ${filters.descendantOf}
-              UNION
-              SELECT ${issues.id}
-              FROM ${issues}
-              JOIN descendants ON ${issues.parentId} = descendants.id
-              WHERE ${issues.companyId} = ${companyId}
-            )
-            SELECT id FROM descendants
-          )
-        `);
-      }
-      const lowTrustCondition = lowTrustBoundaryIssueCondition(
-        companyId,
-        filters?.lowTrustBoundary,
-      );
-      if (lowTrustCondition) conditions.push(lowTrustCondition);
-      const statuses = parseStatusFilter(filters?.status);
-      if (statuses.length === 1) {
-        conditions.push(eq(issues.status, statuses[0]));
-      } else if (statuses.length > 1) {
-        conditions.push(inArray(issues.status, statuses));
-      }
-      if (assigneeAgentFilter === null) {
-        conditions.push(isNull(issues.assigneeAgentId));
-      } else if (assigneeAgentFilter) {
-        conditions.push(eq(issues.assigneeAgentId, assigneeAgentFilter));
-      }
-      if (filters?.participantAgentId) {
-        conditions.push(
-          participatedByAgentCondition(companyId, filters.participantAgentId),
-        );
-      }
-      if (filters?.assigneeUserId) {
-        conditions.push(eq(issues.assigneeUserId, filters.assigneeUserId));
-      }
-      if (touchedByUserId) {
-        conditions.push(touchedByUserCondition(companyId, touchedByUserId));
-      }
-      if (inboxArchivedByUserId) {
-        conditions.push(
-          inboxVisibleForUserCondition(companyId, inboxArchivedByUserId),
-        );
-      }
-      if (unreadForUserId) {
-        conditions.push(unreadForUserCondition(companyId, unreadForUserId));
-      }
-      if (filters?.projectId)
-        conditions.push(eq(issues.projectId, filters.projectId));
-      if (filters?.workspaceId) {
-        conditions.push(
-          or(
-            eq(issues.executionWorkspaceId, filters.workspaceId),
-            eq(issues.projectWorkspaceId, filters.workspaceId),
-          )!,
-        );
-      }
-      if (filters?.executionWorkspaceId) {
-        conditions.push(
-          eq(issues.executionWorkspaceId, filters.executionWorkspaceId),
-        );
-      }
-      if (filters?.parentId)
-        conditions.push(eq(issues.parentId, filters.parentId));
-      if (filters?.originKind)
-        conditions.push(eq(issues.originKind, filters.originKind));
-      if (filters?.originKindPrefix)
-        conditions.push(
-          like(issues.originKind, `${filters.originKindPrefix}%`),
-        );
-      if (filters?.originId)
-        conditions.push(eq(issues.originId, filters.originId));
-      if (filters?.hasPlanDocument !== undefined) {
-        conditions.push(
-          hasPlanDocumentCondition(companyId, filters.hasPlanDocument),
-        );
-      }
-      if (!shouldIncludePluginOperationIssues(filters)) {
-        conditions.push(nonPluginOperationIssueCondition());
-      }
-      if (filters?.labelId) {
-        const labeledIssueIds = await db
-          .select({ issueId: issueLabels.issueId })
-          .from(issueLabels)
-          .where(
-            and(
-              eq(issueLabels.companyId, companyId),
-              eq(issueLabels.labelId, filters.labelId),
-            ),
-          );
-        if (labeledIssueIds.length === 0) return [];
-        conditions.push(
-          inArray(
-            issues.id,
-            labeledIssueIds.map((row) => row.issueId),
-          ),
-        );
-      }
-      if (filters?.updatedSince) {
-        const since = new Date(filters.updatedSince);
-        if (Number.isFinite(since.getTime())) {
-          conditions.push(gt(issues.updatedAt, since));
-        }
-      }
-      if (
-        filters?.excludeRoutineExecutions &&
-        !filters?.originKind &&
-        !filters?.originId
-      ) {
-        conditions.push(ne(issues.originKind, "routine_execution"));
-      }
+      const conditions = await issueListConditions(db, companyId, filters);
+      if (!conditions) return [];
       const priorityOrder = issuePriorityRankExpr();
       const searchOrder = sql<number>`-task_search.score`;
       const issueSource = db.select(issueListSelect).from(issues);
@@ -8202,6 +8230,8 @@ export function issueService(db: Db) {
      * `RECENT_ISSUES_LIMIT`, ordered as `getRecentTouchedIssues` orders them.
      */
     countInboxUnreadIssues: async (companyId: string, userId: string) => {
+      const conditions = await issueListConditions(db, companyId, inboxMineIssueFilters(userId));
+      if (!conditions) return 0;
       const priorityRank = issuePriorityRankExpr();
       const lastActivityAt = issueCanonicalLastActivityAtExpr(companyId);
       const prefetch = db
@@ -8215,17 +8245,7 @@ export function issueService(db: Db) {
           unread: sql<boolean>`${inboxUnreadForUserExpr(companyId, userId)}`.as("unread"),
         })
         .from(issues)
-        .where(
-          and(
-            eq(issues.companyId, companyId),
-            visibleIssueCondition(),
-            isNull(issues.conversationAgentId),
-            inArray(issues.status, parseStatusFilter(INBOX_MINE_ISSUE_STATUS_FILTER)),
-            touchedByUserCondition(companyId, userId),
-            inboxVisibleForUserCondition(companyId, userId),
-            nonPluginOperationIssueCondition(),
-          ),
-        )
+        .where(and(...conditions))
         .orderBy(
           ...issueListOrderBy(companyId, {
             hasSearch: false,

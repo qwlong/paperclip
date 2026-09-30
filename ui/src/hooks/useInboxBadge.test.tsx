@@ -20,6 +20,9 @@ vi.mock("../api/dashboard", () => ({ dashboardApi: { summary: async () => undefi
 vi.mock("../api/heartbeats", () => ({ heartbeatsApi: { list: async () => [] } }));
 vi.mock("../api/inboxDismissals", () => ({ inboxDismissalsApi: { list: async () => [] } }));
 
+import type { Issue } from "@paperclipai/shared";
+import { removeIssueFromInboxCaches } from "../lib/inboxArchiveCache";
+import { queryKeys } from "../lib/queryKeys";
 import { useInboxBadge } from "./useInboxBadge";
 
 type Badge = ReturnType<typeof useInboxBadge>;
@@ -56,5 +59,43 @@ describe("useInboxBadge", () => {
     expect(latest!.inbox).toBe(3);
     expect(mocks.inboxUnreadCount).toHaveBeenCalledWith("company-1");
     expect(mocks.listIssues).not.toHaveBeenCalled();
+  });
+
+  async function renderBadge() {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const badge: { current: Badge | null } = { current: null };
+    root = createRoot(document.createElement("div"));
+    await act(async () => {
+      root!.render(
+        <QueryClientProvider client={queryClient}>
+          <Harness onBadge={(latest) => { badge.current = latest; }} />
+        </QueryClientProvider>,
+      );
+    });
+    await vi.waitFor(() => expect(badge.current?.mineIssues).toBe(3));
+    return { queryClient, badge };
+  }
+
+  it("drops at once when the Inbox archives an unread issue", async () => {
+    const { queryClient, badge } = await renderBadge();
+    queryClient.setQueryData<Issue[]>(
+      [...queryKeys.issues.listMineByMe("company-1"), "compact"],
+      [{ id: "issue-a", isUnreadForMe: true } as Issue],
+    );
+
+    act(() => removeIssueFromInboxCaches(queryClient, "company-1", "issue-a"));
+
+    await vi.waitFor(() => expect(badge.current?.mineIssues).toBe(2));
+  });
+
+  it("refetches when the mine list is invalidated, and not on other sidebar badge refreshes", async () => {
+    const { queryClient } = await renderBadge();
+    expect(mocks.inboxUnreadCount).toHaveBeenCalledTimes(1);
+
+    await act(() => queryClient.invalidateQueries({ queryKey: queryKeys.sidebarBadges("company-1") }));
+    expect(mocks.inboxUnreadCount).toHaveBeenCalledTimes(1);
+
+    await act(() => queryClient.invalidateQueries({ queryKey: queryKeys.issues.listMineByMe("company-1") }));
+    await vi.waitFor(() => expect(mocks.inboxUnreadCount).toHaveBeenCalledTimes(2));
   });
 });

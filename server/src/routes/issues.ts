@@ -5,8 +5,6 @@ import { getExecutionBlocker } from "../services/execution-blocker.js";
 import {
   countUnreadRecentTouchedIssues,
   extractIssueReferenceIdentifiers,
-  INBOX_MINE_ISSUE_STATUS_FILTER,
-  INBOX_TOUCHED_ISSUE_FETCH_LIMIT,
   requiresExecutionReconciliation,
 } from "@paperclipai/shared";
 import {
@@ -280,6 +278,7 @@ import {
   ISSUE_WAKE_DIAGNOSTICS_LOOKBACK_DAYS,
   ISSUE_WAKE_DIAGNOSTICS_MAX_ACTIVITY_RECORDS,
   ISSUE_WAKE_DIAGNOSTICS_MAX_WAKE_REQUESTS,
+  inboxMineIssueFilters,
   readAcceptedPlanConfirmationTarget,
   type IssuePostCommitAction,
 } from "../services/issues.js";
@@ -8293,12 +8292,7 @@ export function issueRoutes(
       res.json({ count: await svc.countInboxUnreadIssues(companyId, userId) });
       return;
     }
-    const rows = await svc.list(companyId, {
-      touchedByUserId: userId,
-      inboxArchivedByUserId: userId,
-      status: INBOX_MINE_ISSUE_STATUS_FILTER,
-      limit: INBOX_TOUCHED_ISSUE_FETCH_LIMIT,
-    });
+    const rows = await svc.list(companyId, inboxMineIssueFilters(userId));
     const visible = await filterIssuesForActor(req, rows);
     res.json({ count: countUnreadRecentTouchedIssues(visible) });
   });

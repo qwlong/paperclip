@@ -214,13 +214,21 @@ export function useInboxBadge(companyId: string | null | undefined) {
   });
   usePublishSharedQueryData(sharedDashboard, dashboard, dashboardUpdatedAt);
 
-  const { data: inboxUnreadCount } = useQuery({
-    queryKey: [...queryKeys.sidebarBadges(companyId!), "inbox-unread-count"],
+  const inboxUnreadCountQueryKey = queryKeys.issues.inboxUnreadCount(companyId!);
+  const sharedInboxUnreadCount = useSharedPollingQuery({
+    companyId,
+    resourceKey: "inbox-badge:unread-count",
+    queryKey: inboxUnreadCountQueryKey,
+    enabled: !!companyId,
+  });
+  const { data: inboxUnreadCount, dataUpdatedAt: inboxUnreadCountUpdatedAt } = useQuery({
+    queryKey: inboxUnreadCountQueryKey,
     queryFn: () => issuesApi.inboxUnreadCount(companyId!),
     enabled: !!companyId,
     refetchOnWindowFocus: false,
     staleTime: INBOX_BADGE_HOT_PATH_STALE_MS,
   });
+  usePublishSharedQueryData(sharedInboxUnreadCount, inboxUnreadCount, inboxUnreadCountUpdatedAt);
   const unreadMineIssueCount = inboxUnreadCount?.count ?? 0;
   const currentUserId = session?.user.id ?? session?.session.userId ?? null;
 
