@@ -8,16 +8,12 @@ import { authApi } from "../api/auth";
 import { dashboardApi } from "../api/dashboard";
 import { heartbeatsApi } from "../api/heartbeats";
 import { issuesApi } from "../api/issues";
+import { useLocalInboxArchiveIssueIds } from "../lib/inboxArchiveCache";
 import { queryKeys } from "../lib/queryKeys";
-import {
-  filterLocalInboxArchivedIssues,
-  useLocalInboxArchiveIssueIds,
-} from "../lib/inboxArchiveCache";
 import { usePublishSharedQueryData, useSharedPollingQuery } from "./useSharedPolling";
 import {
   buildInboxDismissedAtByKey,
   computeInboxBadgeData,
-  getRecentTouchedIssues,
   loadDismissedInboxAlerts,
   saveDismissedInboxAlerts,
   loadReadInboxItems,
@@ -25,8 +21,6 @@ import {
   READ_ITEMS_KEY,
 } from "../lib/inbox";
 
-const INBOX_ISSUE_STATUSES = "backlog,todo,in_progress,in_review,blocked,done";
-const INBOX_BADGE_ISSUE_LIMIT = 500;
 const INBOX_BADGE_HEARTBEAT_RUN_LIMIT = 200;
 const INBOX_BADGE_HOT_PATH_STALE_MS = 30_000;
 
@@ -178,7 +172,6 @@ export function useReadInboxItems() {
 }
 
 export function useInboxBadge(companyId: string | null | undefined) {
-  const locallyArchivedIssueIds = useLocalInboxArchiveIssueIds(companyId);
   const { dismissed: dismissedAlerts } = useDismissedInboxAlerts();
   const { dismissedAtByKey } = useInboxDismissals(companyId);
   const { data: session } = useQuery({
@@ -222,31 +215,25 @@ export function useInboxBadge(companyId: string | null | undefined) {
   });
   usePublishSharedQueryData(sharedDashboard, dashboard, dashboardUpdatedAt);
 
-  const mineIssuesQueryKey = queryKeys.issues.listMineByMe(companyId!);
-  const sharedMineIssues = useSharedPollingQuery({
+  const unreadIssueIdsQueryKey = queryKeys.issues.inboxUnreadIssueIds(companyId!);
+  const sharedUnreadIssueIds = useSharedPollingQuery({
     companyId,
-    resourceKey: "inbox-badge:mine-issues",
-    queryKey: mineIssuesQueryKey,
+    resourceKey: "inbox-badge:unread-issue-ids",
+    queryKey: unreadIssueIdsQueryKey,
     enabled: !!companyId,
   });
-  const { data: mineIssuesRaw = [], dataUpdatedAt: mineIssuesUpdatedAt } = useQuery({
-    queryKey: mineIssuesQueryKey,
-    queryFn: () =>
-      issuesApi.list(companyId!, {
-        touchedByUserId: "me",
-        inboxArchivedByUserId: "me",
-        status: INBOX_ISSUE_STATUSES,
-        limit: INBOX_BADGE_ISSUE_LIMIT,
-      }),
+  const { data: unreadIssueIds, dataUpdatedAt: unreadIssueIdsUpdatedAt } = useQuery({
+    queryKey: unreadIssueIdsQueryKey,
+    queryFn: () => issuesApi.inboxUnreadIssueIds(companyId!),
     enabled: !!companyId,
     refetchOnWindowFocus: false,
     staleTime: INBOX_BADGE_HOT_PATH_STALE_MS,
   });
-  usePublishSharedQueryData(sharedMineIssues, mineIssuesRaw, mineIssuesUpdatedAt);
-
-  const mineIssues = useMemo(
-    () => getRecentTouchedIssues(filterLocalInboxArchivedIssues(companyId, mineIssuesRaw)),
-    [companyId, locallyArchivedIssueIds, mineIssuesRaw],
+  usePublishSharedQueryData(sharedUnreadIssueIds, unreadIssueIds, unreadIssueIdsUpdatedAt);
+  const locallyArchivedIssueIds = useLocalInboxArchiveIssueIds(companyId);
+  const unreadMineIssueCount = useMemo(
+    () => (unreadIssueIds?.issueIds ?? []).filter((id) => !locallyArchivedIssueIds.has(id)).length,
+    [unreadIssueIds, locallyArchivedIssueIds],
   );
   const currentUserId = session?.user.id ?? session?.session.userId ?? null;
 
@@ -265,11 +252,11 @@ export function useInboxBadge(companyId: string | null | undefined) {
         joinRequests,
         dashboard,
         heartbeatRuns,
-        mineIssues,
+        unreadMineIssueCount,
         dismissedAlerts,
         dismissedAtByKey,
         currentUserId,
       }),
-    [approvals, joinRequests, dashboard, heartbeatRuns, mineIssues, dismissedAlerts, dismissedAtByKey, currentUserId],
+    [approvals, joinRequests, dashboard, heartbeatRuns, unreadMineIssueCount, dismissedAlerts, dismissedAtByKey, currentUserId],
   );
 }

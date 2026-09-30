@@ -3823,6 +3823,21 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/issues/inbox-unread-issue-ids",
+  tags: ["issues", "inbox"],
+  summary: "List the ids of unread issues in the board user's inbox",
+  description:
+    "Returns `{ issueIds }` for the recent touched-by-me issues that are unread and not archived. Board users only.",
+  request: { params: z.object({ companyId: z.string() }) },
+  responses: {
+    200: r.ok(),
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
+});
+
+registry.registerPath({
   method: "post",
   path: "/api/companies/{companyId}/issues",
   tags: ["issues"],

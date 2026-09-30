@@ -2,7 +2,11 @@ import { queuedInteractionId, readQueuedInteractionResponse, hasQueuedInteractio
 import { deliverConversationComments, isConversation } from "../services/agent-conversations.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
-import { extractIssueReferenceIdentifiers, requiresExecutionReconciliation } from "@paperclipai/shared";
+import {
+  unreadRecentTouchedIssueIds,
+  extractIssueReferenceIdentifiers,
+  requiresExecutionReconciliation,
+} from "@paperclipai/shared";
 import {
   validateExecutionReconciliation,
   markExecutionReconciliation,
@@ -274,6 +278,7 @@ import {
   ISSUE_WAKE_DIAGNOSTICS_LOOKBACK_DAYS,
   ISSUE_WAKE_DIAGNOSTICS_MAX_ACTIVITY_RECORDS,
   ISSUE_WAKE_DIAGNOSTICS_MAX_WAKE_REQUESTS,
+  inboxMineIssueFilters,
   readAcceptedPlanConfirmationTarget,
   type IssuePostCommitAction,
 } from "../services/issues.js";
@@ -8272,6 +8277,24 @@ export function issueRoutes(
       identicalInFlightCount: coordinated.identicalInFlightCount,
     });
     res.json(coordinated.response.body);
+  });
+
+  // The Inbox badge needs only which issues are unread, not the touched-issue list.
+  router.get("/companies/:companyId/issues/inbox-unread-issue-ids", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    if (req.actor.type !== "board" || !req.actor.userId) {
+      res.status(403).json({ error: "inbox-unread-issue-ids requires board authentication" });
+      return;
+    }
+    const userId = req.actor.userId;
+    if (await actorCanReadCompanyScope(req, companyId)) {
+      res.json({ issueIds: await svc.listInboxUnreadIssueIds(companyId, userId) });
+      return;
+    }
+    const rows = await svc.list(companyId, inboxMineIssueFilters(userId));
+    const visible = await filterIssuesForActor(req, rows);
+    res.json({ issueIds: unreadRecentTouchedIssueIds(visible) });
   });
 
   router.get("/companies/:companyId/issues/count", async (req, res) => {

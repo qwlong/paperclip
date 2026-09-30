@@ -329,7 +329,7 @@ describe("inbox helpers", () => {
         makeRun("run-latest", "timed_out", "2026-03-11T01:00:00.000Z"),
         makeRun("run-other-agent", "failed", "2026-03-11T02:00:00.000Z", "agent-2"),
       ],
-      mineIssues: [makeIssue("1", true)],
+      unreadMineIssueCount: 1,
       dismissedAlerts: new Set<string>(),
       dismissedAtByKey: new Map<string, number>(),
       currentUserId: "user-1",
@@ -351,7 +351,7 @@ describe("inbox helpers", () => {
       joinRequests: [],
       dashboard,
       heartbeatRuns: [makeRun("run-1", "failed", "2026-03-11T00:00:00.000Z")],
-      mineIssues: [],
+      unreadMineIssueCount: 0,
       dismissedAlerts: new Set<string>(["alert:budget", "alert:agent-errors"]),
       dismissedAtByKey: new Map<string, number>([["run:run-1", new Date("2026-03-11T00:00:00.000Z").getTime()]]),
       currentUserId: "user-1",
@@ -367,13 +367,13 @@ describe("inbox helpers", () => {
     });
   });
 
-  it("excludes read mine issues from the inbox badge count", () => {
+  it("adds the server's unread mine issue count to the inbox badge", () => {
     const result = computeInboxBadgeData({
       approvals: [],
       joinRequests: [],
       dashboard,
       heartbeatRuns: [],
-      mineIssues: [makeIssue("1", false), makeIssue("2", false), makeIssue("3", true)],
+      unreadMineIssueCount: 1,
       dismissedAlerts: new Set<string>(),
       dismissedAtByKey: new Map(),
       currentUserId: "user-1",
@@ -478,7 +478,7 @@ describe("inbox helpers", () => {
       joinRequests: [],
       dashboard,
       heartbeatRuns: [],
-      mineIssues: [],
+      unreadMineIssueCount: 0,
       dismissedAlerts: new Set<string>(),
       dismissedAtByKey: new Map(),
       currentUserId: "user-1",
@@ -493,7 +493,7 @@ describe("inbox helpers", () => {
       joinRequests: [],
       dashboard,
       heartbeatRuns: [],
-      mineIssues: [],
+      unreadMineIssueCount: 0,
       dismissedAlerts: new Set<string>(),
       dismissedAtByKey: new Map(),
       currentUserId: "user-1",

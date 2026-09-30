@@ -304,6 +304,8 @@ export const queryKeys = {
       ["issues", companyId, "assigned-to-me"] as const,
     listMineByMe: (companyId: string) =>
       ["issues", companyId, "mine-by-me"] as const,
+    inboxUnreadIssueIds: (companyId: string) =>
+      ["issues", companyId, "mine-by-me", "unread-issue-ids"] as const,
     listTouchedByMe: (companyId: string) =>
       ["issues", companyId, "touched-by-me"] as const,
     listUnreadTouchedByMe: (companyId: string) =>
