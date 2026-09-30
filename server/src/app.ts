@@ -26,6 +26,11 @@ import { httpLogger, errorHandler } from "./middleware/index.js";
 import { actorMiddleware } from "./middleware/auth.js";
 import { boardMutationGuard } from "./middleware/board-mutation-guard.js";
 import {
+  agentRunUnauthenticatedWriteGuardFor,
+  createPeerRunResolver,
+  listRunningRunProcesses,
+} from "./middleware/agent-run-unauthenticated-write-guard.js";
+import {
   privateHostnameGuard,
   resolvePrivateHostnameAllowSet,
 } from "./middleware/private-hostname-guard.js";
@@ -640,6 +645,15 @@ export async function createApp(
   const agentAvatars = agentAvatarRoutes();
   api.use(agentAvatars.router);
   api.use(boardMutationGuard());
+  api.use(
+    agentRunUnauthenticatedWriteGuardFor({
+      deploymentMode: opts.deploymentMode,
+      mode: process.env.PAPERCLIP_AGENT_RUN_UNAUTHENTICATED_WRITES,
+      findRunForSocket: createPeerRunResolver({ listRunningRunProcesses: () => listRunningRunProcesses(db) }),
+      report: (write) =>
+        logger.warn({ unauthenticatedAgentRunWrite: write }, "agent run wrote without credentials as the local board"),
+    }),
+  );
   api.use(
     "/health",
     healthRoutes(db, {
