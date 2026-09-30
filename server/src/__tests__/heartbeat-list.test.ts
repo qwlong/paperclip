@@ -286,6 +286,87 @@ describeEmbeddedPostgres("heartbeat list", () => {
     expect((result?.stdout as string).length).toBeLessThan(oversizedStdout.length);
     expect(result).not.toHaveProperty("nestedHuge");
   });
+
+  async function seedCompanyAndAgent() {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "running",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    return { companyId, agentId };
+  }
+
+  it.each([
+    ["string values", { issueId: "i-1", taskKey: "MEM-1", wakeReason: "timer", padding: "x".repeat(40_000) }, { issueId: "i-1", taskKey: "MEM-1", wakeReason: "timer" }],
+    ["a numeric value", { issueId: 42 }, { issueId: "42" }],
+    ["an object value", { wakeTriggerDetail: { a: 1 } }, { wakeTriggerDetail: '{"a": 1}' }],
+    ["a JSON null value", { issueId: null, taskId: "t-1" }, { taskId: "t-1" }],
+    ["no known keys", { other: "x" }, null],
+    ["an array snapshot", [1, 2], null],
+    ["a string snapshot", "plain", null],
+    ["a numeric snapshot", 7, null],
+    ["a null snapshot", null, null],
+  ])("summarizes the context snapshot with %s", async (_label, snapshot, expected) => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "succeeded",
+      contextSnapshot: snapshot as Record<string, unknown> | null,
+    });
+
+    for (const summary of [true, false]) {
+      const runs = await heartbeatService(db).list(companyId, undefined, 5, { summary });
+      expect(runs).toHaveLength(1);
+      expect(runs[0]?.contextSnapshot ?? null).toEqual(expected);
+    }
+  });
+
+  it("summarizes result json fields in the full list", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "succeeded",
+      resultJson: {
+        summary: "s".repeat(10_000),
+        message: "done",
+        total_cost_usd: 1.25,
+        cost_usd: "0.5",
+        costUsd: "not-a-number",
+        stdout: "o".repeat(40_000),
+      },
+    });
+
+    const [run] = await heartbeatService(db).list(companyId, undefined, 5);
+    const summaryMax = (run?.resultJson as Record<string, unknown>)?.summary as string;
+    expect(summaryMax.length).toBeLessThan(10_000);
+    expect(run?.resultJson).toEqual({
+      summary: summaryMax,
+      message: "done",
+      total_cost_usd: 1.25,
+      cost_usd: 0.5,
+    });
+    expect(summaryMax).toBe("s".repeat(summaryMax.length));
+  });
 });
 
 describe("heartbeat run event payload bounding", () => {

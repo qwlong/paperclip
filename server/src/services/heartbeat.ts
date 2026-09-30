@@ -39,9 +39,9 @@ import { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-
 export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 import { buildExecutionContinuation, StaleExecutionContinuationError } from "./execution-continuation.js";
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
-import { PROJECT_REPOSITORIES_DIR, readGitWorkspaceSnapshot } from "@paperclipai/adapter-utils/git-workspace-sync";
+import { PROJECT_REPOSITORIES_DIR, readGitWorkspaceSnapshot, disposeGitWorkspaceSnapshot } from "@paperclipai/adapter-utils/git-workspace-sync";
 import { isWorkspaceGitScanError, WorkspaceGitScanError, WORKSPACE_GIT_SCAN_ERROR_CODES } from "./workspace-git-operation-scheduler.js";
-import { captureDirectorySnapshot, mergeDirectoryWithBaseline } from "@paperclipai/adapter-utils/workspace-restore-merge";
+import { captureDirectorySnapshot, disposeDirectorySnapshot, mergeDirectoryWithBaseline } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { initializeRunIdentity, explicitOperatorRunIdentity } from "./run-identity.js";
 import {
   assertDurableChatWakeupReceipt,
@@ -617,6 +617,7 @@ import {
 } from "./effective-run-config-fingerprints.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { serverVersion } from "../version.js";
+import { jsonbTextFields } from "./jsonb-text-fields.js";
 
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const MAX_PERSISTED_LOG_CHUNK_CHARS = 64 * 1024;
@@ -2516,8 +2517,14 @@ async function materializeManagedProjectWorkspace(
     if (input.localSource) {
       const snapshot = await readGitWorkspaceSnapshot(input.localSource, false);
       if (!snapshot) throw new Error("Configured repository folder is not a Git checkout");
-      const baseline = await captureDirectorySnapshot(cloneTmpDir, { exclude: [".git", ".paperclip-runtime", PROJECT_REPOSITORIES_DIR, ...snapshot.ignoredPaths] });
-      await mergeDirectoryWithBaseline({ baseline, sourceDir: input.localSource, targetDir: cloneTmpDir });
+      let baseline;
+      try {
+        baseline = await captureDirectorySnapshot(cloneTmpDir, { exclude: [".git", ".paperclip-runtime", PROJECT_REPOSITORIES_DIR], ignoredPaths: snapshot.ignoredPaths, diskBacked: true });
+        await mergeDirectoryWithBaseline({ baseline, sourceDir: input.localSource, targetDir: cloneTmpDir });
+      } finally {
+        if (baseline) await disposeDirectorySnapshot(baseline);
+        await disposeGitWorkspaceSnapshot(snapshot);
+      }
       await execFile("git", ["-C", cloneTmpDir, "remote", "set-url", "origin", input.repoUrl], { timeout: 10_000 });
     } else if (input.repoRef) {
       await execFile("git", ["-C", cloneTmpDir, "checkout", input.repoRef], { timeout: MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS });
@@ -3349,67 +3356,34 @@ const heartbeatRunSummaryListColumns = {
   resultJson: sql<Record<string, unknown> | null>`NULL`.as("resultJson"),
 } as const;
 
+export const HEARTBEAT_RUN_CONTEXT_SUMMARY_KEYS = [
+  "issueId",
+  "taskId",
+  "taskKey",
+  "commentId",
+  "wakeCommentId",
+  "wakeReason",
+  "wakeSource",
+  "wakeTriggerDetail",
+] as const;
+
 const heartbeatRunListContextColumns = {
-  contextIssueId: sql<
-    string | null
-  >`${heartbeatRuns.contextSnapshot} ->> 'issueId'`.as("contextIssueId"),
-  contextTaskId: sql<
-    string | null
-  >`${heartbeatRuns.contextSnapshot} ->> 'taskId'`.as("contextTaskId"),
-  contextTaskKey: sql<
-    string | null
-  >`${heartbeatRuns.contextSnapshot} ->> 'taskKey'`.as("contextTaskKey"),
-  contextCommentId: sql<
-    string | null
-  >`${heartbeatRuns.contextSnapshot} ->> 'commentId'`.as("contextCommentId"),
-  contextWakeCommentId: sql<
-    string | null
-  >`${heartbeatRuns.contextSnapshot} ->> 'wakeCommentId'`.as(
-    "contextWakeCommentId",
-  ),
-  contextWakeReason: sql<
-    string | null
-  >`${heartbeatRuns.contextSnapshot} ->> 'wakeReason'`.as("contextWakeReason"),
-  contextWakeSource: sql<
-    string | null
-  >`${heartbeatRuns.contextSnapshot} ->> 'wakeSource'`.as("contextWakeSource"),
-  contextWakeTriggerDetail: sql<
-    string | null
-  >`${heartbeatRuns.contextSnapshot} ->> 'wakeTriggerDetail'`.as(
-    "contextWakeTriggerDetail",
-  ),
+  contextFields: jsonbTextFields(
+    heartbeatRuns.contextSnapshot,
+    HEARTBEAT_RUN_CONTEXT_SUMMARY_KEYS.map((key) => ({ key })),
+  ).as("contextFields"),
 } as const;
 
 const heartbeatRunListResultColumns = {
-  resultSummary: sql<
-    string | null
-  >`left(${heartbeatRuns.resultJson} ->> 'summary', ${HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS})`.as(
-    "resultSummary",
-  ),
-  resultResult: sql<
-    string | null
-  >`left(${heartbeatRuns.resultJson} ->> 'result', ${HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS})`.as(
-    "resultResult",
-  ),
-  resultMessage: sql<
-    string | null
-  >`left(${heartbeatRuns.resultJson} ->> 'message', ${HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS})`.as(
-    "resultMessage",
-  ),
-  resultError: sql<
-    string | null
-  >`left(${heartbeatRuns.resultJson} ->> 'error', ${HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS})`.as(
-    "resultError",
-  ),
-  resultTotalCostUsd: sql<
-    string | null
-  >`${heartbeatRuns.resultJson} ->> 'total_cost_usd'`.as("resultTotalCostUsd"),
-  resultCostUsd: sql<
-    string | null
-  >`${heartbeatRuns.resultJson} ->> 'cost_usd'`.as("resultCostUsd"),
-  resultCostUsdCamel: sql<
-    string | null
-  >`${heartbeatRuns.resultJson} ->> 'costUsd'`.as("resultCostUsdCamel"),
+  resultFields: jsonbTextFields(heartbeatRuns.resultJson, [
+    { key: "summary", maxChars: HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS },
+    { key: "result", maxChars: HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS },
+    { key: "message", maxChars: HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS },
+    { key: "error", maxChars: HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS },
+    { key: "total_cost_usd" },
+    { key: "cost_usd" },
+    { key: "costUsd" },
+  ]).as("resultFields"),
 } as const;
 
 const heartbeatRunSafeResultJsonColumn = sql<Record<string, unknown> | null>`
@@ -5125,23 +5099,26 @@ export function summarizeHeartbeatRunContextSnapshot(
   contextSnapshot: Record<string, unknown> | null | undefined,
 ): Record<string, unknown> | null {
   const summary: Record<string, unknown> = {};
-  const allowedKeys = [
-    "issueId",
-    "taskId",
-    "taskKey",
-    "commentId",
-    "wakeCommentId",
-    "wakeReason",
-    "wakeSource",
-    "wakeTriggerDetail",
-  ] as const;
-
-  for (const key of allowedKeys) {
+  for (const key of HEARTBEAT_RUN_CONTEXT_SUMMARY_KEYS) {
     const value = readNonEmptyString(contextSnapshot?.[key]);
     if (value) summary[key] = value;
   }
 
   return Object.keys(summary).length > 0 ? summary : null;
+}
+
+export function summarizeHeartbeatRunListResultFields(
+  fields: Record<string, string | null> | null | undefined,
+): Record<string, unknown> | null {
+  return summarizeHeartbeatRunListResultJson({
+    summary: fields?.summary,
+    result: fields?.result,
+    message: fields?.message,
+    error: fields?.error,
+    totalCostUsd: fields?.total_cost_usd,
+    costUsd: fields?.cost_usd,
+    costUsdCamel: fields?.costUsd,
+  });
 }
 
 export function summarizeHeartbeatRunListResultJson(input: {
@@ -12080,15 +12057,7 @@ export function heartbeatService(
       };
     }
 
-    const latestSummary = summarizeHeartbeatRunListResultJson({
-      summary: latestRun?.resultSummary,
-      result: latestRun?.resultResult,
-      message: latestRun?.resultMessage,
-      error: latestRun?.resultError,
-      totalCostUsd: latestRun?.resultTotalCostUsd,
-      costUsd: latestRun?.resultCostUsd,
-      costUsdCamel: latestRun?.resultCostUsdCamel,
-    });
+    const latestSummary = summarizeHeartbeatRunListResultFields(latestRun?.resultFields);
     const latestTextSummary =
       readNonEmptyString(latestSummary?.summary) ??
       readNonEmptyString(latestSummary?.result) ??
@@ -29309,57 +29278,17 @@ export function heartbeatService(
 
       const rows = limit ? await query.limit(limit) : await query;
       return rows.map((row) => {
-        const {
-          contextIssueId,
-          contextTaskId,
-          contextTaskKey,
-          contextCommentId,
-          contextWakeCommentId,
-          contextWakeReason,
-          contextWakeSource,
-          contextWakeTriggerDetail,
-          resultSummary,
-          resultResult,
-          resultMessage,
-          resultError,
-          resultTotalCostUsd,
-          resultCostUsd,
-          resultCostUsdCamel,
-          ...rest
-        } = row as typeof row & {
-          resultSummary?: string | null;
-          resultResult?: string | null;
-          resultMessage?: string | null;
-          resultError?: string | null;
-          resultTotalCostUsd?: string | null;
-          resultCostUsd?: string | null;
-          resultCostUsdCamel?: string | null;
+        const { contextFields, resultFields, ...rest } = row as typeof row & {
+          resultFields?: Record<string, string | null> | null;
         };
 
         return {
           ...rest,
-          contextSnapshot: summarizeHeartbeatRunContextSnapshot({
-            issueId: contextIssueId,
-            taskId: contextTaskId,
-            taskKey: contextTaskKey,
-            commentId: contextCommentId,
-            wakeCommentId: contextWakeCommentId,
-            wakeReason: contextWakeReason,
-            wakeSource: contextWakeSource,
-            wakeTriggerDetail: contextWakeTriggerDetail,
-          }),
+          contextSnapshot: summarizeHeartbeatRunContextSnapshot(contextFields),
           resultJson:
             safeForLegacyEncoding || summary
               ? null
-              : summarizeHeartbeatRunListResultJson({
-                  summary: resultSummary,
-                  result: resultResult,
-                  message: resultMessage,
-                  error: resultError,
-                  totalCostUsd: resultTotalCostUsd,
-                  costUsd: resultCostUsd,
-                  costUsdCamel: resultCostUsdCamel,
-                }),
+              : summarizeHeartbeatRunListResultFields(resultFields),
         };
       });
     },
