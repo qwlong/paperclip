@@ -12,12 +12,11 @@ import {
   issues,
 } from "@paperclipai/db";
 import {
-  countUnreadRecentTouchedIssues,
-  INBOX_MINE_ISSUE_STATUS_FILTER,
+  unreadRecentTouchedIssueIds,
   INBOX_TOUCHED_ISSUE_FETCH_LIMIT,
   RECENT_ISSUES_LIMIT,
 } from "@paperclipai/shared";
-import { issueService } from "../services/issues.js";
+import { inboxMineIssueFilters, issueService } from "../services/issues.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -41,12 +40,12 @@ function seededRandom(seed: number) {
   };
 }
 
-describeEmbeddedPostgres("issueService.countInboxUnreadIssues", () => {
+describeEmbeddedPostgres("issueService.listInboxUnreadIssueIds", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
 
   beforeAll(async () => {
-    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-inbox-unread-count-service-");
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-inbox-unread-issue-ids-service-");
     db = createDb(tempDb.connectionString);
   }, 20_000);
 
@@ -86,18 +85,19 @@ describeEmbeddedPostgres("issueService.countInboxUnreadIssues", () => {
     return { companyId, agentId };
   }
 
-  async function countFromList(companyId: string, userId: string) {
-    const rows = await issueService(db).list(companyId, {
-      touchedByUserId: userId,
-      inboxArchivedByUserId: userId,
-      status: INBOX_MINE_ISSUE_STATUS_FILTER,
-      limit: INBOX_TOUCHED_ISSUE_FETCH_LIMIT,
-    });
+  async function unreadFromList(companyId: string, userId: string) {
+    const rows = await issueService(db).list(companyId, inboxMineIssueFilters(userId));
+    const ids = unreadRecentTouchedIssueIds(rows).sort();
     return {
-      count: countUnreadRecentTouchedIssues(rows),
+      ids,
+      count: ids.length,
       rows: rows.length,
       unreadAnywhere: rows.filter((row) => row.isUnreadForMe).length,
     };
+  }
+
+  async function unreadFromService(companyId: string, userId: string) {
+    return [...await issueService(db).listInboxUnreadIssueIds(companyId, userId)].sort();
   }
 
   /** Random issues touched in every way the Inbox recognises, with ties on the minute. */
@@ -186,13 +186,13 @@ describeEmbeddedPostgres("issueService.countInboxUnreadIssues", () => {
 
   it.each([1, 2, 3, 4, 5])("matches the Inbox list's unread count (seed %i)", async (seed) => {
     const { companyId, userId } = await seedRandomInbox(seed, 260);
-    const expected = await countFromList(companyId, userId);
+    const expected = await unreadFromList(companyId, userId);
     // Precondition: the fixture is big enough that the recent window excludes unread issues.
     expect(expected.rows).toBeGreaterThan(RECENT_ISSUES_LIMIT);
     expect(expected.unreadAnywhere).toBeGreaterThan(expected.count);
     expect(expected.count).toBeGreaterThan(0);
 
-    expect(await issueService(db).countInboxUnreadIssues(companyId, userId)).toBe(expected.count);
+    expect(await unreadFromService(companyId, userId)).toEqual(expected.ids);
   });
 
   it("compares read and reply times at the millisecond precision the Inbox list uses", async () => {
@@ -214,11 +214,11 @@ describeEmbeddedPostgres("issueService.countInboxUnreadIssues", () => {
       { companyId, issueId: laterMsId, authorAgentId: agentId, body: "later ms", createdAt: sql`'2026-09-01T01:00:00.001100Z'::timestamptz`, updatedAt: minutes(60) },
     ] as never);
 
-    const expected = await countFromList(companyId, userId);
+    const expected = await unreadFromList(companyId, userId);
     // Precondition: only the reply in a later millisecond is unread for the list.
-    expect(expected).toEqual({ count: 1, rows: 2, unreadAnywhere: 1 });
+    expect(expected).toMatchObject({ count: 1, rows: 2, unreadAnywhere: 1 });
 
-    expect(await issueService(db).countInboxUnreadIssues(companyId, userId)).toBe(1);
+    expect(await unreadFromService(companyId, userId)).toEqual(expected.ids);
   });
 
   /**
@@ -277,12 +277,12 @@ describeEmbeddedPostgres("issueService.countInboxUnreadIssues", () => {
     },
   ])("breaks ties at the window edge like the Inbox list: $name", async ({ unread, read, expected }) => {
     const { companyId, userId } = await seedTieAtWindowEdge({ unread, read });
-    const fromList = await countFromList(companyId, userId);
+    const fromList = await unreadFromList(companyId, userId);
     // Precondition: both tied issues are fetched and only one fits in the window.
     expect(fromList.rows).toBe(RECENT_ISSUES_LIMIT + 1);
     expect(fromList.count).toBe(expected);
 
-    expect(await issueService(db).countInboxUnreadIssues(companyId, userId)).toBe(expected);
+    expect(await unreadFromService(companyId, userId)).toEqual(fromList.ids);
   });
 
   it("windows the same prefetch the Inbox list does when more issues are touched than it fetches", async () => {
@@ -301,11 +301,11 @@ describeEmbeddedPostgres("issueService.countInboxUnreadIssues", () => {
     await db.insert(issueReadStates).values(readRows);
     await db.insert(issueComments).values({ companyId, issueId: lowPriorityId, authorAgentId: agentId, body: "reply", createdAt: minutes(20_001), updatedAt: minutes(20_001) });
 
-    const expected = await countFromList(companyId, userId);
+    const expected = await unreadFromList(companyId, userId);
     // Precondition: the prefetch is full, so the newest low-priority issue is left out of it.
     expect(expected.rows).toBe(INBOX_TOUCHED_ISSUE_FETCH_LIMIT);
     expect(expected.count).toBe(0);
 
-    expect(await issueService(db).countInboxUnreadIssues(companyId, userId)).toBe(0);
+    expect(await unreadFromService(companyId, userId)).toEqual([]);
   });
 });

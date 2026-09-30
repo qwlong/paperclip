@@ -8225,13 +8225,14 @@ export function issueService(db: Db) {
     },
 
     /**
-     * The unread issues among the ones the Inbox "mine" list shows: the same
-     * prefetch `list` returns for the Inbox, then its most recently active
-     * `RECENT_ISSUES_LIMIT`, ordered as `getRecentTouchedIssues` orders them.
+     * The ids of the unread issues among the ones the Inbox "mine" list shows:
+     * the same prefetch `list` returns for the Inbox, then its most recently
+     * active `RECENT_ISSUES_LIMIT`, ordered as `getRecentTouchedIssues` orders them.
      */
-    countInboxUnreadIssues: async (companyId: string, userId: string) => {
-      const conditions = await issueListConditions(db, companyId, inboxMineIssueFilters(userId));
-      if (!conditions) return 0;
+    listInboxUnreadIssueIds: async (companyId: string, userId: string): Promise<string[]> => {
+      const filters = inboxMineIssueFilters(userId);
+      const conditions = await issueListConditions(db, companyId, filters);
+      if (!conditions) return [];
       const priorityRank = issuePriorityRankExpr();
       const lastActivityAt = issueCanonicalLastActivityAtExpr(companyId);
       const prefetch = db
@@ -8253,10 +8254,10 @@ export function issueService(db: Db) {
             searchOrder: sql`0`,
           }),
         )
-        .limit(INBOX_TOUCHED_ISSUE_FETCH_LIMIT)
+        .limit(filters.limit!)
         .as("inbox_prefetch");
       const recent = db
-        .select({ unread: prefetch.unread })
+        .select({ id: prefetch.id, unread: prefetch.unread })
         .from(prefetch)
         .orderBy(
           desc(prefetch.lastActivityMs),
@@ -8268,10 +8269,8 @@ export function issueService(db: Db) {
         )
         .limit(RECENT_ISSUES_LIMIT)
         .as("inbox_recent");
-      const [row] = await db
-        .select({ count: sql<number>`(count(*) FILTER (WHERE ${recent.unread}))::int` })
-        .from(recent);
-      return row?.count ?? 0;
+      const rows = await db.select({ id: recent.id }).from(recent).where(sql`${recent.unread}`);
+      return rows.map((row) => row.id);
     },
 
     count: async (companyId: string, filters?: IssueFilters) => {

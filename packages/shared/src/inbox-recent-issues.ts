@@ -38,9 +38,9 @@ export function getRecentTouchedIssues<T extends InboxActivityFields>(issues: T[
   return [...issues].sort(sortIssuesByMostRecentActivity).slice(0, RECENT_ISSUES_LIMIT);
 }
 
-/** The number of unread issues among those the Inbox lists. */
-export function countUnreadRecentTouchedIssues(
-  issues: Array<InboxActivityFields & { isUnreadForMe?: boolean }>,
-): number {
-  return getRecentTouchedIssues(issues).filter((issue) => issue.isUnreadForMe).length;
+/** The ids of the unread issues among those the Inbox lists. */
+export function unreadRecentTouchedIssueIds(
+  issues: Array<InboxActivityFields & { id: string; isUnreadForMe?: boolean }>,
+): string[] {
+  return getRecentTouchedIssues(issues).filter((issue) => issue.isUnreadForMe).map((issue) => issue.id);
 }

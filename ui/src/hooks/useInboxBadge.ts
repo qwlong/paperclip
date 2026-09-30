@@ -8,6 +8,7 @@ import { authApi } from "../api/auth";
 import { dashboardApi } from "../api/dashboard";
 import { heartbeatsApi } from "../api/heartbeats";
 import { issuesApi } from "../api/issues";
+import { useLocalInboxArchiveIssueIds } from "../lib/inboxArchiveCache";
 import { queryKeys } from "../lib/queryKeys";
 import { usePublishSharedQueryData, useSharedPollingQuery } from "./useSharedPolling";
 import {
@@ -214,22 +215,26 @@ export function useInboxBadge(companyId: string | null | undefined) {
   });
   usePublishSharedQueryData(sharedDashboard, dashboard, dashboardUpdatedAt);
 
-  const inboxUnreadCountQueryKey = queryKeys.issues.inboxUnreadCount(companyId!);
-  const sharedInboxUnreadCount = useSharedPollingQuery({
+  const unreadIssueIdsQueryKey = queryKeys.issues.inboxUnreadIssueIds(companyId!);
+  const sharedUnreadIssueIds = useSharedPollingQuery({
     companyId,
-    resourceKey: "inbox-badge:unread-count",
-    queryKey: inboxUnreadCountQueryKey,
+    resourceKey: "inbox-badge:unread-issue-ids",
+    queryKey: unreadIssueIdsQueryKey,
     enabled: !!companyId,
   });
-  const { data: inboxUnreadCount, dataUpdatedAt: inboxUnreadCountUpdatedAt } = useQuery({
-    queryKey: inboxUnreadCountQueryKey,
-    queryFn: () => issuesApi.inboxUnreadCount(companyId!),
+  const { data: unreadIssueIds, dataUpdatedAt: unreadIssueIdsUpdatedAt } = useQuery({
+    queryKey: unreadIssueIdsQueryKey,
+    queryFn: () => issuesApi.inboxUnreadIssueIds(companyId!),
     enabled: !!companyId,
     refetchOnWindowFocus: false,
     staleTime: INBOX_BADGE_HOT_PATH_STALE_MS,
   });
-  usePublishSharedQueryData(sharedInboxUnreadCount, inboxUnreadCount, inboxUnreadCountUpdatedAt);
-  const unreadMineIssueCount = inboxUnreadCount?.count ?? 0;
+  usePublishSharedQueryData(sharedUnreadIssueIds, unreadIssueIds, unreadIssueIdsUpdatedAt);
+  const locallyArchivedIssueIds = useLocalInboxArchiveIssueIds(companyId);
+  const unreadMineIssueCount = useMemo(
+    () => (unreadIssueIds?.issueIds ?? []).filter((id) => !locallyArchivedIssueIds.has(id)).length,
+    [unreadIssueIds, locallyArchivedIssueIds],
+  );
   const currentUserId = session?.user.id ?? session?.session.userId ?? null;
 
   const { data: heartbeatRuns = [] } = useQuery({

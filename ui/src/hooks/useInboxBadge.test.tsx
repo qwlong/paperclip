@@ -7,11 +7,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   listIssues: vi.fn(async () => []),
-  inboxUnreadCount: vi.fn(async () => ({ count: 3 })),
+  inboxUnreadIssueIds: vi.fn(async () => ({ issueIds: ["issue-a", "issue-b", "issue-c"] })),
 }));
 
 vi.mock("../api/issues", () => ({
-  issuesApi: { list: mocks.listIssues, inboxUnreadCount: mocks.inboxUnreadCount },
+  issuesApi: { list: mocks.listIssues, inboxUnreadIssueIds: mocks.inboxUnreadIssueIds },
 }));
 vi.mock("../api/approvals", () => ({ approvalsApi: { list: async () => [] } }));
 vi.mock("../api/access", () => ({ accessApi: { listJoinRequests: async () => [] } }));
@@ -20,8 +20,7 @@ vi.mock("../api/dashboard", () => ({ dashboardApi: { summary: async () => undefi
 vi.mock("../api/heartbeats", () => ({ heartbeatsApi: { list: async () => [] } }));
 vi.mock("../api/inboxDismissals", () => ({ inboxDismissalsApi: { list: async () => [] } }));
 
-import type { Issue } from "@paperclipai/shared";
-import { removeIssueFromInboxCaches } from "../lib/inboxArchiveCache";
+import { beginLocalInboxArchive, clearLocalInboxArchive } from "../lib/inboxArchiveCache";
 import { queryKeys } from "../lib/queryKeys";
 import { useInboxBadge } from "./useInboxBadge";
 
@@ -42,7 +41,7 @@ describe("useInboxBadge", () => {
     vi.clearAllMocks();
   });
 
-  it("counts unread mine issues from the server count, not from an issue list", async () => {
+  it("counts unread mine issues from the server's unread ids, not from an issue list", async () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     let latest: Badge | null = null;
     root = createRoot(document.createElement("div"));
@@ -57,7 +56,7 @@ describe("useInboxBadge", () => {
     await vi.waitFor(() => expect(latest?.mineIssues).toBe(3));
 
     expect(latest!.inbox).toBe(3);
-    expect(mocks.inboxUnreadCount).toHaveBeenCalledWith("company-1");
+    expect(mocks.inboxUnreadIssueIds).toHaveBeenCalledWith("company-1");
     expect(mocks.listIssues).not.toHaveBeenCalled();
   });
 
@@ -76,26 +75,29 @@ describe("useInboxBadge", () => {
     return { queryClient, badge };
   }
 
-  it("drops at once when the Inbox archives an unread issue", async () => {
+  it("drops at once when an unread issue is being archived, and stays down while a refetch still lists it", async () => {
     const { queryClient, badge } = await renderBadge();
-    queryClient.setQueryData<Issue[]>(
-      [...queryKeys.issues.listMineByMe("company-1"), "compact"],
-      [{ id: "issue-a", isUnreadForMe: true } as Issue],
-    );
 
-    act(() => removeIssueFromInboxCaches(queryClient, "company-1", "issue-a"));
-
+    act(() => beginLocalInboxArchive("company-1", "issue-a"));
     await vi.waitFor(() => expect(badge.current?.mineIssues).toBe(2));
+
+    // The server has not applied the archive yet, so a refetch still lists the issue.
+    await act(() => queryClient.invalidateQueries({ queryKey: queryKeys.issues.listMineByMe("company-1") }));
+    await vi.waitFor(() => expect(mocks.inboxUnreadIssueIds).toHaveBeenCalledTimes(2));
+    expect(badge.current?.mineIssues).toBe(2);
+
+    act(() => clearLocalInboxArchive("company-1", "issue-a"));
+    await vi.waitFor(() => expect(badge.current?.mineIssues).toBe(3));
   });
 
   it("refetches when the mine list is invalidated, and not on other sidebar badge refreshes", async () => {
     const { queryClient } = await renderBadge();
-    expect(mocks.inboxUnreadCount).toHaveBeenCalledTimes(1);
+    expect(mocks.inboxUnreadIssueIds).toHaveBeenCalledTimes(1);
 
     await act(() => queryClient.invalidateQueries({ queryKey: queryKeys.sidebarBadges("company-1") }));
-    expect(mocks.inboxUnreadCount).toHaveBeenCalledTimes(1);
+    expect(mocks.inboxUnreadIssueIds).toHaveBeenCalledTimes(1);
 
     await act(() => queryClient.invalidateQueries({ queryKey: queryKeys.issues.listMineByMe("company-1") }));
-    await vi.waitFor(() => expect(mocks.inboxUnreadCount).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(mocks.inboxUnreadIssueIds).toHaveBeenCalledTimes(2));
   });
 });

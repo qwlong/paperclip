@@ -219,8 +219,8 @@ export const issuesApi = {
       `/companies/${companyId}/issues/count?${params.toString()}`,
     );
   },
-  inboxUnreadCount: (companyId: string) =>
-    api.get<{ count: number }>(`/companies/${companyId}/issues/inbox-unread-count`),
+  inboxUnreadIssueIds: (companyId: string) =>
+    api.get<{ issueIds: string[] }>(`/companies/${companyId}/issues/inbox-unread-issue-ids`),
   listLabels: (companyId: string) =>
     api.get<IssueLabel[]>(`/companies/${companyId}/labels`),
   createLabel: (companyId: string, data: { name: string; color: string }) =>

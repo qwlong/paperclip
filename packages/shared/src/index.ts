@@ -1680,7 +1680,7 @@ export {
 } from "./issue-references.js";
 
 export {
-  countUnreadRecentTouchedIssues,
+  unreadRecentTouchedIssueIds,
   getRecentTouchedIssues,
   INBOX_TOUCHED_ISSUE_FETCH_LIMIT,
   issueLastActivityTimestamp,

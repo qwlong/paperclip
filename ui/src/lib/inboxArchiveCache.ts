@@ -163,26 +163,13 @@ function inboxIssueQueryPrefixes(companyId: string) {
 
 /**
  * The cached queries under the inbox prefixes that hold issue lists. The mine
- * prefix also holds the unread count, so it is refreshed with the list.
+ * prefix also holds the unread issue ids, so they are refreshed with the list.
  */
 function issueListQueries(queryClient: QueryClient, companyId: string) {
-  const countHash = hashKey(queryKeys.issues.inboxUnreadCount(companyId));
+  const unreadIdsHash = hashKey(queryKeys.issues.inboxUnreadIssueIds(companyId));
   return inboxIssueQueryPrefixes(companyId).flatMap((queryKey) =>
     queryClient.getQueryCache().findAll({ queryKey })
-      .filter((query) => query.queryHash !== countHash),
-  );
-}
-
-function cachedIssues(queryClient: QueryClient, companyId: string, issueId: string): Issue[] {
-  return issueListQueries(queryClient, companyId).flatMap((query) =>
-    (query.state.data as Issue[] | undefined)?.filter((issue) => issue.id === issueId) ?? [],
-  );
-}
-
-function adjustInboxUnreadCount(queryClient: QueryClient, companyId: string, delta: number) {
-  queryClient.setQueryData<{ count: number }>(
-    queryKeys.issues.inboxUnreadCount(companyId),
-    (cached) => (cached ? { count: Math.max(0, cached.count + delta) } : cached),
+      .filter((query) => query.queryHash !== unreadIdsHash),
   );
 }
 
@@ -220,11 +207,9 @@ export function removeIssueFromInboxCaches(
   companyId: string,
   issueId: string,
 ) {
-  const wasUnread = cachedIssues(queryClient, companyId, issueId).some((issue) => issue.isUnreadForMe);
   for (const query of issueListQueries(queryClient, companyId)) {
     queryClient.setQueryData<Issue[]>(query.queryKey, (cached) => cached?.filter((issue) => issue.id !== issueId));
   }
-  if (wasUnread) adjustInboxUnreadCount(queryClient, companyId, -1);
 }
 
 export function restoreIssueToInboxCaches(
@@ -232,8 +217,6 @@ export function restoreIssueToInboxCaches(
   snapshot: InboxIssueCacheSnapshot,
   issueId: string,
 ) {
-  let restoredUnread = false;
-  let companyId: string | null = null;
   for (const [queryKey, previousData] of snapshot) {
     if (!previousData) continue;
 
@@ -244,14 +227,11 @@ export function restoreIssueToInboxCaches(
     queryClient.setQueryData<Issue[]>(queryKey, (currentData) => {
       if (currentData?.some((issue) => issue.id === issueId)) return currentData;
 
-      restoredUnread ||= Boolean(issueToRestore?.isUnreadForMe);
-      companyId ??= inboxIssueCompanyIdFromQueryKey(queryKey);
       const nextData = [...(currentData ?? [])];
       nextData.splice(resolveRestoreIndex(nextData, previousData, previousIndex), 0, issueToRestore);
       return nextData;
     });
   }
-  if (restoredUnread && companyId) adjustInboxUnreadCount(queryClient, companyId, 1);
 }
 
 export function invalidateInboxIssueQueries(queryClient: QueryClient, companyId: string) {

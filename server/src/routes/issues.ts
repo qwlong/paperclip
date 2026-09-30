@@ -3,7 +3,7 @@ import { deliverConversationComments, isConversation } from "../services/agent-c
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
 import {
-  countUnreadRecentTouchedIssues,
+  unreadRecentTouchedIssueIds,
   extractIssueReferenceIdentifiers,
   requiresExecutionReconciliation,
 } from "@paperclipai/shared";
@@ -8279,22 +8279,22 @@ export function issueRoutes(
     res.json(coordinated.response.body);
   });
 
-  // The Inbox badge needs only this number, not the touched-issue list.
-  router.get("/companies/:companyId/issues/inbox-unread-count", async (req, res) => {
+  // The Inbox badge needs only which issues are unread, not the touched-issue list.
+  router.get("/companies/:companyId/issues/inbox-unread-issue-ids", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     if (req.actor.type !== "board" || !req.actor.userId) {
-      res.status(403).json({ error: "inbox-unread-count requires board authentication" });
+      res.status(403).json({ error: "inbox-unread-issue-ids requires board authentication" });
       return;
     }
     const userId = req.actor.userId;
     if (await actorCanReadCompanyScope(req, companyId)) {
-      res.json({ count: await svc.countInboxUnreadIssues(companyId, userId) });
+      res.json({ issueIds: await svc.listInboxUnreadIssueIds(companyId, userId) });
       return;
     }
     const rows = await svc.list(companyId, inboxMineIssueFilters(userId));
     const visible = await filterIssuesForActor(req, rows);
-    res.json({ count: countUnreadRecentTouchedIssues(visible) });
+    res.json({ issueIds: unreadRecentTouchedIssueIds(visible) });
   });
 
   router.get("/companies/:companyId/issues/count", async (req, res) => {

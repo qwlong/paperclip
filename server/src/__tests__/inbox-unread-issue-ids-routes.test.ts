@@ -27,12 +27,12 @@ const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : 
 const BASE_TIME = Date.parse("2026-09-01T00:00:00.000Z");
 const minutes = (n: number) => new Date(BASE_TIME + n * 60_000);
 
-describeEmbeddedPostgres("GET /companies/:companyId/issues/inbox-unread-count", () => {
+describeEmbeddedPostgres("GET /companies/:companyId/issues/inbox-unread-issue-ids", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
 
   beforeAll(async () => {
-    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-inbox-unread-count-");
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-inbox-unread-issue-ids-");
     db = createDb(tempDb.connectionString);
   }, 20_000);
 
@@ -168,12 +168,12 @@ describeEmbeddedPostgres("GET /companies/:companyId/issues/inbox-unread-count", 
     return issueId;
   }
 
-  async function fetchCount(app: express.Express, companyId: string) {
-    const res = await request(app).get(`/api/companies/${companyId}/issues/inbox-unread-count`).expect(200);
-    return res.body as { count: number };
+  async function fetchUnreadIds(app: express.Express, companyId: string) {
+    const res = await request(app).get(`/api/companies/${companyId}/issues/inbox-unread-issue-ids`).expect(200);
+    return [...(res.body as { issueIds: string[] }).issueIds].sort();
   }
 
-  it("counts only unread issues the user touched and has not archived", async () => {
+  it("lists only unread issues the user touched and has not archived", async () => {
     const { companyId, agentId } = await seedCompany();
     const other = await seedCompany();
     const userId = await seedUser();
@@ -181,8 +181,8 @@ describeEmbeddedPostgres("GET /companies/:companyId/issues/inbox-unread-count", 
     await addMember(other.companyId, userId);
     const base = { companyId, agentId, userId };
 
-    await touchedIssue({ ...base, at: 10 });
-    await touchedIssue({ ...base, at: 20, status: "in_review" });
+    const unreadTodo = await touchedIssue({ ...base, at: 10 });
+    const unreadInReview = await touchedIssue({ ...base, at: 20, status: "in_review" });
     await touchedIssue({ ...base, at: 30, readAt: 40 });
     await touchedIssue({ ...base, at: 50, archivedAt: 60 });
     await touchedIssue({ ...base, at: 70, status: "cancelled" });
@@ -190,10 +190,10 @@ describeEmbeddedPostgres("GET /companies/:companyId/issues/inbox-unread-count", 
     await touchedIssue({ ...other, userId, at: 90 });
 
     const app = boardApp(userId, [companyId, other.companyId]);
-    expect(await fetchCount(app, companyId)).toEqual({ count: 2 });
+    expect(await fetchUnreadIds(app, companyId)).toEqual([unreadTodo, unreadInReview].sort());
   });
 
-  it("counts within the same most-recent window the Inbox list shows", async () => {
+  it("lists within the same most-recent window the Inbox list shows", async () => {
     const { companyId, agentId } = await seedCompany();
     const userId = await seedUser();
     await addMember(companyId, userId);
@@ -205,7 +205,7 @@ describeEmbeddedPostgres("GET /companies/:companyId/issues/inbox-unread-count", 
       await touchedIssue({ ...base, at: 10 * i, readAt: 10 * i + 5 });
     }
     // Newest activity, unread: inside the window.
-    await touchedIssue({ ...base, at: 5_000 });
+    const newest = await touchedIssue({ ...base, at: 5_000 });
 
     const app = boardApp(userId, [companyId]);
     const list = await request(app)
@@ -221,7 +221,7 @@ describeEmbeddedPostgres("GET /companies/:companyId/issues/inbox-unread-count", 
     expect(list.body).toHaveLength(101);
     expect(list.body.filter((issue: { isUnreadForMe?: boolean }) => issue.isUnreadForMe)).toHaveLength(2);
 
-    expect(await fetchCount(app, companyId)).toEqual({ count: 1 });
+    expect(await fetchUnreadIds(app, companyId)).toEqual([newest]);
   });
 
   it("rejects actors that are not a board user", async () => {
@@ -234,6 +234,6 @@ describeEmbeddedPostgres("GET /companies/:companyId/issues/inbox-unread-count", 
     app.use("/api", issueRoutes(db, {} as never));
     app.use(errorHandler);
 
-    await request(app).get(`/api/companies/${companyId}/issues/inbox-unread-count`).expect(403);
+    await request(app).get(`/api/companies/${companyId}/issues/inbox-unread-issue-ids`).expect(403);
   });
 });
