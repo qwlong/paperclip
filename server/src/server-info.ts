@@ -1,51 +1,38 @@
-import { execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import type { ServerGitInfo, ServerGitLocalChanges, ServerInfoSnapshot } from "@paperclipai/shared";
 import { parseBuildCommit, readBuildCommit } from "./build-commit.js";
 
 export type { ServerGitInfo, ServerInfoSnapshot };
 
-type GitCommand = () => string;
+type GitCommand = () => Promise<string>;
 type BuildCommitCommand = () => string | null;
 
 const SHORT_SHA_RE = /^[0-9a-f]{7,40}$/i;
+const GIT_COMMAND_TIMEOUT_MS = 1500;
+const execFileAsync = promisify(execFile);
+
+async function runGit(args: string[], cwd?: string): Promise<string> {
+  const { stdout } = await execFileAsync("git", args, {
+    cwd,
+    encoding: "utf8",
+    timeout: GIT_COMMAND_TIMEOUT_MS,
+  });
+  return stdout;
+}
 
 // `git log -1` reads only the commit object. `git show` diffs a merge against
 // its parents even with `-s`, which scales with the size of the merge.
-export function readHeadCommitMetadata(cwd?: string) {
-  return execFileSync(
-    "git",
-    ["log", "-1", "--format=%H%n%h%n%s%n%cI", "HEAD"],
-    {
-      cwd,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-      timeout: 1500,
-    },
-  );
+export function readHeadCommitMetadata(cwd?: string): Promise<string> {
+  return runGit(["log", "-1", "--format=%H%n%h%n%s%n%cI", "HEAD"], cwd);
 }
 
-function defaultGitStatusCommand() {
-  return execFileSync(
-    "git",
-    ["status", "--porcelain=v1", "--untracked-files=normal"],
-    {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-      timeout: 1500,
-    },
-  );
+function defaultGitStatusCommand(): Promise<string> {
+  return runGit(["status", "--porcelain=v1", "--untracked-files=normal"]);
 }
 
-function defaultGitBranchCommand() {
-  return execFileSync(
-    "git",
-    ["symbolic-ref", "--quiet", "--short", "HEAD"],
-    {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-      timeout: 1500,
-    },
-  );
+function defaultGitBranchCommand(): Promise<string> {
+  return runGit(["symbolic-ref", "--quiet", "--short", "HEAD"]);
 }
 
 function parseGitLocalChanges(output: string): ServerGitLocalChanges {
@@ -75,9 +62,9 @@ function parseGitLocalChanges(output: string): ServerGitLocalChanges {
   };
 }
 
-function getGitLocalChanges(gitStatusCommand: GitCommand): ServerGitLocalChanges {
+async function getGitLocalChanges(gitStatusCommand: GitCommand): Promise<ServerGitLocalChanges> {
   try {
-    return parseGitLocalChanges(gitStatusCommand());
+    return parseGitLocalChanges(await gitStatusCommand());
   } catch {
     return { available: false, unavailableReason: "git_status_unavailable" };
   }
@@ -109,22 +96,17 @@ function parseGitInfo(
   };
 }
 
-function readGitInfo(
+async function readGitInfo(
   gitCommand: GitCommand = readHeadCommitMetadata,
   gitStatusCommand: GitCommand = defaultGitStatusCommand,
   gitBranchCommand: GitCommand = defaultGitBranchCommand,
   buildCommitCommand: BuildCommitCommand = readBuildCommit,
-): ServerGitInfo {
+): Promise<ServerGitInfo> {
+  const localChanges = getGitLocalChanges(gitStatusCommand);
+  const branchName = gitBranchCommand().then((output) => output.trim() || null, () => null);
   try {
-    const output = gitCommand();
-    const localChanges = getGitLocalChanges(gitStatusCommand);
-    let branchName: string | null = null;
-    try {
-      branchName = gitBranchCommand().trim() || null;
-    } catch {
-      branchName = null;
-    }
-    return parseGitInfo(output, branchName, localChanges);
+    const output = await gitCommand();
+    return parseGitInfo(output, await branchName, await localChanges);
   } catch {
     const buildCommit = parseBuildCommit(buildCommitCommand());
     if (!buildCommit) {
@@ -146,7 +128,7 @@ function readGitInfo(
   }
 }
 
-export function createServerInfoSnapshot(
+export async function createServerInfoSnapshot(
   opts: {
     now?: Date;
     gitCommand?: GitCommand;
@@ -154,10 +136,10 @@ export function createServerInfoSnapshot(
     gitBranchCommand?: GitCommand;
     buildCommitCommand?: BuildCommitCommand;
   } = {},
-): ServerInfoSnapshot {
+): Promise<ServerInfoSnapshot> {
   return {
     processStartedAt: (opts.now ?? new Date()).toISOString(),
-    git: readGitInfo(
+    git: await readGitInfo(
       opts.gitCommand,
       opts.gitStatusCommand,
       opts.gitBranchCommand,
@@ -170,12 +152,13 @@ export function createServerInfoSnapshot(
 // without the Node process restarting: a managed dev-server restart re-runs the
 // code while keeping this module alive, so a commit captured once at boot goes
 // stale. Re-read git HEAD on demand, throttled by a short TTL so frequent health
-// polls don't spawn git on every request.
+// polls don't spawn git on every request. Callers that arrive while a refresh
+// is running share it.
 const GIT_INFO_CACHE_TTL_MS = 3000;
 export const serverProcessStartedAt = new Date().toISOString();
-let gitInfoCache: { value: ServerGitInfo; expiresAt: number } | null = null;
+let gitInfoCache: { value: Promise<ServerGitInfo>; expiresAt: number; settled: boolean } | null = null;
 
-export function getServerInfoSnapshot(
+export async function getServerInfoSnapshot(
   opts: {
     now?: number;
     gitCommand?: GitCommand;
@@ -183,20 +166,20 @@ export function getServerInfoSnapshot(
     gitBranchCommand?: GitCommand;
     buildCommitCommand?: BuildCommitCommand;
   } = {},
-): ServerInfoSnapshot {
+): Promise<ServerInfoSnapshot> {
   const now = opts.now ?? Date.now();
-  if (!gitInfoCache || now >= gitInfoCache.expiresAt) {
-    gitInfoCache = {
-      value: readGitInfo(
-        opts.gitCommand,
-        opts.gitStatusCommand,
-        opts.gitBranchCommand,
-        opts.buildCommitCommand,
-      ),
+  if (!gitInfoCache || (gitInfoCache.settled && now >= gitInfoCache.expiresAt)) {
+    const entry = {
+      value: readGitInfo(opts.gitCommand, opts.gitStatusCommand, opts.gitBranchCommand, opts.buildCommitCommand),
       expiresAt: now + GIT_INFO_CACHE_TTL_MS,
+      settled: false,
     };
+    void entry.value.finally(() => {
+      entry.settled = true;
+    });
+    gitInfoCache = entry;
   }
-  return { processStartedAt: serverProcessStartedAt, git: gitInfoCache.value };
+  return { processStartedAt: serverProcessStartedAt, git: await gitInfoCache.value };
 }
 
 export function resetServerInfoCacheForTests(): void {

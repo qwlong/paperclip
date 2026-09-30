@@ -165,7 +165,7 @@ export function healthRoutes(
 
     const requestId = randomUUID();
     const requestedAt = new Date();
-    const serverInfo = opts.serverInfo ?? getServerInfoSnapshot();
+    const serverInfo = opts.serverInfo ?? (await getServerInfoSnapshot());
     const preflightActiveRunIds = await db
       .select({ id: heartbeatRuns.id })
       .from(heartbeatRuns)
@@ -250,7 +250,7 @@ export function healthRoutes(
     // in local_trusted dev — never anonymous authenticated callers. The
     // enableServerInfoDebugView experimental flag gates the UI surface, not this
     // already access-controlled field.
-    const serverInfo = opts.serverInfo ?? getServerInfoSnapshot();
+    const serverInfo = opts.serverInfo ?? (await getServerInfoSnapshot());
     // The build commit is a plain git SHA of a public repository — not a
     // secret — so it is surfaced on every response, including the redacted
     // one, unlike the fuller `serverInfo` block. Deploy tooling (and anyone)
