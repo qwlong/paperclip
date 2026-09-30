@@ -109,6 +109,31 @@ describe("agentRunUnauthenticatedWriteGuard", () => {
     expect(findRunForSocket).not.toHaveBeenCalled();
   });
 
+  it("lets the write through when resolving the peer takes too long", async () => {
+    const report = vi.fn();
+    const handled = vi.fn();
+    const app = express();
+    app.use((req, _res, next) => {
+      req.actor = { type: "board", userId: "local-board", source: "local_implicit" };
+      next();
+    });
+    app.use(agentRunUnauthenticatedWriteGuard({
+      mode: "reject",
+      findRunForSocket: () => new Promise(() => {}),
+      report,
+      timeoutMs: 50,
+    }));
+    app.post("/api/issues/x", (_req, res) => {
+      handled();
+      res.status(204).end();
+    });
+
+    await request(app).post("/api/issues/x").expect(204);
+
+    expect(handled).toHaveBeenCalledTimes(1);
+    expect(report).not.toHaveBeenCalled();
+  });
+
   it("lets the write through when the peer cannot be resolved", async () => {
     const { app, handled } = appWith({
       mode: "reject",
@@ -124,69 +149,172 @@ describe("agentRunUnauthenticatedWriteGuard", () => {
 });
 
 describe("createPeerRunResolver", () => {
-  const socket = (remotePort: number) => ({ remotePort, remoteAddress: "127.0.0.1" }) as Socket;
-  // pid -> ppid; 30 is a shell spawned by the run process 20, 40 is the script it ran.
-  const processTable = new Map([[40, 30], [30, 20], [20, 10], [10, 1], [50, 10], [1, 0]]);
+  const STARTED_AT = Date.parse("2026-10-01T05:00:00.000Z");
+  const CLIENT_PORT = 5001;
+  const SERVER_PORT = 3100;
+  const socket = (remotePort = CLIENT_PORT, remoteAddress = "127.0.0.1") =>
+    ({ remotePort, remoteAddress, localAddress: remoteAddress, localPort: SERVER_PORT }) as Socket;
+  const connection = (remotePort = CLIENT_PORT) => `127.0.0.1:${remotePort}->127.0.0.1:${SERVER_PORT}`;
+  const proc = (ppid: number, pgid: number, startedAtMs: number | null = STARTED_AT - 60_000) => ({ ppid, pgid, startedAtMs });
+  // 20 is the run process (its own group leader); 30 is a shell it spawned, 40 the script
+  // that shell ran; 60 was reparented to init but stayed in the run's group; 50 is unrelated.
+  const processTable = new Map([
+    [40, proc(30, 20)],
+    [30, proc(20, 20)],
+    [20, proc(10, 20, STARTED_AT)],
+    [60, proc(1, 20)],
+    [10, proc(1, 10)],
+    [50, proc(10, 50)],
+    [1, proc(0, 1)],
+  ]);
+  const RUN_PROCESS = { ...RUN, processPid: 20, processGroupId: 20, processStartedAt: new Date(STARTED_AT) };
+  const MATCH = { ...RUN, processPid: 20 };
 
   function resolverWith(overrides: Partial<Parameters<typeof createPeerRunResolver>[0]> = {}) {
+    let clock = 1_000_000;
     const deps = {
-      lookupPeerPid: vi.fn(async () => 40 as number | null),
-      readParentPids: vi.fn(async () => processTable),
-      listRunningRunProcesses: vi.fn(async () => [{ ...RUN, processPid: 20 }]),
+      listRunningRunProcesses: vi.fn(async () => [RUN_PROCESS]),
+      readConnectionPids: vi.fn(async (_port: number) => new Map([[connection(), 40]])),
+      readProcessTable: vi.fn(async () => processTable),
+      now: () => clock,
       ...overrides,
     };
-    return { resolve: createPeerRunResolver(deps), deps };
+    return { resolve: createPeerRunResolver(deps), deps, advance: (ms: number) => { clock += ms; } };
   }
 
   it("matches a peer whose ancestor is a running run's process", async () => {
-    const { resolve } = resolverWith();
-    await expect(resolve(socket(5001))).resolves.toEqual({ ...RUN, processPid: 20 });
+    const { resolve, deps } = resolverWith();
+    await expect(resolve(socket())).resolves.toEqual(MATCH);
+    expect(deps.readConnectionPids).toHaveBeenCalledWith(SERVER_PORT);
   });
 
   it("matches the run process itself", async () => {
-    const { resolve } = resolverWith({ lookupPeerPid: vi.fn(async () => 20) });
-    await expect(resolve(socket(5001))).resolves.toEqual({ ...RUN, processPid: 20 });
+    const { resolve } = resolverWith({ readConnectionPids: vi.fn(async () => new Map([[connection(), 20]])) });
+    await expect(resolve(socket())).resolves.toEqual(MATCH);
+  });
+
+  it("matches a process that left the run's ancestry but stayed in its process group", async () => {
+    const { resolve } = resolverWith({ readConnectionPids: vi.fn(async () => new Map([[connection(), 60]])) });
+    await expect(resolve(socket())).resolves.toEqual(MATCH);
   });
 
   it("does not match a sibling of the run process", async () => {
-    const { resolve } = resolverWith({ lookupPeerPid: vi.fn(async () => 50) });
-    await expect(resolve(socket(5001))).resolves.toBeNull();
+    const { resolve } = resolverWith({ readConnectionPids: vi.fn(async () => new Map([[connection(), 50]])) });
+    await expect(resolve(socket())).resolves.toBeNull();
+  });
+
+  it.each([
+    { label: "a pid now held by a process that started later", processStartedAt: new Date(STARTED_AT - 10_000) },
+    { label: "a run without a recorded start time", processStartedAt: null },
+  ])("does not trust $label", async ({ processStartedAt }) => {
+    const { resolve } = resolverWith({
+      listRunningRunProcesses: vi.fn(async () => [{ ...RUN_PROCESS, processStartedAt }]),
+    });
+    await expect(resolve(socket())).resolves.toBeNull();
+  });
+
+  it("does not trust a run whose pid is not a local process group leader", async () => {
+    // Remote and sandbox runs record the remote pid with no process group.
+    const { resolve, deps } = resolverWith({
+      listRunningRunProcesses: vi.fn(async () => [{ ...RUN_PROCESS, processGroupId: null }]),
+    });
+    await expect(resolve(socket())).resolves.toBeNull();
+    expect(deps.readConnectionPids).not.toHaveBeenCalled();
   });
 
   it("returns null when no run is executing, without reading processes", async () => {
     const { resolve, deps } = resolverWith({ listRunningRunProcesses: vi.fn(async () => []) });
-    await expect(resolve(socket(5001))).resolves.toBeNull();
-    expect(deps.lookupPeerPid).not.toHaveBeenCalled();
+    await expect(resolve(socket())).resolves.toBeNull();
+    expect(deps.readConnectionPids).not.toHaveBeenCalled();
+    expect(deps.readProcessTable).not.toHaveBeenCalled();
   });
 
-  it("returns null when the peer process is unknown", async () => {
-    const { resolve } = resolverWith({ lookupPeerPid: vi.fn(async () => null) });
-    await expect(resolve(socket(5001))).resolves.toBeNull();
+  it("matches the exact connection, not another one on the same port number", async () => {
+    const { resolve } = resolverWith({
+      readConnectionPids: vi.fn(async () => new Map([
+        [`127.0.0.1:${CLIENT_PORT}->127.0.0.1:9999`, 40],
+        [`127.0.0.1:${SERVER_PORT}->127.0.0.1:${CLIENT_PORT}`, 40],
+      ])),
+    });
+    await expect(resolve(socket())).resolves.toBeNull();
+  });
+
+  it("matches IPv6 loopback connections", async () => {
+    const { resolve } = resolverWith({
+      readConnectionPids: vi.fn(async () => new Map([[`[::1]:${CLIENT_PORT}->[::1]:${SERVER_PORT}`, 40]])),
+    });
+    await expect(resolve(socket(CLIENT_PORT, "::1"))).resolves.toEqual(MATCH);
   });
 
   it("terminates on a cyclic process table", async () => {
     const { resolve } = resolverWith({
-      readParentPids: vi.fn(async () => new Map([[40, 30], [30, 40]])),
+      readProcessTable: vi.fn(async () => new Map([[40, proc(30, 40)], [30, proc(40, 30)], [20, proc(1, 20, STARTED_AT)]])),
     });
-    await expect(resolve(socket(5001))).resolves.toBeNull();
+    await expect(resolve(socket())).resolves.toBeNull();
   });
 
-  it("resolves each connection's peer once", async () => {
+  it("shares one snapshot between requests close together", async () => {
     const { resolve, deps } = resolverWith();
-    const keptAlive = socket(5001);
-    await resolve(keptAlive);
-    await resolve(keptAlive);
-    await resolve(socket(5002));
-    expect(deps.lookupPeerPid).toHaveBeenCalledTimes(2);
+    await Promise.all([resolve(socket()), resolve(socket()), resolve(socket())]);
+    await resolve(socket());
+    expect(deps.listRunningRunProcesses).toHaveBeenCalledTimes(1);
+    expect(deps.readConnectionPids).toHaveBeenCalledTimes(1);
+    expect(deps.readProcessTable).toHaveBeenCalledTimes(1);
+  });
+
+  it("refreshes the snapshot once it is older than a second", async () => {
+    const { resolve, deps, advance } = resolverWith();
+    await resolve(socket());
+    advance(1_001);
+    await resolve(socket());
+    expect(deps.listRunningRunProcesses).toHaveBeenCalledTimes(2);
+    expect(deps.readConnectionPids).toHaveBeenCalledTimes(2);
+  });
+
+  it("rereads connections for a connection the current snapshot has not seen", async () => {
+    const readConnectionPids = vi.fn()
+      .mockResolvedValueOnce(new Map([[connection(), 40]]))
+      .mockResolvedValueOnce(new Map([[connection(), 40], [connection(5002), 40]]));
+    const { resolve, advance } = resolverWith({ readConnectionPids });
+    await resolve(socket());
+    advance(10);
+    await expect(resolve(socket(5002))).resolves.toEqual(MATCH);
+    expect(readConnectionPids).toHaveBeenCalledTimes(2);
+  });
+
+  it("rereads processes for a peer the current process table has not seen", async () => {
+    const newer = new Map([...processTable, [70, proc(20, 20)]]);
+    const readProcessTable = vi.fn().mockResolvedValueOnce(processTable).mockResolvedValueOnce(newer);
+    const readConnectionPids = vi.fn(async () => new Map([[connection(), 40], [connection(5002), 70]]));
+    const { resolve, advance } = resolverWith({ readProcessTable, readConnectionPids });
+    await resolve(socket());
+    advance(10);
+    await expect(resolve(socket(5002))).resolves.toEqual(MATCH);
+    expect(readProcessTable).toHaveBeenCalledTimes(2);
+  });
+
+  it("returns null for a connection that is still unknown after rereading", async () => {
+    const { resolve } = resolverWith();
+    await expect(resolve(socket(6000))).resolves.toBeNull();
+  });
+
+  it("retries a failed read on the next request instead of caching the failure", async () => {
+    const readConnectionPids = vi.fn()
+      .mockRejectedValueOnce(new Error("lsof failed"))
+      .mockResolvedValueOnce(new Map([[connection(), 40]]));
+    const { resolve } = resolverWith({ readConnectionPids });
+    await expect(resolve(socket())).rejects.toThrow("lsof failed");
+    await expect(resolve(socket())).resolves.toEqual(MATCH);
   });
 
   it("rechecks running runs for a kept-alive connection", async () => {
     const listRunningRunProcesses = vi.fn()
-      .mockResolvedValueOnce([{ ...RUN, processPid: 20 }])
+      .mockResolvedValueOnce([RUN_PROCESS])
       .mockResolvedValueOnce([]);
-    const { resolve } = resolverWith({ listRunningRunProcesses });
-    const keptAlive = socket(5001);
+    const { resolve, advance } = resolverWith({ listRunningRunProcesses });
+    const keptAlive = socket();
     await expect(resolve(keptAlive)).resolves.not.toBeNull();
+    advance(1_001);
     await expect(resolve(keptAlive)).resolves.toBeNull();
   });
 });
@@ -197,8 +325,10 @@ const describeWithLsof = hasLsof && process.platform !== "win32" ? describe : de
 describeWithLsof("createPeerRunResolver against real processes", () => {
   it("attributes a request from a grandchild of the run process, and not one from elsewhere", async () => {
     let runPid: number | null = null;
+    let runStartedAt: Date | null = null;
     const resolve = createPeerRunResolver({
-      listRunningRunProcesses: async () => (runPid ? [{ ...RUN, processPid: runPid }] : []),
+      listRunningRunProcesses: async () =>
+        runPid ? [{ ...RUN, processPid: runPid, processGroupId: runPid, processStartedAt: runStartedAt }] : [],
     });
     const app = express();
     app.post("/probe", async (req, res) => {
@@ -214,10 +344,13 @@ describeWithLsof("createPeerRunResolver against real processes", () => {
       // running a script through its shell tool. Trailing `; true` keeps each
       // shell from exec-ing into its child, so the ancestry really has two hops.
       const inner = `"${process.execPath}" -e '${client}'; true`;
-      const runProcess = spawn("/bin/sh", ["-c", `/bin/sh -c ${JSON.stringify(inner)}; true`], {
+      // Like the adapters, the run process leads its own process group.
+      const runProcess = spawn("/bin/sh", ["-c", `sleep 1; /bin/sh -c ${JSON.stringify(inner)}; true`], {
         stdio: ["ignore", "pipe", "inherit"],
+        detached: true,
       });
       runPid = runProcess.pid!;
+      runStartedAt = new Date(spawnSync("ps", ["-o", "lstart=", "-p", String(runPid)], { encoding: "utf8", env: { ...process.env, LC_ALL: "C" } }).stdout.trim());
       const fromRun = await new Promise<string>((done, fail) => {
         let out = "";
         runProcess.stdout.on("data", (chunk) => { out += chunk; });
@@ -273,14 +406,14 @@ describeEmbeddedPostgres("listRunningRunProcesses", () => {
     });
     const running = randomUUID();
     await db.insert(heartbeatRuns).values([
-      { id: running, companyId, agentId, status: "running", invocationSource: "assignment", processPid: 111 },
+      { id: running, companyId, agentId, status: "running", invocationSource: "assignment", processPid: 111, processGroupId: 111, processStartedAt: new Date("2026-10-01T05:00:00.000Z") },
       { id: randomUUID(), companyId, agentId, status: "running", invocationSource: "assignment", processPid: null },
       { id: randomUUID(), companyId, agentId, status: "succeeded", invocationSource: "assignment", processPid: 222 },
       { id: randomUUID(), companyId, agentId, status: "queued", invocationSource: "assignment", processPid: 333 },
     ]);
 
     await expect(listRunningRunProcesses(db)).resolves.toEqual([
-      { runId: running, agentId, companyId, processPid: 111 },
+      { runId: running, agentId, companyId, processPid: 111, processGroupId: 111, processStartedAt: new Date("2026-10-01T05:00:00.000Z") },
     ]);
   });
 });
