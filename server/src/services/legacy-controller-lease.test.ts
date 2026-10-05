@@ -114,6 +114,85 @@ const support = await getEmbeddedPostgresTestSupport();
     } finally { watch.stop(); vi.useRealTimers(); }
   });
 
+  const leaseTimers = ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] as const;
+  function stallable(real: typeof db) {
+    let failure: "hangs" | "rejects" | null = null;
+    const proxy = new Proxy(real, {
+      get(target, prop, receiver) {
+        if (prop === "update" && failure) {
+          const settle = failure === "hangs" ? new Promise(() => {}) : Promise.reject(new Error("connection reset"));
+          settle.catch(() => {});
+          return () => ({ set: () => ({ where: () => ({ returning: () => settle }) }) });
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+    return { db: proxy as typeof db, fail(mode: "hangs" | "rejects") { failure = mode; } };
+  }
+  async function leaseOf(id: string) {
+    const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, id));
+    return saved;
+  }
+
+  it("an undispatched controller still stops when renewal stalls past the lease", async () => {
+    const run = await seed();
+    const hung = stallable(db);
+    hung.fail("hangs");
+    vi.useFakeTimers({ toFake: leaseTimers });
+    const controller = new AbortController();
+    const watch = watchLegacyControllerLease(hung.db, run, controller);
+    try {
+      await vi.advanceTimersByTimeAsync(61_000);
+      expect(controller.signal.aborted).toBe(true);
+    } finally { watch.stop(); vi.useRealTimers(); }
+  });
+  it.each(["hangs", "rejects"] as const)("a dispatched controller is not cancelled when renewal %s and nobody took over", async mode => {
+    const run = await seed();
+    const flaky = stallable(db);
+    vi.useFakeTimers({ toFake: leaseTimers });
+    const controller = new AbortController();
+    const watch = watchLegacyControllerLease(flaky.db, run, controller);
+    try {
+      await watch.assertOwned("dispatching");
+      flaky.fail(mode);
+      await vi.advanceTimersByTimeAsync(5 * 60_000);
+      expect(controller.signal.aborted).toBe(false);
+    } finally { watch.stop(); vi.useRealTimers(); }
+  });
+  it("a dispatched controller whose lease expired unclaimed takes it back on the next renewal", async () => {
+    const run = await seed();
+    vi.useFakeTimers({ toFake: leaseTimers });
+    const controller = new AbortController();
+    const watch = watchLegacyControllerLease(db, run, controller);
+    try {
+      await watch.assertOwned("dispatching");
+      await expire(run.id);
+      expect((await leaseOf(run.id)).controllerLeaseExpiresAt!.getTime()).toBeLessThan(Date.now());
+      await vi.advanceTimersByTimeAsync(10_000);
+      await vi.waitFor(async () => {
+        const saved = await leaseOf(run.id);
+        expect(saved.controllerLeaseExpiresAt!.getTime()).toBeGreaterThan(Date.now());
+      });
+      expect(controller.signal.aborted).toBe(false);
+      expect((await leaseOf(run.id)).controllerBootId).toBe(legacyControllerBootId);
+    } finally { watch.stop(); vi.useRealTimers(); }
+  });
+  it.each([
+    ["another controller revoked it", { controllerBootId: randomUUID() }],
+    ["the run reached a terminal status", { status: "succeeded" }],
+  ] as const)("a dispatched controller stops once %s", async (_case, change) => {
+    const run = await seed();
+    vi.useFakeTimers({ toFake: leaseTimers });
+    const controller = new AbortController();
+    const watch = watchLegacyControllerLease(db, run, controller);
+    try {
+      await watch.assertOwned("dispatching");
+      await db.update(heartbeatRuns).set(change).where(eq(heartbeatRuns.id, run.id));
+      await vi.advanceTimersByTimeAsync(10_000);
+      await vi.waitFor(() => expect(controller.signal.aborted).toBe(true));
+    } finally { watch.stop(); vi.useRealTimers(); }
+  });
+
   it("leaves native controller ownership to the native coordinator", () => {
     expect(legacyControllerClaim("native")).toEqual({});
   });
