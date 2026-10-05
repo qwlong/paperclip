@@ -36,6 +36,23 @@ export async function renewLegacyControllerLease(
   return Boolean(renewed);
 }
 
+/** After dispatch the provider's own exit is the run's outcome. Lateness alone
+ * is not a takeover: keep the lease while this boot still holds the running row,
+ * whether or not it expired in the meantime. Revocation replaces the boot id. */
+async function holdDispatchedLegacyControllerLease(
+  db: Db,
+  run: Pick<Run, "id" | "companyId">,
+): Promise<boolean> {
+  const [held] = await db.update(heartbeatRuns).set({
+    controllerLeaseExpiresAt: sql`clock_timestamp() + interval '60 seconds'`,
+  }).where(and(
+    eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId),
+    eq(heartbeatRuns.runtimeMode, "legacy"), eq(heartbeatRuns.status, "running"),
+    eq(heartbeatRuns.controllerBootId, legacyControllerBootId),
+  )).returning({ id: heartbeatRuns.id });
+  return Boolean(held);
+}
+
 export async function hasLiveLegacyController(db: Db, run: Run): Promise<boolean> {
   if (run.runtimeMode === "native" || !run.controllerBootId) return false;
   const [owner] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
@@ -70,6 +87,7 @@ export function watchLegacyControllerLease(db: Db, run: Run, controller: AbortCo
   }
   let stopped = false;
   let pending = false;
+  let dispatched = false;
   const lost = () => { if (!stopped) controller.abort(new Error("Legacy controller lease lost")); };
   let deadline = setTimeout(lost, Math.max(0,
     (run.controllerLeaseExpiresAt?.getTime() ?? 0) - Date.now()));
@@ -95,16 +113,24 @@ export function watchLegacyControllerLease(db: Db, run: Run, controller: AbortCo
       controller.signal.throwIfAborted();
     }
     controller.signal.throwIfAborted();
-    if (!stopped) {
-      clearTimeout(deadline);
-      deadline = setTimeout(lost, Math.max(0, LEGACY_CONTROLLER_LEASE_MS - (Date.now() - startedAt)));
-      deadline.unref();
+    if (stopped) return;
+    clearTimeout(deadline);
+    if (stage === "dispatching") {
+      dispatched = true;
+      return;
     }
+    deadline = setTimeout(lost, Math.max(0, LEGACY_CONTROLLER_LEASE_MS - (Date.now() - startedAt)));
+    deadline.unref();
+  };
+  const holdDispatched = async () => {
+    if (!(await holdDispatchedLegacyControllerLease(db, run))) lost();
   };
   const timer = setInterval(() => {
     if (pending || stopped) return;
     pending = true;
-    void assertOwned().catch(lost).finally(() => { pending = false; });
+    // A failed query after dispatch proves nothing about ownership; retry next tick.
+    const check = dispatched ? holdDispatched().catch(() => {}) : assertOwned().catch(lost);
+    void check.finally(() => { pending = false; });
   }, LEGACY_CONTROLLER_RENEW_MS);
   timer.unref();
   return { assertOwned, stop() { stopped = true; clearInterval(timer); clearTimeout(deadline); } };
