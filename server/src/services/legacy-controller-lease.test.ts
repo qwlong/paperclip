@@ -114,7 +114,8 @@ const support = await getEmbeddedPostgresTestSupport();
     } finally { watch.stop(); vi.useRealTimers(); }
   });
 
-  const leaseTimers = ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] as const;
+  const leaseTimers: NonNullable<Parameters<typeof vi.useFakeTimers>[0]>["toFake"] =
+    ["setTimeout", "clearTimeout", "setInterval", "clearInterval"];
   function stallable(real: typeof db) {
     let failure: "hangs" | "rejects" | null = null;
     const proxy = new Proxy(real, {
