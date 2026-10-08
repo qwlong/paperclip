@@ -7,9 +7,10 @@ import {
   parseJson,
 } from "@paperclipai/adapter-utils/server-utils";
 
-// The legacy login-prompt markers. The Claude CLI prints these words when it
-// asks the user to log in. The detector matches them against any probe output
-// line, which includes the raw stdout and stderr. This scope is pre-existing.
+// The login-prompt markers. The Claude CLI prints these words when it asks the
+// user to log in. The detector matches them only against text the CLI wrote
+// itself, never against what a model or a tool put on the stream. See
+// claudeAuthoredStdoutLines.
 const CLAUDE_LOGIN_PROMPT_RE =
   /(?:not\s+logged\s+in|please\s+log\s+in|please\s+run\s+(?:`?claude\s+login`?|\/login)|login\s+required|requires\s+login|unauthorized|authentication\s+required|invalid\s+api\s+key[\s\S]{0,120}(?:\/login|claude\s+login|log\s+in))/i;
 
@@ -203,31 +204,53 @@ function claudeResultIndicatesAuthFailure(parsed: Record<string, unknown>): bool
   return extractClaudeErrorMessages(parsed).length > 0;
 }
 
+// The stdout text the Claude CLI wrote itself. Plain-text output is all the
+// CLI's. In stream-json output the CLI speaks only through events: the result
+// event, read through the parsed result, and the synthetic assistant message it
+// answers with when it cannot reach a model. Every other event carries what a
+// model or a tool produced, and a line that is not an event is a fragment the
+// capture cap cut off.
+function claudeAuthoredStdoutLines(stdout: string): string[] {
+  const lines = stdout.split(/\r?\n/);
+  const events = lines.flatMap((line) => {
+    const event = parseJson(line.trim());
+    return event !== null && typeof event === "object" ? [event] : [];
+  });
+  if (events.length === 0) return lines;
+  return events.flatMap((event) => {
+    const message = parseObject(event.message);
+    if (event.type !== "assistant" || message.model !== "<synthetic>") return [];
+    const content = Array.isArray(message.content) ? message.content : [];
+    return content.flatMap((block) => {
+      const entry = parseObject(block);
+      return entry.type === "text" ? [asString(entry.text, "")] : [];
+    });
+  });
+}
+
 export function detectClaudeLoginRequired(input: {
   parsed: Record<string, unknown> | null;
   stdout: string;
   stderr: string;
 }): { requiresLogin: boolean; loginUrl: string | null } {
   const parsed = input.parsed ?? null;
-  const resultText = asString(parsed?.result, "").trim();
+  // A successful run's result is the model's answer, so only a failed run's
+  // terminal fields speak for the CLI.
+  const failedResultText =
+    parsed !== null && claudeResultIndicatesAuthFailure(parsed) ? collectClaudeTerminalText(parsed) : "";
 
-  // The legacy login-prompt markers keep their broad scope. They match against
-  // every output line, which includes the parsed result, the parsed errors, and
-  // the raw stdout and stderr.
-  const promptLines = [resultText, ...extractClaudeErrorMessages(parsed ?? {}), input.stdout, input.stderr]
+  // The login-prompt markers match the failed result, the CLI's own stdout
+  // text, and stderr. The other stream events carry model and tool output.
+  const promptLines = [failedResultText, ...claudeAuthoredStdoutLines(input.stdout), input.stderr]
     .join("\n")
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean);
   const loginPrompt = promptLines.some((line) => CLAUDE_LOGIN_PROMPT_RE.test(line));
 
-  // The token-failure markers match only against the parsed terminal fields of
-  // a failed run. The raw stdout is untrusted, so a model that prints a token
-  // phrase, or a successful run that repeats one, does not flip the classifier.
-  const tokenFailure =
-    parsed !== null &&
-    claudeResultIndicatesAuthFailure(parsed) &&
-    CLAUDE_AUTH_TOKEN_FAILURE_RE.test(collectClaudeTerminalText(parsed));
+  // The token-failure markers match only the failed result. A model can print
+  // the same words as ordinary prose, anywhere else on the stream.
+  const tokenFailure = CLAUDE_AUTH_TOKEN_FAILURE_RE.test(failedResultText);
 
   return {
     requiresLogin: loginPrompt || tokenFailure,
