@@ -147,6 +147,159 @@ describe("detectClaudeLoginRequired", () => {
   });
 });
 
+describe("detectClaudeLoginRequired login prompts", () => {
+  const LOGIN_PROMPT_PHRASES = [
+    "Unauthorized",
+    "Not logged in",
+    "Please log in",
+    "Please run /login",
+    "Please run `claude login`",
+    "Login required",
+    "requires login",
+    "Authentication required",
+    "Invalid API key, run claude login",
+  ];
+
+  const event = (value: Record<string, unknown>) => JSON.stringify(value);
+  const SUCCESS = { type: "result", subtype: "success", is_error: false, result: "done" };
+
+  // What a model or a tool put on the stream of a run that succeeded, in every
+  // shape it can take: the model's own text, a tool's output, a system event a
+  // background task summarised, and the model's final answer.
+  const contentStreams = (phrase: string) => ({
+    "tool output": event({
+      type: "user",
+      message: {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "toolu_1",
+            content: `"401": { "description": "${phrase}" }`,
+          },
+        ],
+      },
+    }),
+    "model text": event({
+      type: "assistant",
+      message: {
+        model: "claude-sonnet-5",
+        role: "assistant",
+        content: [{ type: "text", text: `The API answers ${phrase} without a token.` }],
+      },
+    }),
+    "system event": event({
+      type: "system",
+      subtype: "task_notification",
+      summary: `Check why the docs say ${phrase}`,
+    }),
+  });
+
+  for (const phrase of LOGIN_PROMPT_PHRASES) {
+    const streams = {
+      ...Object.fromEntries(
+        Object.entries(contentStreams(phrase)).map(([source, line]) => [source, [line, event(SUCCESS)].join("\n")]),
+      ),
+      "final answer": event({ ...SUCCESS, result: `The endpoint answers ${phrase} without a token.` }),
+    };
+    for (const [source, stdout] of Object.entries(streams)) {
+      it(`ignores "${phrase}" in ${source} of a run that succeeded`, () => {
+        expect(stdout).toContain(phrase);
+        expect(
+          detectClaudeLoginRequired({
+            parsed: parseClaudeStreamJson(stdout).resultJson,
+            stdout,
+            stderr: "",
+          }).requiresLogin,
+        ).toBe(false);
+      });
+    }
+  }
+
+  // The stream the Claude CLI writes when it has no login: it answers with a
+  // synthetic assistant message of its own, then a failed result.
+  const notLoggedInAssistant = event({
+    type: "assistant",
+    message: {
+      model: "<synthetic>",
+      role: "assistant",
+      content: [{ type: "text", text: "Not logged in · Please run /login" }],
+    },
+    error: "authentication_failed",
+  });
+  const notLoggedInResult = event({
+    type: "result",
+    subtype: "success",
+    is_error: true,
+    result: "Not logged in · Please run /login",
+    terminal_reason: "api_error",
+  });
+
+  it("classifies the CLI's not-logged-in stream as login required", () => {
+    const stdout = [event({ type: "system", subtype: "init" }), notLoggedInAssistant, notLoggedInResult].join("\n");
+    expect(
+      detectClaudeLoginRequired({
+        parsed: parseClaudeStreamJson(stdout).resultJson,
+        stdout,
+        stderr: "",
+      }).requiresLogin,
+    ).toBe(true);
+  });
+
+  it("classifies the CLI's own not-logged-in message when the stream ends before its result", () => {
+    const stdout = [event({ type: "system", subtype: "init" }), notLoggedInAssistant].join("\n");
+    expect(parseClaudeStreamJson(stdout).resultJson).toBeNull();
+    expect(
+      detectClaudeLoginRequired({ parsed: null, stdout, stderr: "" }).requiresLogin,
+    ).toBe(true);
+  });
+
+  it("ignores the cut-off first line of a stream that outgrew the capture cap", () => {
+    // The capture keeps the tail of stdout, so the first line can be the end of
+    // a tool's output event.
+    const toolOutput = contentStreams("Unauthorized")["tool output"];
+    const stdout = [toolOutput.slice(toolOutput.indexOf("401")), event(SUCCESS)].join("\n");
+    expect(stdout.split("\n")[0]).toContain("Unauthorized");
+    expect(
+      detectClaudeLoginRequired({
+        parsed: parseClaudeStreamJson(stdout).resultJson,
+        stdout,
+        stderr: "",
+      }).requiresLogin,
+    ).toBe(false);
+  });
+
+  it("classifies a login prompt in the failed result alone", () => {
+    expect(
+      detectClaudeLoginRequired({
+        parsed: JSON.parse(notLoggedInResult),
+        stdout: "",
+        stderr: "",
+      }).requiresLogin,
+    ).toBe(true);
+  });
+
+  it("classifies a login prompt the CLI printed as plain text", () => {
+    expect(
+      detectClaudeLoginRequired({
+        parsed: null,
+        stdout: "Not logged in · Please run /login",
+        stderr: "",
+      }).requiresLogin,
+    ).toBe(true);
+  });
+
+  it("reads plain-text output as plain text even when a line parses as a JSON value", () => {
+    expect(
+      detectClaudeLoginRequired({
+        parsed: null,
+        stdout: ["Opening browser to sign in…", "401", "Not logged in · Please run /login"].join("\n"),
+        stderr: "",
+      }).requiresLogin,
+    ).toBe(true);
+  });
+});
+
 describe("isClaudeModelNotFoundError", () => {
   it("detects model resolution failures from structured and fallback output", () => {
     expect(isClaudeModelNotFoundError({
