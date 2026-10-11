@@ -14,6 +14,18 @@ const createParser = () => {
 const event = JSON.stringify({ type: "usage", usage: { inputTokens: 2, costUsd: 0.25 }, text: "private content" });
 
 describe("usage checkpoint stream", () => {
+  it("retains counter-free assistant events as work-start markers", async () => {
+    const consume = vi.fn((_records: string) => null);
+    const log = createUsageCheckpointLog(vi.fn(), vi.fn(), consume);
+    await log("stdout", JSON.stringify({ type: "assistant", message: {
+      id: "first-message", content: [{ type: "text", text: "private content" }],
+    } }) + "\n");
+    expect(consume).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(consume.mock.calls[0][0])).toEqual({
+      type: "assistant", message: { id: "first-message" },
+    });
+  });
+
   it("retains Claude's control-response accounting without its unrelated payload", async () => {
     const consume = vi.fn((_records: string) => null);
     const log = createUsageCheckpointLog(vi.fn(), vi.fn(), consume);
