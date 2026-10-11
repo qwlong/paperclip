@@ -20,8 +20,9 @@ describe("Claude resumed accounting through execution and checkpoints", () => {
     { name: "success", exitCode: 0, timedOut: false },
     { name: "failure", exitCode: 1, timedOut: false },
     { name: "timeout after result", exitCode: 1, timedOut: true },
-  ].flatMap(outcome => [false, true].flatMap(truncated => [false, true].map(checkpoint => ({ ...outcome, truncated, checkpoint })))))
-  ("uses invocation totals for $name (truncated=$truncated, checkpoint=$checkpoint)", async ({ exitCode, timedOut, truncated, checkpoint }) => {
+  ].flatMap(outcome => [false, true].flatMap(truncated => [false, true].map(checkpoint => ({ ...outcome, truncated, checkpoint }))))
+    .flatMap(testCase => [false, true].map(lateBaseline => ({ ...testCase, lateBaseline }))))
+  ("accounts for $name (truncated=$truncated, checkpoint=$checkpoint, lateBaseline=$lateBaseline)", async ({ exitCode, timedOut, truncated, checkpoint, lateBaseline }) => {
     const directory = await mkdtemp(join(tmpdir(), "paperclip-claude-accounting-"));
     directories.push(directory);
     const command = join(directory, "runtime");
@@ -37,17 +38,23 @@ describe("Claude resumed accounting through execution and checkpoints", () => {
       expect(input).toHaveLength(2);
       expect(input[0]).toMatchObject({ type: "control_request", request: { subtype: "get_usage", skip_behaviors: true } });
       expect(input[1]).toMatchObject({ type: "user", message: { role: "user", content: onMeta.mock.calls.at(-1)![0].prompt } });
-      const stdout = [
+      const events = [
+        ...(lateBaseline ? [{ type: "assistant", message: {
+          id: "first-message", content: [{ type: "text", text: "Work started before the baseline reply." }],
+        } }] : []),
         { type: "control_response", response: { subtype: "success", request_id: input[0].request_id,
           response: { session: { total_cost_usd: 0.00031, model_usage: { [model]: previous } } } } },
         { type: "system", subtype: "init", session_id: "session-1", model },
         { type: "result", subtype: exitCode ? "error_during_execution" : "success", is_error: exitCode !== 0,
           session_id: "session-1", result: "finished", total_cost_usd: 0.000635, modelUsage: { [model]: current } },
-      ].map(event => JSON.stringify(event)).join("\n") + "\n";
+      ];
+      const stdout = events.map(event => JSON.stringify(event)).join("\n") + "\n";
       for (let offset = 0; offset < stdout.length; offset += 13) await options.onLog("stdout", stdout.slice(offset, offset + 13));
       // The transport caps stdout at its tail; the initial baseline is then
       // absent from the returned display text but remains in the log stream.
-      const displayOutput = truncated ? stdout.slice(stdout.indexOf("\n") + 1) : stdout;
+      const displayOutput = truncated
+        ? events.slice(lateBaseline ? 2 : 1).map(event => JSON.stringify(event)).join("\n") + "\n"
+        : stdout;
       return { exitCode, signal: null, timedOut, stdout: displayOutput, stderr: "", pid: 123, startedAt: new Date().toISOString() };
     });
     const { execute } = await import("../../../packages/adapters/claude-local/src/server/execute.js");
@@ -60,11 +67,14 @@ describe("Claude resumed accounting through execution and checkpoints", () => {
         env: { CLAUDE_CONFIG_DIR: directory, ANTHROPIC_API_KEY: "fixture" } },
       context: {}, onLog: async () => {}, onUsage, onMeta,
     });
-    const expected = {
-      usage: { inputTokens: 140, outputTokens: 32, cachedInputTokens: 200 },
-      usageBasis: "per_run", costUsd: expect.closeTo(0.000325, 10),
-      usageByModel: [{ model, usage: { inputTokens: 140, outputTokens: 32, cachedInputTokens: 200 }, costUsd: expect.closeTo(0.000325, 10) }],
-    };
+    // An assistant event without counters still proves work has started. A
+    // baseline received after it must not subtract any current-run work.
+    const usage = lateBaseline
+      ? { inputTokens: 270, outputTokens: 63, cachedInputTokens: 400 }
+      : { inputTokens: 140, outputTokens: 32, cachedInputTokens: 200 };
+    const costUsd = expect.closeTo(lateBaseline ? 0.000635 : 0.000325, 10);
+    const expected = { usage, usageBasis: "per_run", costUsd,
+      usageByModel: [{ model, usage, costUsd }] };
     expect(result).toMatchObject(expected);
     if (onUsage) expect(onUsage.mock.calls.at(-1)![0]).toMatchObject({ ...expected, complete: true });
   });
