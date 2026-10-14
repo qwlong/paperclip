@@ -1322,7 +1322,8 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       .where(eq(heartbeatRuns.id, unclaimableRunId));
 
     // Precondition: the unclaimable run really was rejected, not started.
-    expect(unclaimable?.status).toBe("queued");
+    // Upstream settles a permanently rejected claim instead of leaving it queued.
+    expect(unclaimable?.status).toBe("cancelled");
     expect(readySucceeded).toBe(true);
   });
 
