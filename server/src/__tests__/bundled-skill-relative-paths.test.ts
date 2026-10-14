@@ -20,10 +20,17 @@ function bundledSkillReferences() {
       const skillDir = path.join(SKILLS_ROOT, entry.name);
       const skillFile = path.join(skillDir, "SKILL.md");
       if (!fs.existsSync(skillFile)) return [];
-      const refs = new Set(
-        [...fs.readFileSync(skillFile, "utf8").matchAll(RELATIVE_REF)].map((m) => m[1]),
-      );
-      return [...refs].map((ref) => ({ skill: entry.name, skillDir, ref }));
+      const refs = new Map<string, string>();
+      for (const line of fs.readFileSync(skillFile, "utf8").split("\n")) {
+        // A line may point at another bundled skill's directory explicitly,
+        // e.g. "from the installed **paperclip** operational skill directory".
+        const owner = line.match(/\*\*([a-z0-9-]+)\*\* [a-z ]*skill directory/)?.[1];
+        const baseDir = owner && fs.existsSync(path.join(SKILLS_ROOT, owner, "SKILL.md"))
+          ? path.join(SKILLS_ROOT, owner)
+          : skillDir;
+        for (const m of line.matchAll(RELATIVE_REF)) refs.set(m[1], baseDir);
+      }
+      return [...refs].map(([ref, baseDir]) => ({ skill: entry.name, skillDir: baseDir, ref }));
     });
 }
 
@@ -35,6 +42,7 @@ describe("bundled skill relative paths", () => {
       expect.arrayContaining([
         "paperclip:scripts/paperclip-issue-update.sh",
         "paperclip:scripts/paperclip-upload-artifact.sh",
+        "complain:scripts/submit-agent-commentary.mjs",
       ]),
     );
   });

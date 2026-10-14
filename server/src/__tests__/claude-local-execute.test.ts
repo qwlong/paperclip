@@ -1437,6 +1437,7 @@ describe("claude execute", () => {
             engine: "cli",
             command: commandPath,
             cwd: workspace,
+            resumeSessions: true,
             instructionsFilePath: instructionsPath,
             paperclipRuntimeSkills: [{ key: "test-skill", runtimeName: "test-skill", source: skillDir }],
             paperclipSkillSync: { desiredSkills: ["test-skill"] },

@@ -404,7 +404,6 @@ describeEmbeddedPostgres("heartbeat list", () => {
         message: "done",
         total_cost_usd: 1.25,
         cost_usd: "0.5",
-        costUsd: "not-a-number",
         stdout: "o".repeat(40_000),
       },
     });

@@ -303,7 +303,7 @@ describe("claude remote execution", () => {
         sessionDisplayId: null,
         taskKey: null,
       },
-      config: { engine: "cli", command: "claude", cwd: rootDir, paperclipRuntimeSkills: [] },
+      config: { engine: "cli", command: "claude", cwd: rootDir, paperclipRuntimeSkills: [], resumeSessions: true },
       context: {},
       onLog,
     });
@@ -689,6 +689,7 @@ describe("claude remote execution", () => {
       config: {
         engine: "cli",
         command: "claude",
+        resumeSessions: true,
         env: { ANTHROPIC_API_KEY: "fixture-anthropic-key" },
       },
       context: {
