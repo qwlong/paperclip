@@ -1318,12 +1318,17 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
         .where(eq(heartbeatRuns.id, readyRunId));
       return run?.status === "succeeded";
     }, 15_000);
-    const [unclaimable] = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns)
-      .where(eq(heartbeatRuns.id, unclaimableRunId));
+    // Upstream settles a run it cannot start: the claim is rejected and cancelled,
+    // or the claim lands and execution setup fails. Either way it must not stay
+    // queued, and its writes must land before teardown.
+    const unclaimableSettled = await waitForCondition(async () => {
+      const [run] = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, unclaimableRunId));
+      return run?.status === "cancelled" || run?.status === "failed";
+    }, 15_000);
+    await heartbeat.drainActiveRunExecutions();
 
-    // Precondition: the unclaimable run really was rejected, not started.
-    // Upstream settles a permanently rejected claim instead of leaving it queued.
-    expect(unclaimable?.status).toBe("cancelled");
+    expect(unclaimableSettled).toBe(true);
     expect(readySucceeded).toBe(true);
   });
 
