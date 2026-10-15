@@ -10,19 +10,21 @@ import { AsyncLocalStorage } from "node:async_hooks";
 
 type RootClient = { unsafe: (...args: any[]) => any };
 type Transactional = { transaction: (...args: any[]) => Promise<any> };
-type OpenTransaction = { client: RootClient; open: boolean };
-export type PoolReentry = { stack: string };
+type OpenTransaction = { client: RootClient; open: boolean; openedAt: string };
+/** `openedAt` is where the transaction holding the first connection began. */
+export type PoolReentry = { stack: string; openedAt: string };
 export type PoolReentryHandler = (reentry: PoolReentry) => void;
 
 const openTransactions = new AsyncLocalStorage<OpenTransaction>();
 const handlers = new WeakMap<RootClient, PoolReentryHandler>();
 const reportedStacks = new Set<string>();
 
-/** Each distinct call site is reported once per process. */
+/** Each distinct pair of call sites is reported once per process. */
 export function warnPoolReentryOnce(reentry: PoolReentry) {
-  if (reportedStacks.has(reentry.stack)) return;
-  reportedStacks.add(reentry.stack);
-  process.emitWarning(`Query used a second pool connection inside an open transaction\n${reentry.stack}`, {
+  const key = `${reentry.stack}\n${reentry.openedAt}`;
+  if (reportedStacks.has(key)) return;
+  reportedStacks.add(key);
+  process.emitWarning(`Query used a second pool connection inside an open transaction\n${reentry.stack}\n  transaction opened:\n${reentry.openedAt}`, {
     code: "PAPERCLIP_DB_POOL_REENTRY",
   });
 }
@@ -34,7 +36,7 @@ function callSite(): string {
   Error.stackTraceLimit = limit;
   const frames = stack.split("\n").slice(1);
   return frames.filter(frame => !frame.includes("node_modules") && !frame.includes("node:")
-    && !frame.includes("pool-reentry.ts")).slice(0, 8).join("\n");
+    && !frame.includes("pool-reentry.ts")).slice(0, 12).join("\n");
 }
 
 export function setPoolReentryHandler(client: RootClient, handler: PoolReentryHandler) {
@@ -47,14 +49,14 @@ export function detectPoolReentry<T extends Transactional>(db: T, client: RootCl
   const unsafe = client.unsafe;
   client.unsafe = function (...args: any[]) {
     const current = openTransactions.getStore();
-    if (current?.open && current.client === client) handlers.get(client)?.({ stack: callSite() });
+    if (current?.open && current.client === client) handlers.get(client)?.({ stack: callSite(), openedAt: current.openedAt });
     return unsafe.apply(this, args);
   };
   const transaction = db.transaction;
   db.transaction = function (callback: (tx: unknown) => Promise<unknown>, ...options: any[]) {
     // The driver acquires the connection by sending BEGIN through the root
     // client, so the transaction counts as open only once its work starts.
-    const state: OpenTransaction = { client, open: false };
+    const state: OpenTransaction = { client, open: false, openedAt: callSite() };
     return openTransactions.run(state, async () => {
       try {
         return await transaction.call(this, (tx: unknown) => {
