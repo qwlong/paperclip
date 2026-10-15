@@ -558,7 +558,40 @@ export function budgetServiceInTransaction(db: Db, publications: ActivityPublica
     });
   }
 
+  /** Read-only: whether reconcileScope would write anything, and the block it would return if not. */
+  async function inspectScope(companyId: string, scopeType: BudgetScopeType, scopeId: string) {
+    const scope = await resolveScopeRecord(db, scopeType, scopeId);
+    if (scope.companyId !== companyId) throw notFound("Budget scope not found");
+    const policies = await db.select().from(budgetPolicies).where(and(
+      eq(budgetPolicies.companyId, companyId), eq(budgetPolicies.scopeType, scopeType), eq(budgetPolicies.scopeId, scopeId),
+    ));
+    const observed = await computeObservedSpends(db, policies);
+    const openIncidents = policies.length ? await db.select().from(budgetIncidents).where(and(
+      inArray(budgetIncidents.policyId, policies.map((policy) => policy.id)), eq(budgetIncidents.status, "open"),
+    )) : [];
+    const settled = scope.pauseReason !== "budget"
+      && policies.every((policy, index) => !observedBlocks(policy, observed[index]!))
+      && openIncidents.every((incident) => {
+        if (incident.thresholdType === "hard") return false;
+        const index = policies.findIndex((policy) => policy.id === incident.policyId);
+        const policy = policies[index]!;
+        return policy.isActive && policy.notifyEnabled
+          && compareCents(observed[index]!.totalExact, Math.ceil(policy.amount * policy.warnPercent / 100)) >= 0;
+      });
+    if (!settled) return { settled, block: null };
+    const recovering = policies.some((policy, index) =>
+      policy.isActive && policy.hardStopEnabled && policy.amount > 0 && observed[index]!.recoveringRunCount > 0);
+    const block = scopeType !== "agent" && scope.paused
+      ? { scopeType, scopeId, scopeName: scope.name, reason: `${scopeType === "company" ? "Company" : "Project"} is paused and cannot start new work.` }
+      : recovering
+        ? { scopeType, scopeId, scopeName: scope.name, reason: "New work must wait while a native run recovers its unfinished accounting." }
+        : null;
+    return { settled, block };
+  }
+
   async function reconcileScope(companyId: string, scopeType: BudgetScopeType, scopeId: string) {
+    const inspection = await inspectScope(companyId, scopeType, scopeId);
+    if (inspection.settled) return inspection.block;
     const scope = await resolveScopeRecord(db, scopeType, scopeId);
     if (scope.companyId !== companyId) throw notFound("Budget scope not found");
     const policies = await db.select().from(budgetPolicies).where(and(
@@ -606,6 +639,7 @@ export function budgetServiceInTransaction(db: Db, publications: ActivityPublica
   }
 
   return {
+    inspectScope,
     reconcileScope,
     listPolicies: async (companyId: string): Promise<BudgetPolicy[]> => {
       const rows = await listPolicyRows(companyId);
@@ -1022,14 +1056,22 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
         .from(budgetPolicies).orderBy(budgetPolicies.companyId, budgetPolicies.scopeType, budgetPolicies.scopeId);
       // Each scope commits independently: deleted targets and a failed scope
       // must not roll back recovery or cancellation delivery for other work.
+      // A settled scope has nothing to write, so it never queues for the lock.
+      const settledCompanies = new Set<string>();
       for (const scope of scopes) {
         try {
-          await mutate(scope.companyId, (service) => service.reconcileScope(scope.companyId, scope.scopeType as BudgetScopeType, scope.scopeId));
+          const scopeType = scope.scopeType as BudgetScopeType;
+          if ((await reads.inspectScope(scope.companyId, scopeType, scope.scopeId)).settled) {
+            settledCompanies.add(scope.companyId);
+            continue;
+          }
+          await mutate(scope.companyId, (service) => service.reconcileScope(scope.companyId, scopeType, scope.scopeId));
         } catch (error) {
           if (error instanceof HttpError && error.status === 404) continue;
           logger.warn({ err: error, ...scope }, "Budget scope recovery pending; continuing remaining scopes");
         }
       }
+      for (const companyId of settledCompanies) await deliverBudgetEnforcement(db, hooks, companyId);
     },
     upsertPolicy: (companyId: string, input: BudgetPolicyUpsertInput, actorUserId: string | null) =>
       mutate(companyId, (service) => service.upsertPolicy(companyId, input, actorUserId)),
