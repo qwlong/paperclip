@@ -180,6 +180,40 @@ const support = await getEmbeddedPostgresTestSupport();
     expect((await current(agent.id)).lifecycleState).toBe("terminated");
   });
 
+  it.each([
+    ["proves no provider work started", { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } }, true],
+    ["reports that provider work started", { executionRecovery: { kind: "bootstrap", providerWorkStarted: true } }, false],
+    ["has a different recovery kind", { executionRecovery: { kind: "interrupted", providerWorkStarted: false } }, false],
+    ["has no recovery evidence", null, false],
+  ])("treats a processless cancelled legacy run as stopped only when it %s", async (_, resultJson, stopped) => {
+    const agent = await hire();
+    await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id,
+      status: "cancelled", invocationSource: "on_demand", runtimeMode: "legacy", executionStage: "preparing",
+      startedAt: new Date(), finishedAt: new Date(), resultJson }).returning();
+    expect(await agentExecutionsHaveStopped(db, [agent.id])).toBe(stopped);
+  });
+
+  it("waits for a preparer that still holds its lease even when the run proves no provider work", async () => {
+    const agent = await hire();
+    await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id,
+      status: "cancelled", invocationSource: "on_demand", runtimeMode: "legacy", executionStage: "preparing",
+      startedAt: new Date(), finishedAt: new Date(), controllerLeaseExpiresAt: new Date(Date.now() + 60_000),
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } });
+    expect(await agentExecutionsHaveStopped(db, [agent.id])).toBe(false);
+  });
+
+  it("finishes pausing an agent whose last legacy run was cancelled before any provider work", async () => {
+    const agent = await hire();
+    await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id,
+      status: "cancelled", invocationSource: "on_demand", runtimeMode: "legacy", executionStage: "preparing",
+      startedAt: new Date(), finishedAt: new Date(), errorCode: "adapter_failed",
+      resultJson: { stopReason: "cancelled", executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } });
+    const work = worker(createLifecycleDriver(db, {} as never).runHost);
+    await createAgentLifecycle(db).pauseAgent(agent.id);
+    await work.process(agent.id);
+    expect((await current(agent.id)).lifecycleState).toBe("paused");
+  });
+
   it("does not cancel a reporting agent when its manager pauses", async () => {
     const parent = await hire();
     const [child] = await db.insert(agents).values({ companyId, name: "Report", reportsTo: parent.id,

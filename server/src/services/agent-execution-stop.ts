@@ -6,6 +6,13 @@ import { hasNativeLocalProcessStop } from "./native-local-process-stop.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { isCancelledNativeStartup } from "./cancelled-native-startup.js";
 
+/** Recorded only after the adapter returned, setup failed, or a queued run was
+ * cancelled, each before a provider process existed. */
+function provesNoProviderWork(run: typeof heartbeatRuns.$inferSelect) {
+  const recovery = run.resultJson?.executionRecovery as Record<string, unknown> | undefined;
+  return recovery?.kind === "bootstrap" && recovery.providerWorkStarted === false;
+}
+
 /** Cancellation changes admission. Process and lease evidence controls cleanup. */
 export async function agentExecutionsHaveStopped(db: Db, agentIds: string[]) {
   if (!agentIds.length) return true;
@@ -56,6 +63,7 @@ export async function agentExecutionsHaveStopped(db: Db, agentIds: string[]) {
         !await isCancelledNativeStartup(db, run, coordinators.find(row => row.runId === run.id))) return false;
     if (run.runtimeMode === "legacy" && !run.processPid && !run.processGroupId &&
         (run.resultJson?.executionCancellation as Record<string, unknown> | undefined)?.state !== "acknowledged" &&
+        !provesNoProviderWork(run) &&
         !(run.executionStage === "settled" && !await runUsedConversationAdapter(db, run)) &&
         !await isCancelledNativeStartup(db, run, coordinators.find(row => row.runId === run.id))) return false;
   }
