@@ -234,6 +234,55 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
     }
   });
 
+  describe("admission while another writer holds the company accounting lock", () => {
+    async function withCompanyLocked<T>(companyId: string, check: () => Promise<T>) {
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      let locked!: () => void;
+      const ready = new Promise<void>((resolve) => { locked = resolve; });
+      const holder = db.transaction(async (tx) => {
+        await tx.select({ id: companies.id }).from(companies).where(eq(companies.id, companyId)).for("no key update");
+        locked();
+        await held;
+      });
+      await ready;
+      try {
+        const timeout = new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 1_000));
+        return await Promise.race([check(), timeout]);
+      } finally {
+        release();
+        await holder;
+      }
+    }
+
+    it("answers without waiting when no scope has a budget policy", async () => {
+      const { companyId, agentId, projectId } = await createBudgetFixture();
+      const service = budgetService(db);
+
+      expect(await withCompanyLocked(companyId, () => service.getInvocationBlock(companyId, agentId, { projectId }))).toBeNull();
+    });
+
+    it("still reports a manual company pause without waiting", async () => {
+      const { companyId, agentId } = await createBudgetFixture();
+      await db.update(companies).set({ status: "paused", pauseReason: "manual", pausedAt: new Date() }).where(eq(companies.id, companyId));
+      const service = budgetService(db);
+      // The first check applies the agent's company_paused hold, which is a write.
+      await service.getInvocationBlock(companyId, agentId);
+
+      expect(await withCompanyLocked(companyId, () => service.getInvocationBlock(companyId, agentId))).toMatchObject({
+        scopeType: "company", reason: "Company is paused and cannot start new work.",
+      });
+    });
+
+    it("waits for the lock when a policy applies (fixture sanity)", async () => {
+      const { companyId, agentId } = await createBudgetFixture();
+      await db.insert(budgetPolicies).values({ companyId, scopeType: "agent", scopeId: agentId, windowKind: "lifetime", amount: 100 });
+      const service = budgetService(db);
+
+      expect(await withCompanyLocked(companyId, () => service.getInvocationBlock(companyId, agentId))).toBe("blocked");
+    });
+  });
+
   it("distinguishes a company budget pause from a manual company pause", async () => {
     const { companyId, agentId } = await createBudgetFixture();
     const service = budgetService(db);
