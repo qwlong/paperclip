@@ -19,12 +19,10 @@ function provesNoProviderWork(run: typeof heartbeatRuns.$inferSelect) {
  * "preparing" under a boot that is gone, that settled before runtime selection,
  * or that the dispatch gate declined, never reached its adapter. */
 async function neverReachedDispatch(db: Db, run: typeof heartbeatRuns.$inferSelect) {
-  if (run.executionStage === "preparing") {
-    return Boolean(run.controllerBootId && run.controllerBootId !== legacyControllerBootId);
-  }
-  const declined = run.executionStage === "settled" && !run.runtimeModeResolvedAt
-    || run.errorCode === DISPATCH_DECLINED_FOR_REPAIR_CODE;
-  return declined && !await hasRecordedExecution(db, run);
+  const stoppedBeforeDispatch = run.executionStage === "preparing"
+    ? Boolean(run.controllerBootId && run.controllerBootId !== legacyControllerBootId)
+    : run.executionStage === "settled" && !run.runtimeModeResolvedAt || run.errorCode === DISPATCH_DECLINED_FOR_REPAIR_CODE;
+  return stoppedBeforeDispatch && !await hasRecordedExecution(db, run);
 }
 
 /** Cancellation changes admission. Process and lease evidence controls cleanup. */

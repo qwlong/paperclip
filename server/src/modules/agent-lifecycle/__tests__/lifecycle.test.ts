@@ -219,6 +219,7 @@ const support = await getEmbeddedPostgresTestSupport();
   const conversationClaim = { adapterDispatch: { adapterType: "claude_local" } };
   it.each([
     ["was still preparing when a previous boot stopped", { executionStage: "preparing", controllerBootId: otherBoot }, false, true],
+    ["was preparing under a previous boot but recorded an adapter invocation", { executionStage: "preparing", controllerBootId: otherBoot }, true, false],
     ["settled before runtime selection", { executionStage: "settled", controllerBootId: legacyControllerBootId }, false, true],
     ["is still preparing under this boot", { executionStage: "preparing", controllerBootId: legacyControllerBootId }, false, false],
     ["is preparing without a controller claim", { executionStage: "preparing", controllerBootId: null }, false, false],
