@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { and, eq, getTableName, inArray, isTable, or, sql } from "drizzle-orm";
 import { createDb, executionWorkspaces, heartbeatRuns, issues, projects, type Db, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
-import { assertExecutionWorkspaceRootReadAccess } from "../services/execution-workspace-repositories.js";
+import { assertExecutionWorkspaceRootReadAccess, executionWorkspaceRepositoryService } from "../services/execution-workspace-repositories.js";
 import { assertTaskWorkspaceAccess, assertTaskWorkspaceSourceProjectAccess, assertTaskWorkspacesAccess } from "../services/task-workspace-source-access.js";
 import { accessService } from "../services/access.js";
 import { executionWorkspaceReadSqlCondition, type AuthorizationActor } from "../services/authorization.js";
@@ -79,6 +79,30 @@ function tableReadsDb<T extends object>(target: T): { db: T; reads: (table: stri
     },
   });
   return { db: handle as T, reads: table => tables.filter(name => name === table).length };
+}
+
+// Like tableReadsDb, but also records reads issued inside transactions opened on the handle.
+function deepTableReadsDb<T extends object>(target: T): { db: T; reads: (table: string) => number } {
+  const tables: string[] = [];
+  const builder = (query: any): any => new Proxy(query, {
+    get(object, property, receiver) {
+      const value = Reflect.get(object, property, receiver);
+      if (property === "from" && typeof value === "function") {
+        return (table: unknown, ...rest: unknown[]) => { if (isTable(table)) tables.push(getTableName(table)); return value.call(object, table, ...rest); };
+      }
+      return typeof value === "function" ? value.bind(object) : value;
+    },
+  });
+  const wrap = (handle: any): any => new Proxy(handle, {
+    get(object, property, receiver) {
+      const value = Reflect.get(object, property, receiver);
+      if (typeof value !== "function") return value;
+      if (property === "select") return (...args: unknown[]) => builder(value.apply(object, args));
+      if (property === "transaction") return (run: (tx: unknown) => unknown, ...rest: unknown[]) => value.call(object, (tx: unknown) => run(wrap(tx)), ...rest);
+      return value.bind(object);
+    },
+  });
+  return { db: wrap(target) as T, reads: table => tables.filter(name => name === table).length };
 }
 
 const outcome = (promise: Promise<unknown>) => promise.then(() => "allowed", (error: Error) => `denied: ${error.message}`);
@@ -164,6 +188,21 @@ const support = await getEmbeddedPostgresTestSupport();
     await assertTaskWorkspacesAccess(many.db, f.actor, f.companyId, ids);
     for (const table of ["agents", "heartbeat_runs", "company_memberships"]) {
       expect(few.reads(table), `premise: deciding reads ${table}`).toBeGreaterThan(0);
+      expect(many.reads(table), table).toBe(few.reads(table));
+    }
+  });
+
+  it("authorizes a root reader against the workspaces sharing its root with a fixed number of reads of its own rows", async () => {
+    const f = await fixture();
+    await addPeers(f, 2);
+    await f.service.guardForPublication(f.admission);
+    const few = deepTableReadsDb(db);
+    await executionWorkspaceRepositoryService(few.db).guardForPublication(f.admission);
+    await addPeers(f, 10);
+    const many = deepTableReadsDb(db);
+    await executionWorkspaceRepositoryService(many.db).guardForPublication(f.admission);
+    for (const table of ["agents", "heartbeat_runs"]) {
+      expect(few.reads(table), `premise: authorizing the reader reads ${table}`).toBeGreaterThan(0);
       expect(many.reads(table), table).toBe(few.reads(table));
     }
   });

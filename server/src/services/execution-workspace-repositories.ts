@@ -555,7 +555,13 @@ export function executionWorkspaceRepositoryService(db: Db) {
       } else await assertTaskWorkspacesAccess(tx, actor, input.companyId, sourceIds);
       const sourceWorkspaces = sourceIds.size ? await tx.select().from(executionWorkspaces).where(and(
         eq(executionWorkspaces.companyId, input.companyId), or(...[...sourceIds].map(id => eq(executionWorkspaces.id, id))))) : [];
+      // A source workspace enters the trust decision only through its project, so
+      // workspaces that share a project share the decision.
+      const decidedSourceProjects = new Set<string | null>();
       for (const sourceWorkspace of sourceWorkspaces.length ? sourceWorkspaces : [null]) {
+        const sourceProjectId = sourceWorkspace?.projectId ?? null;
+        if (decidedSourceProjects.has(sourceProjectId)) continue;
+        decidedSourceProjects.add(sourceProjectId);
         if (await requiresAnonymousAcquisition(tx, { issue, workspace: sourceWorkspace, agentId: reader.agentId!, runId: reader.scopeId })) {
           await reserveRootPolicy(tx, input.companyId, canonicalCwd, "anonymous_only");
         }
