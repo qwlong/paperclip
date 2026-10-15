@@ -963,7 +963,7 @@ export function authorizationService(db: Db | DbTransaction, options: { rowMemo?
       .then((rows) => rows[0] ?? null));
   }
 
-  const issueAuthorizationColumns = {
+  const issueAuthorizationColumns = () => ({
     id: issues.id,
     companyId: issues.companyId,
     projectId: issues.projectId,
@@ -975,8 +975,8 @@ export function authorizationService(db: Db | DbTransaction, options: { rowMemo?
     executionPolicy: issues.executionPolicy,
     originKind: issues.originKind,
     originId: issues.originId,
-  };
-  const issuePrivacyColumns = {
+  });
+  const issuePrivacyColumns = () => ({
     id: issues.id,
     companyId: issues.companyId,
     visibility: issues.visibility,
@@ -986,7 +986,7 @@ export function authorizationService(db: Db | DbTransaction, options: { rowMemo?
     assigneeUserId: issues.assigneeUserId,
     assigneeAgentId: issues.assigneeAgentId,
     projectId: issues.projectId,
-  };
+  });
   const issueKey = (issueId: string) => `issue:${issueId}`;
   const issuePrivacyRowKey = (companyId: string, issueId: string) => `issue-privacy-row:${companyId}:${issueId}`;
   const issuePrivacyReadKey = (actor: AuthorizationActor, companyId: string, issueId: string) =>
@@ -994,7 +994,7 @@ export function authorizationService(db: Db | DbTransaction, options: { rowMemo?
 
   async function loadIssue(issueId: string): Promise<IssueAuthorizationRow | null> {
     return remember(issueKey(issueId), () => db
-      .select(issueAuthorizationColumns)
+      .select(issueAuthorizationColumns())
       .from(issues)
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null));
@@ -1011,8 +1011,8 @@ export function authorizationService(db: Db | DbTransaction, options: { rowMemo?
     const ids = [...new Set(issueIds)].filter((id) => UUID_PATTERN.test(id) && !memo.has(issueKey(id)));
     for (let start = 0; start < ids.length; start += PREFETCH_CHUNK_SIZE) {
       const chunk = ids.slice(start, start + PREFETCH_CHUNK_SIZE);
-      const authorizationRows = await db.select(issueAuthorizationColumns).from(issues).where(inArray(issues.id, chunk));
-      const privacyRows = await db.select(issuePrivacyColumns).from(issues)
+      const authorizationRows = await db.select(issueAuthorizationColumns()).from(issues).where(inArray(issues.id, chunk));
+      const privacyRows = await db.select(issuePrivacyColumns()).from(issues)
         .where(and(inArray(issues.id, chunk), eq(issues.companyId, companyId)));
       const readable = await db.select({ id: issues.id }).from(issues)
         .where(and(inArray(issues.id, chunk), eq(issues.companyId, companyId), issuePrivacyCondition(actor)));
@@ -2760,7 +2760,7 @@ export function authorizationService(db: Db | DbTransaction, options: { rowMemo?
 
     const { companyId, issueId } = input.resource;
     const issue = await remember(issuePrivacyRowKey(companyId, issueId), () => db
-      .select(issuePrivacyColumns)
+      .select(issuePrivacyColumns())
       .from(issues)
       .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)))
       .then((rows) => rows[0] ?? null));
@@ -2813,6 +2813,10 @@ export function authorizationService(db: Db | DbTransaction, options: { rowMemo?
   };
 }
 
+// The retain_workspace_privacy_sources trigger keys retained sources by issues.id::text.
+// Matching on the uuid lets the lookup use the primary key; a key in any other form matches nothing.
+const retainedSourceIssueId = sql`(case when source.id ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' then source.id::uuid end)`;
+
 /** A workspace can contain several tasks. Reading files/operations requires
  * access to every task bound to it, not just the task that originally made it. */
 export async function executionWorkspaceReadSqlCondition(db: Db | DbTransaction, actor: AuthorizationActor): Promise<SQL<boolean>> {
@@ -2823,7 +2827,7 @@ export async function executionWorkspaceReadSqlCondition(db: Db | DbTransaction,
       select 1 from ${projects} where ${projects.id} = ${executionWorkspaces.projectId}
         and ${projects.companyId} = ${executionWorkspaces.companyId} and ${projectCondition}))
     and not exists (select 1 from jsonb_object_keys(coalesce(${executionWorkspaces.metadata}->'_issuePrivacySources', '{}'::jsonb)) source(id)
-      where not exists (select 1 from ${issues} where ${issues.id}::text = source.id
+      where not exists (select 1 from ${issues} where ${issues.id} = ${retainedSourceIssueId}
         and ${issues.companyId} = ${executionWorkspaces.companyId} and ${issueCondition}))
     and not exists (select 1 from ${issues}
       where ${issues.companyId} = ${executionWorkspaces.companyId}
