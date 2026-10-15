@@ -1,5 +1,5 @@
 {
-  "id": "cfe5c429-f879-4534-b8b6-7614b63cbce8",
+  "id": "3bd7b1df-1434-4fac-87d6-53b90a9eb9e1",
   "prevId": "aaf08b19-e3cc-4889-8e9d-5081e2e3cf8e",
   "version": "7",
   "dialect": "postgresql",
@@ -32454,22 +32454,6 @@
           "method": "btree",
           "with": {}
         },
-        "heartbeat_runs_company_secret_redactions_idx": {
-          "name": "heartbeat_runs_company_secret_redactions_idx",
-          "columns": [
-            {
-              "expression": "company_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "where": "\"heartbeat_runs\".\"context_snapshot\" ? 'paperclipSecretRedactions'",
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
         "heartbeat_runs_company_ctx_task_created_idx": {
           "name": "heartbeat_runs_company_ctx_task_created_idx",
           "columns": [
@@ -32521,6 +32505,54 @@
           ],
           "isUnique": false,
           "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "heartbeat_runs_company_ctx_paperclip_issue_created_idx": {
+          "name": "heartbeat_runs_company_ctx_paperclip_issue_created_idx",
+          "columns": [
+            {
+              "expression": "company_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "(\"context_snapshot\" -> 'paperclipIssue' ->> 'id')",
+              "asc": true,
+              "isExpression": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "created_at",
+              "isExpression": false,
+              "asc": false,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": true,
+          "method": "btree",
+          "with": {}
+        },
+        "heartbeat_runs_company_origin_issue_idx": {
+          "name": "heartbeat_runs_company_origin_issue_idx",
+          "columns": [
+            {
+              "expression": "company_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "coalesce(\n        \"native_issue_id\"::text,\n        nullif(\"context_snapshot\"->>'issueId', ''),\n        nullif(\"context_snapshot\"->>'taskId', ''),\n        nullif(\"context_snapshot\"->>'taskKey', '')\n      )",
+              "asc": true,
+              "isExpression": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": true,
           "method": "btree",
           "with": {}
         }

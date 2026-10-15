@@ -14,6 +14,7 @@ import {
   agents,
   companies,
   createDb,
+  databaseWorkPending,
   executionWorkspaces,
   heartbeatRuns,
   issueComments,
@@ -23,6 +24,7 @@ import {
   issues,
   projectWorkspaces,
   projects,
+  subscribeDatabaseWork,
   workspaceRuntimeServices,
 } from "@paperclipai/db";
 import {
@@ -41,6 +43,8 @@ import {
   readMetadataReopenPendingConsumptionSince,
 } from "../services/execution-workspaces.ts";
 import { issueService } from "../services/issues.ts";
+import { workProductService } from "../services/work-products.js";
+import { DELIVERY_QUEUES } from "../services/delivery-work-notifications.js";
 import {
   startRuntimeServicesForWorkspaceControl,
   stopRuntimeServicesForExecutionWorkspace,
@@ -396,7 +400,6 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     mergedPr?: boolean;
     activeRun?: boolean;
     childStatus?: "done" | "todo";
-    sourceStatus?: "done" | "in_progress" | "todo";
   } = {}) {
     const companyId = randomUUID();
     const projectId = randomUUID();
@@ -447,7 +450,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       projectId,
       identifier,
       title: "Delivered source issue",
-      status: options.sourceStatus ?? "done",
+      status: "done",
       priority: "medium",
       executionWorkspaceId,
     });
@@ -520,253 +523,206 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     return { companyId, projectId, executionWorkspaceId, sourceIssueId, identifier, repoRoot, worktreePath, headSha };
   }
 
-  it("reads the issue tree before it inspects git for a workspace that is not terminal", async () => {
-    const seeded = await seedTerminalWorkspace({ sourceStatus: "in_progress" });
-    const runSpy = vi.spyOn(workspaceGitOperationScheduler, "run");
+  it("skips nonterminal trees, cooldowns, and active runs without a Git scan", async () => {
+    await seedTerminalWorkspace({ childStatus: "todo" });
+    const recent = await seedTerminalWorkspace({ mergedPr: true });
+    const running = await seedTerminalWorkspace({ activeRun: true });
+    await db.update(issues).set({ completedAt: new Date("2020-01-01") }).where(eq(issues.id, running.sourceIssueId));
+    await db.update(issues).set({ completedAt: new Date() }).where(eq(issues.id, recent.sourceIssueId));
+    const service = executionWorkspaceService(db, { workspaceReaperCooldownDays: 7 });
+    const scan = vi.spyOn(workspaceGitOperationScheduler, "run");
     try {
-      const sweep = await svc.sweepTerminalWorkspaces();
-      const readinessScans = runSpy.mock.calls.filter(
-        ([input]) =>
-          (input as { operation?: string }).operation === "execution_workspaces.close_readiness_status",
-      );
-      expect(readinessScans).toHaveLength(0);
-      expect(sweep.checked).toBeGreaterThanOrEqual(1);
-      expect(sweep.skippedNonTerminalTree).toBeGreaterThanOrEqual(1);
-      expect(sweep.archived).toBe(0);
-      expect(seeded.executionWorkspaceId).toBeTruthy();
-    } finally {
-      runSpy.mockRestore();
-    }
+      expect(await service.sweepTerminalWorkspaces()).toMatchObject({
+        archived: 0, skippedNonTerminalTree: 1, skippedCooldown: 1, skippedActiveRun: 1,
+      });
+      expect(scan).not.toHaveBeenCalled();
+    } finally { scan.mockRestore(); }
   });
 
-  it("inspects an unchanged candidate once instead of on every sweep", async () => {
-    const seeded = await seedTerminalWorkspace();
-    const runSpy = vi.spyOn(workspaceGitOperationScheduler, "run");
-    const countReadinessScans = () =>
-      runSpy.mock.calls.filter(
-        ([input]) =>
-          (input as { operation?: string }).operation === "execution_workspaces.close_readiness_status",
-      ).length;
-    try {
-      const first = await svc.sweepTerminalWorkspaces();
-      const scansAfterFirst = countReadinessScans();
-      const second = await svc.sweepTerminalWorkspaces();
-      expect(scansAfterFirst).toBeGreaterThanOrEqual(1);
-      expect(second.skippedRecentlyInspected).toBeGreaterThanOrEqual(1);
-      expect(countReadinessScans()).toBe(scansAfterFirst);
-      expect(first.archived).toBe(0);
-      expect(second.archived).toBe(0);
-      expect(seeded.executionWorkspaceId).toBeTruthy();
-    } finally {
-      runSpy.mockRestore();
-    }
-  });
-
-  it("reads a working tree shared by several rows once per sweep", async () => {
-    const seeded = await seedTerminalWorkspace();
-    const secondIssueId = randomUUID();
-    const secondWorkspaceId = randomUUID();
-    // Production data looks like this: 54 of 59 candidate rows pointed at one
-    // directory, so a sweep paid one `git status` per row for the same tree.
-    await db.insert(executionWorkspaces).values({
-      id: secondWorkspaceId,
-      companyId: seeded.companyId,
-      projectId: seeded.projectId,
-      mode: "isolated_workspace",
-      strategyType: "git_worktree",
-      name: "shared-working-tree-row",
-      status: "active",
-      cwd: seeded.worktreePath,
-      providerRef: seeded.worktreePath,
-      providerType: "git_worktree",
-      repoUrl: "https://github.com/paperclipai/paperclip.git",
-      baseRef: "main",
-      branchName: "PAP-16015-delivery",
+  it("derives cooldown deadlines from the full company-scoped terminal tree", async () => {
+    const seed = await seedTerminalWorkspace({ childStatus: "done" });
+    const [child] = await db.select().from(issues).where(eq(issues.parentId, seed.sourceIssueId));
+    const sourceDone = new Date("2026-01-01T00:00:00Z"), childCancelled = new Date("2026-01-02T00:00:00Z");
+    await db.update(issues).set({ completedAt: sourceDone }).where(eq(issues.id, seed.sourceIssueId));
+    await db.update(issues).set({ status: "cancelled", cancelledAt: childCancelled }).where(eq(issues.id, child!.id));
+    const unrelated = await seedTerminalWorkspace();
+    await db.update(issues).set({ parentId: seed.sourceIssueId, status: "todo" }).where(eq(issues.id, unrelated.sourceIssueId));
+    const service = executionWorkspaceService(db, {
+      workspaceReaperCooldownDays: 7, now: () => new Date("2026-01-03T00:00:00Z"),
     });
-    await db.insert(issues).values({
-      id: secondIssueId,
-      companyId: seeded.companyId,
-      projectId: seeded.projectId,
-      identifier: `${seeded.identifier}-shared`,
-      title: "Second row over the same working tree",
-      status: "done",
-      priority: "medium",
-      executionWorkspaceId: secondWorkspaceId,
+    await service.sweepTerminalWorkspaces();
+    const select = vi.spyOn(db, "select");
+    try {
+      expect(await service.nextTerminalWorkspaceSweepAt()).toBe(childCancelled.getTime() + 7 * 86_400_000);
+      expect(await service.nextTerminalWorkspaceSweepAt()).toBe(childCancelled.getTime() + 7 * 86_400_000);
+      expect(select).not.toHaveBeenCalled();
+    } finally { select.mockRestore(); }
+    await db.update(issues).set({ status: "todo" }).where(eq(issues.id, child!.id));
+    await service.sweepTerminalWorkspaces();
+    expect(await service.nextTerminalWorkspaceSweepAt()).toBeNull();
+    await db.update(issues).set({ status: "done", completedAt: null, updatedAt: sourceDone }).where(eq(issues.id, child!.id));
+    await service.sweepTerminalWorkspaces();
+    expect(await service.nextTerminalWorkspaceSweepAt()).toBe(sourceDone.getTime() + 7 * 86_400_000);
+  });
+
+  it("does not use cached display Git state to remove a worktree", async () => {
+    const seed = await seedTerminalWorkspace({ mergedPr: true });
+    await svc.getById(seed.executionWorkspaceId);
+    await fs.writeFile(path.join(seed.worktreePath, "unsaved.txt"), "keep this work\n");
+    expect(await svc.sweepTerminalWorkspaces()).toMatchObject({ archived: 0, skippedUndelivered: 1 });
+    expect(await fs.readFile(path.join(seed.worktreePath, "unsaved.txt"), "utf8")).toBe("keep this work\n");
+  });
+
+  it("shares compatible Git inspections within a batch while keeping branch and company decisions separate", async () => {
+    const first = await seedTerminalWorkspace();
+    const otherCompany = await seedTerminalWorkspace();
+    const [original] = await db.select().from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, first.executionWorkspaceId));
+    await db.insert(executionWorkspaces).values([
+      { ...original!, id: randomUUID(), name: "Same directory", updatedAt: new Date("2020-01-01") },
+      { ...original!, id: randomUUID(), name: "Different base", baseRef: "other-base", updatedAt: new Date("2020-01-01") },
+    ]);
+    await db.update(executionWorkspaces).set({
+      cwd: first.worktreePath,
+      providerRef: first.worktreePath,
+      branchName: original!.branchName,
+      baseRef: original!.baseRef,
+    }).where(eq(executionWorkspaces.id, otherCompany.executionWorkspaceId));
+    const service = executionWorkspaceService(db, { workspaceReaperCooldownDays: 0 });
+    const scan = vi.spyOn(workspaceGitOperationScheduler, "run");
+    const select = vi.spyOn(db, "select");
+    try {
+      expect(await service.sweepTerminalWorkspaces()).toMatchObject({ checked: 4, archived: 0 });
+      expect(scan.mock.calls.filter(([input]) => input.operation === "execution_workspaces.close_readiness_status"))
+        .toHaveLength(3);
+      expect(select.mock.calls.filter(([fields]) => fields && "completedAt" in fields && "cancelledAt" in fields))
+        .toHaveLength(4);
+    } finally {
+      scan.mockRestore();
+      select.mockRestore();
+    }
+  });
+
+  it("backs off unchanged terminal candidates while unrelated commits wake the worker", async () => {
+    await seedTerminalWorkspace();
+    let clock = Date.now();
+    const service = executionWorkspaceService(db, {
+      workspaceReaperCooldownDays: 0, terminalWorkspaceInspectionBackoffMs: 300_000,
+      now: () => new Date(clock),
     });
-    await db
-      .update(executionWorkspaces)
-      .set({ sourceIssueId: secondIssueId })
-      .where(eq(executionWorkspaces.id, secondWorkspaceId));
-
-    const runSpy = vi.spyOn(workspaceGitOperationScheduler, "run");
-    const scansForPath = () =>
-      runSpy.mock.calls.filter(([input]) => {
-        const call = input as { operation?: string; workspacePath?: string };
-        return (
-          call.operation === "execution_workspaces.close_readiness_status"
-          && typeof call.workspacePath === "string"
-          && path.resolve(call.workspacePath) === path.resolve(seeded.worktreePath)
-        );
-      }).length;
+    const scan = vi.spyOn(workspaceGitOperationScheduler, "run");
     try {
-      await svc.sweepTerminalWorkspaces();
-      expect(scansForPath()).toBe(1);
-    } finally {
-      runSpy.mockRestore();
-    }
+      expect(await service.sweepTerminalWorkspaces()).toMatchObject({ archived: 0, skippedUndelivered: 1 });
+      const initial = scan.mock.calls.length;
+      expect(initial).toBeGreaterThan(0);
+      service.terminalWorkspaceWorkSettled(new Set(["issue:unrelated"]));
+      expect(await service.sweepTerminalWorkspaces()).toMatchObject({ skippedBackoff: 1 });
+      expect(scan).toHaveBeenCalledTimes(initial);
+      clock += 240_000;
+      expect(await service.nextTerminalWorkspaceSweepAt()).toBe(clock + 60_000);
+      clock += 60_000;
+      await service.sweepTerminalWorkspaces();
+      expect(scan).toHaveBeenCalledTimes(initial * 2);
+    } finally { scan.mockRestore(); }
   });
 
-  it("does not share a git snapshot across rows with different branch metadata", async () => {
-    const seeded = await seedTerminalWorkspace();
-    const otherIssueId = randomUUID();
-    const otherWorkspaceId = randomUUID();
-    // Same working tree, different branch/base metadata: the status snapshot
-    // alone is path-dependent, but `isMergedIntoBase`/`branchName` are not, so
-    // the second row must not inherit the first row's delivery verdict.
-    await db.insert(executionWorkspaces).values({
-      id: otherWorkspaceId,
-      companyId: seeded.companyId,
-      projectId: seeded.projectId,
-      mode: "isolated_workspace",
-      strategyType: "git_worktree",
-      name: "other-branch-row",
-      status: "active",
-      cwd: seeded.worktreePath,
-      providerRef: seeded.worktreePath,
-      providerType: "git_worktree",
-      repoUrl: "https://github.com/paperclipai/paperclip.git",
-      baseRef: "main",
-      branchName: "other-delivery",
+  it("invalidates a candidate backoff after its real PR producer commits", async () => {
+    const seed = await seedTerminalWorkspace();
+    const service = executionWorkspaceService(db, {
+      workspaceReaperCooldownDays: 0, terminalWorkspaceInspectionBackoffMs: 300_000,
+      resolvePullRequestDetails: async () => ({ state: "merged", headRef: "PAP-16015-delivery", headSha: seed.headSha }),
     });
-    await db.insert(issues).values({
-      id: otherIssueId,
-      companyId: seeded.companyId,
-      projectId: seeded.projectId,
-      identifier: `${seeded.identifier}-other`,
-      title: "Second row over the same tree with different branch metadata",
-      status: "done",
-      priority: "medium",
-      executionWorkspaceId: otherWorkspaceId,
+    expect(await service.sweepTerminalWorkspaces()).toMatchObject({ archived: 0, skippedUndelivered: 1 });
+    const unsubscribe = subscribeDatabaseWork(db, DELIVERY_QUEUES.terminalWorkspaces, (event, hints) => {
+      if (event === "settled") service.terminalWorkspaceWorkSettled(hints);
     });
-    await db
-      .update(executionWorkspaces)
-      .set({ sourceIssueId: otherIssueId })
-      .where(eq(executionWorkspaces.id, otherWorkspaceId));
-
-    const runSpy = vi.spyOn(workspaceGitOperationScheduler, "run");
-    const scansForPath = () =>
-      runSpy.mock.calls.filter(([input]) => {
-        const call = input as { operation?: string; workspacePath?: string };
-        return (
-          call.operation === "execution_workspaces.close_readiness_status"
-          && typeof call.workspacePath === "string"
-          && path.resolve(call.workspacePath) === path.resolve(seeded.worktreePath)
-        );
-      }).length;
     try {
-      await svc.sweepTerminalWorkspaces();
-      expect(scansForPath()).toBe(2);
-    } finally {
-      runSpy.mockRestore();
-    }
+      await workProductService(db).createForIssue(seed.sourceIssueId, seed.companyId, {
+        type: "pull_request", provider: "github", title: "PR", status: "merged",
+        url: "https://github.com/paperclipai/paperclip/pull/10623", executionWorkspaceId: seed.executionWorkspaceId,
+      });
+      expect(await service.sweepTerminalWorkspaces()).toMatchObject({ archived: 1 });
+      await expect(fs.access(seed.worktreePath)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally { unsubscribe(); }
   });
 
-  it("retries a failed reaper git inspection instead of suppressing it for the cooldown", async () => {
-    const seeded = await seedTerminalWorkspace();
-    const runSpy = vi.spyOn(workspaceGitOperationScheduler, "run");
-    const countReadinessScans = () =>
-      runSpy.mock.calls.filter(
-        ([input]) =>
-          (input as { operation?: string }).operation === "execution_workspaces.close_readiness_status",
-      ).length;
-    try {
-      // A transient scheduler/Git failure must not count as an inspection, or
-      // the cooldown would delay cleanup for five minutes on one blip.
-      runSpy.mockRejectedValue(new Error("synthetic scan failure"));
-      await svc.sweepTerminalWorkspaces();
-      const scansAfterFirst = countReadinessScans();
-      const second = await svc.sweepTerminalWorkspaces();
-      expect(scansAfterFirst).toBeGreaterThanOrEqual(1);
-      expect(countReadinessScans()).toBeGreaterThan(scansAfterFirst);
-      expect(second.skippedRecentlyInspected).toBe(0);
-      expect(seeded.executionWorkspaceId).toBeTruthy();
-    } finally {
-      runSpy.mockRestore();
-    }
+  it("rescans committed changes that arrive behind a bounded recovery cursor", async () => {
+    const seed = await seedTerminalWorkspace();
+    const service = executionWorkspaceService(db, {
+      workspaceReaperCooldownDays: 0,
+      resolvePullRequestDetails: async () => ({ state: "merged", headRef: "PAP-16015-delivery", headSha: seed.headSha }),
+    });
+    expect(await service.sweepTerminalWorkspaces(1)).toMatchObject({ checked: 1, skippedUndelivered: 1 });
+    await workProductService(db).createForIssue(seed.sourceIssueId, seed.companyId, {
+      type: "pull_request", provider: "github", title: "PR", status: "merged",
+      url: "https://github.com/paperclipai/paperclip/pull/10623",
+    });
+    service.terminalWorkspaceWorkSettled(new Set([`issue:${seed.sourceIssueId}`]));
+    expect(await service.sweepTerminalWorkspaces(1)).toMatchObject({ checked: 0 });
+    expect(service.hasTerminalWorkspaceSweepContinuation()).toBe(true);
+    expect(await service.sweepTerminalWorkspaces(2)).toMatchObject({ checked: 1, archived: 1 });
+    expect(service.hasTerminalWorkspaceSweepContinuation()).toBe(false);
+    expect(await service.nextTerminalWorkspaceSweepAt()).toBeNull();
   });
 
-  it("serves a repeated close-readiness scan from the scheduler cache", async () => {
-    const seeded = await seedTerminalWorkspace();
-    const runSpy = vi.spyOn(workspaceGitOperationScheduler, "run");
+  it("retries unread rows from a failed full page before it can park recovery", async () => {
+    const seed = await seedTerminalWorkspace({ mergedPr: true });
+    await seedTerminalWorkspace({ childStatus: "todo" });
+    await db.update(executionWorkspaces).set({ updatedAt: new Date("2019-01-01") })
+      .where(eq(executionWorkspaces.id, seed.executionWorkspaceId));
+    const service = executionWorkspaceService(db, {
+      workspaceReaperCooldownDays: 0,
+      resolvePullRequestDetails: async () => ({ state: "merged", headRef: "PAP-16015-delivery", headSha: seed.headSha }),
+    });
+    const original = db.select.bind(db);
+    let fail = true;
+    const select = vi.spyOn(db, "select").mockImplementation(((fields: any) => {
+      if (fail && fields?.completedAt && fields?.cancelledAt) {
+        fail = false;
+        throw new Error("task tree read failed");
+      }
+      return original(fields);
+    }) as typeof db.select);
     try {
-      await svc.getCloseReadiness(seeded.executionWorkspaceId);
-      await svc.getCloseReadiness(seeded.executionWorkspaceId);
-      const readinessCallIndexes = runSpy.mock.calls
-        .map((call, index) => ({
-          index,
-          operation: (call[0] as { operation?: string }).operation,
-        }))
-        .filter((entry) => entry.operation === "execution_workspaces.close_readiness_status")
-        .map((entry) => entry.index);
-      expect(readinessCallIndexes.length).toBeGreaterThanOrEqual(2);
-      const responses = await Promise.all(
-        readinessCallIndexes.map(
-          (index) => runSpy.mock.results[index]!.value as Promise<{ cacheHit?: boolean }>,
-        ),
-      );
-      expect(responses[responses.length - 2]?.cacheHit).toBe(false);
-      expect(responses[responses.length - 1]?.cacheHit).toBe(true);
-    } finally {
-      runSpy.mockRestore();
-    }
+      await expect(service.sweepTerminalWorkspaces(1)).rejects.toThrow("task tree read failed");
+      expect(service.hasTerminalWorkspaceSweepContinuation()).toBe(true);
+      expect(await service.sweepTerminalWorkspaces(1)).toMatchObject({ checked: 1, archived: 1 });
+      expect(await service.sweepTerminalWorkspaces(1)).toMatchObject({ checked: 1, skippedNonTerminalTree: 1 });
+      expect(await service.sweepTerminalWorkspaces(1)).toMatchObject({ checked: 0 });
+      expect(service.hasTerminalWorkspaceSweepContinuation()).toBe(false);
+      expect(await service.nextTerminalWorkspaceSweepAt()).toBeNull();
+      await expect(fs.access(seed.worktreePath)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally { select.mockRestore(); }
   });
 
-  it("reads live Git state for the close decision inside the cache window", async () => {
-    const seeded = await seedTerminalWorkspace();
-    const runSpy = vi.spyOn(workspaceGitOperationScheduler, "run");
+  it("signals real issue producers before writes and waits for the outer transaction", async () => {
+    const seed = await seedTerminalWorkspace();
+    const events: string[] = [];
+    const unsubscribe = subscribeDatabaseWork(db, DELIVERY_QUEUES.terminalWorkspaces, event => events.push(event));
     try {
-      // The board display read populates the bounded cache.
-      await svc.getCloseReadiness(seeded.executionWorkspaceId);
-      // The archive decision must not reuse it: that read decides whether the
-      // worktree is destroyed.
-      await svc.getCloseReadiness(seeded.executionWorkspaceId, { freshGitStatus: true });
-      const readinessCallIndexes = runSpy.mock.calls
-        .map((call, index) => ({
-          index,
-          operation: (call[0] as { operation?: string }).operation,
-        }))
-        .filter((entry) => entry.operation === "execution_workspaces.close_readiness_status")
-        .map((entry) => entry.index);
-      expect(readinessCallIndexes.length).toBeGreaterThanOrEqual(2);
-      const decisionScan = await (runSpy.mock.results[
-        readinessCallIndexes[readinessCallIndexes.length - 1]!
-      ]!.value as Promise<{ cacheHit?: boolean }>);
-      expect(decisionScan.cacheHit).toBe(false);
-    } finally {
-      runSpy.mockRestore();
-    }
+      await db.transaction(async tx => {
+        await issueService(db).update(seed.sourceIssueId, { status: "cancelled" }, tx);
+        expect(events).toEqual(["intent"]);
+        expect(databaseWorkPending(db, DELIVERY_QUEUES.terminalWorkspaces)).toBe(true);
+        const [outside] = await db.select().from(issues).where(eq(issues.id, seed.sourceIssueId));
+        expect(outside?.status).toBe("done");
+      });
+      expect(events).toEqual(["intent", "settled"]);
+      expect(databaseWorkPending(db, DELIVERY_QUEUES.terminalWorkspaces)).toBe(false);
+      await workProductService(db).createForIssue(seed.sourceIssueId, seed.companyId, {
+        type: "pull_request", provider: "github", title: "PR", status: "merged", url: "https://github.com/paperclipai/paperclip/pull/10623",
+      });
+      expect(events.slice(-2)).toEqual(["intent", "settled"]);
+      await svc.update(seed.executionWorkspaceId, { status: "idle" });
+      expect(events).toHaveLength(6);
+    } finally { unsubscribe(); }
   });
 
   it("reports a squash cross-branch delivery as merged_via_pr and suppresses the ancestry warning", async () => {
-    const repoRoot = await createTempRepo();
-    tempDirs.add(repoRoot);
-    const worktreePath = path.join(path.dirname(repoRoot), `paperclip-delivery-${randomUUID()}`);
-    tempDirs.add(worktreePath);
-    await runGit(repoRoot, ["branch", "PAP-16015-delivery"]);
-    await runGit(repoRoot, ["worktree", "add", worktreePath, "PAP-16015-delivery"]);
-    await fs.writeFile(path.join(worktreePath, "delivered.txt"), "delivered\n", "utf8");
-    await runGit(worktreePath, ["add", "delivered.txt"]);
-    await runGit(worktreePath, ["commit", "-m", "Delivered change"]);
-
     const seeded = await seedTerminalWorkspace();
-    pullRequestDetailsByKey.set(`${seeded.companyId}:10623`, {
-      state: "merged",
-      headRef: "PAP-16015-delivery",
-      headSha: await readGit(worktreePath, ["rev-parse", "HEAD"]),
-    });
     await db.update(executionWorkspaces).set({
-      cwd: worktreePath,
-      providerRef: worktreePath,
+      cwd: seeded.worktreePath,
+      providerRef: seeded.worktreePath,
       providerType: "git_worktree",
       baseRef: "main",
       repoUrl: "https://github.com/paperclipai/paperclip.git",
@@ -883,6 +839,58 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     expect(sweep).toMatchObject({ archived: 1, cleanupFailed: 0 });
     expect(workspace).toMatchObject({ status: "archived", cleanupReason: "issue_terminal" });
   }, 20_000);
+
+  it("reads company-scoped execution configuration without live Git inspection", async () => {
+    const seed = await seedAncestryTerminalWorkspace();
+    const service = executionWorkspaceService(db, {
+      inspectGitCloseReadiness: async () => { throw new Error("Git inspection unavailable"); },
+    });
+    const config = { provisionCommand: "echo prepare", environmentId: randomUUID() };
+    await db.update(executionWorkspaces).set({ metadata: { config } })
+      .where(eq(executionWorkspaces.id, seed.executionWorkspaceId));
+
+    expect(await service.getStoredById(seed.companyId, seed.executionWorkspaceId)).toMatchObject({
+      id: seed.executionWorkspaceId, companyId: seed.companyId,
+      cwd: seed.worktreePath, baseRef: "main", config,
+      deliveryState: "unknown", runtimeServices: [],
+    });
+    await expect(service.getStoredById(randomUUID(), seed.executionWorkspaceId))
+      .rejects.toThrow("Task workspace access is no longer available");
+    expect(await service.getStoredById(seed.companyId, randomUUID())).toBeNull();
+    await expect(service.getById(seed.executionWorkspaceId)).rejects.toThrow("Git inspection unavailable");
+  });
+
+  it("derives ancestry from the existing comparison and stays unknown for an invalid base", async () => {
+    const seed = await seedAncestryTerminalWorkspace();
+    const traceDir = await fs.mkdtemp(path.join(os.tmpdir(), "workspace-git-trace-"));
+    tempDirs.add(traceDir);
+    const tracePath = path.join(traceDir, "git.trace");
+    const previousTrace = process.env.GIT_TRACE;
+    process.env.GIT_TRACE = tracePath;
+    try {
+      const merged = await svc.getCloseReadiness(seed.executionWorkspaceId);
+      expect(merged?.git).toMatchObject({ aheadCount: 0, behindCount: 0, isMergedIntoBase: true });
+      expect(await fs.readFile(tracePath, "utf8")).not.toContain("merge-base");
+
+      await fs.writeFile(path.join(seed.worktreePath, "new.txt"), "Undelivered work\n");
+      await runGit(seed.worktreePath, ["add", "new.txt"]);
+      await runGit(seed.worktreePath, ["commit", "-m", "Undelivered work"]);
+      const ahead = await svc.getCloseReadiness(seed.executionWorkspaceId);
+      expect(ahead?.git).toMatchObject({ aheadCount: 1, behindCount: 0, isMergedIntoBase: false });
+      expect(ahead?.deliveryState).toBe("unmerged");
+
+      await db.update(executionWorkspaces).set({ baseRef: "missing-base" })
+        .where(eq(executionWorkspaces.id, seed.executionWorkspaceId));
+      const unknown = await svc.getCloseReadiness(seed.executionWorkspaceId);
+      expect(unknown?.git).toMatchObject({ aheadCount: null, behindCount: null, isMergedIntoBase: null });
+      expect(unknown?.deliveryState).toBe("unknown");
+      expect(await svc.sweepTerminalWorkspaces()).toMatchObject({ archived: 0, skippedUndelivered: 1 });
+      await expect(fs.access(seed.worktreePath)).resolves.toBeUndefined();
+    } finally {
+      if (previousTrace === undefined) delete process.env.GIT_TRACE;
+      else process.env.GIT_TRACE = previousTrace;
+    }
+  });
 
   it("fails closed before archive when git status inspection is unavailable", async () => {
     const seeded = await seedAncestryTerminalWorkspace();

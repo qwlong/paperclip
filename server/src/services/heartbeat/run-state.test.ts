@@ -2,6 +2,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
+  agentWakeupRequests,
   agentTaskSessions,
   companies,
   createDb,
@@ -30,6 +31,7 @@ function readingDatabase(serverEncoding: string, ...results: unknown[][]) {
     const rows = results.shift() ?? [];
     const query = {
       from: () => query,
+      leftJoin: () => query,
       where: (condition: SQL) => {
         scopes.push(new PgDialect().sqlToQuery(condition).params);
         return query;
@@ -119,6 +121,68 @@ describePostgres("heartbeat run state database wiring", () => {
     const [issue] = await db.insert(issues).values({ companyId, title: "Session task", assigneeAgentId: agent.id }).returning();
     return { companyId, agent, issue, state: extracted.createHeartbeatRunState(db) };
   }
+
+  it("retains the consumed queue identity in issue polling summaries", async () => {
+    const { companyId, agent, issue, state } = await fixture();
+    const [wake] = await db.insert(agentWakeupRequests).values({
+      companyId, agentId: agent.id, source: "issue", status: "claimed",
+    }).returning();
+    const [run] = await db.insert(heartbeatRuns).values({
+      companyId, agentId: agent.id, issueId: issue.id, status: "running",
+      startedAt: new Date(), wakeupRequestId: wake.id,
+      contextSnapshot: { issueId: issue.id, commentId: "delivered-message", queuedCommentSourceWakeIds: ["coalesced-queue"] },
+    }).returning();
+    for (const summary of [
+      await state.getRunIssueSummary(run.id),
+      await state.getActiveRunIssueSummaryForAgent(agent.id),
+    ]) {
+      expect(summary).toMatchObject({ id: run.id, wakeupRequestId: wake.id, contextCommentId: "delivered-message", queuedCommentSourceWakeIds: ["coalesced-queue"] });
+    }
+  });
+
+  it("bounds history at the service boundary and keeps company and agent scope", async () => {
+    const { companyId, agent, state } = await fixture();
+    await db.execute(sql`insert into heartbeat_runs (company_id, agent_id, created_at)
+      select ${companyId}::uuid, ${agent.id}::uuid, '2026-01-01'::timestamptz + n * interval '1 second'
+      from generate_series(1, 1005) n`);
+    const foreign = await fixture();
+    await db.insert(heartbeatRuns).values({ companyId: foreign.companyId, agentId: foreign.agent.id });
+    const rows = await state.listRuns(companyId);
+    expect(rows).toHaveLength(200);
+    expect(rows.every(row => row.companyId === companyId && row.agentId === agent.id)).toBe(true);
+    expect(rows[0].createdAt.getTime()).toBeGreaterThan(rows[199].createdAt.getTime());
+    expect(await state.listRuns(companyId, agent.id, 10000)).toHaveLength(1000);
+    expect(await state.listRuns(companyId, agent.id, 1.9)).toHaveLength(1);
+    expect(await state.listRuns(companyId, agent.id, -10)).toHaveLength(1);
+    expect(await state.listRuns(companyId, agent.id, NaN)).toHaveLength(200);
+    expect(await state.listRuns(companyId, foreign.agent.id)).toEqual([]);
+  });
+
+  it("preserves legacy context text, native issue precedence and summary privacy", async () => {
+    const { companyId, agent, issue, state } = await fixture();
+    const contexts: unknown[] = [null, [], "legacy", 3, true, {}, {
+      issueId: "legacy-issue", taskId: 17, taskKey: { nested: true }, commentId: ["one", 2],
+      wakeCommentId: null, wakeReason: false, wakeSource: "   ", wakeTriggerDetail: "héllo\nworld",
+      secret: "never return this", prompt: randomBytes(96 * 1024).toString("hex"),
+    }];
+    for (const [index, contextSnapshot] of contexts.entries()) {
+      const [run] = await db.insert(heartbeatRuns).values({
+        companyId, agentId: agent.id, issueId: index === contexts.length - 1 ? issue.id : null,
+        contextSnapshot: contextSnapshot as Record<string, unknown>,
+      }).returning();
+      const expected = (await db.execute(sql`select coalesce(issue_id::text, context_snapshot->>'issueId') as "issueId",
+        context_snapshot->>'taskId' as "taskId", context_snapshot->>'taskKey' as "taskKey",
+        context_snapshot->>'commentId' as "commentId", context_snapshot->>'wakeCommentId' as "wakeCommentId",
+        context_snapshot->>'wakeReason' as "wakeReason", context_snapshot->>'wakeSource' as "wakeSource",
+        context_snapshot->>'wakeTriggerDetail' as "wakeTriggerDetail" from heartbeat_runs where id = ${run.id}::uuid`))[0];
+      for (const summary of [false, true]) {
+        const actual = (await state.listRuns(companyId, agent.id, 100, { summary })).find(row => row.id === run.id)!;
+        expect(actual.contextSnapshot).toEqual(extracted.summarizeHeartbeatRunContextSnapshot(expected));
+        expect(actual.contextSnapshot ?? {}).not.toHaveProperty("secret");
+        expect(actual.contextSnapshot ?? {}).not.toHaveProperty("prompt");
+      }
+    }
+  });
 
   it("preserves controller lease cancellation when a large result is bounded", async () => {
     const { companyId, agent, state } = await fixture();

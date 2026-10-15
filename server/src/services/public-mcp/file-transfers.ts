@@ -8,6 +8,7 @@ import { MAX_ATTACHMENT_BYTES, isAllowedContentType } from "../../attachment-typ
 import type { StorageService } from "../../storage/types.js";
 import { authorizationService } from "../authorization.js";
 import { issueService } from "../issues.js";
+import { prepareExternalDeliverablePublication, readExternalDeliverablePublication } from "../native-runtime/external-deliverable-publication.js";
 import { logActivity } from "../activity-log.js";
 import { hashMcpSecret, type PublicMcpOAuth, type McpPrincipal } from "./oauth.js";
 import { McpCapabilityError, company, task, requestId, pick, object, stable, type ApiDispatch, type Capability } from "./contracts.js";
@@ -120,29 +121,44 @@ export function createPublicMcpTransfers(db: Db, oauth: PublicMcpOAuth, api: Api
     const bytes = req.body;
     if (!Buffer.isBuffer(bytes)) throw unavailable();
     const digest = createHash("sha256").update(bytes).digest("hex");
-    const attachment = await db.transaction(async tx => {
+    const published = await db.transaction(async tx => {
       const [upload] = await tx.select().from(mcpAttachmentUploads).where(eq(mcpAttachmentUploads.id, row.uploadId!)).for("update");
       if (!upload || upload.companyId !== principal.grant.companyId || upload.userId !== principal.grant.userId || upload.workSessionId !== row.workSessionId || upload.grantId && upload.grantId !== row.grantId || upload.storageProvider !== storage.provider) throw unavailable();
       if (upload.sha256 !== digest || upload.byteSize !== bytes.length || req.get("Content-Type")?.split(";")[0]?.trim().toLowerCase() !== upload.contentType) throw new McpCapabilityError("Upload bytes, size or Content-Type do not match the requested file.");
-      await taskAccess(principal, upload.taskId, true, tx as unknown as Db, row.workSessionId ?? undefined);
-      if (upload.attachmentId) return attachmentAccess(principal, upload.attachmentId, tx as unknown as Db, row.workSessionId ?? undefined);
-      const stored = await storage.putFile({ companyId: upload.companyId, namespace: "mcp-transfers", objectKey: upload.objectKey, originalFilename: upload.originalFilename, contentType: upload.contentType, body: bytes });
+      // Check access before storage without retaining an agent assignment
+      // lock. Publication locks grant then assignment, matching disconnect;
+      // remote storage must not block revocation. Keep person write checks.
+      await taskAccess(principal, upload.taskId, principal.grant.purpose !== "agent", tx as unknown as Db, row.workSessionId ?? undefined);
+      const stored = upload.attachmentId ? null : await storage.putFile({ companyId: upload.companyId, namespace: "mcp-transfers", objectKey: upload.objectKey, originalFilename: upload.originalFilename, contentType: upload.contentType, body: bytes });
       // Recheck after receiving/storing bytes. Lock the grant against concurrent revocation.
       const [grant] = await tx.select().from(mcpOauthGrants).where(eq(mcpOauthGrants.id, row.grantId)).for("update");
       if (!grant || grant.revokedAt || row.expiresAt <= new Date()) throw unavailable();
       const current = await oauth.authorizeGrant(row.grantId, tx as unknown as Db);
       if (current.grant.purpose !== "agent") requireWrite(current);
       await taskAccess(current, upload.taskId, true, tx as unknown as Db, row.workSessionId ?? undefined);
+      const session = await workSession(current, row.workSessionId ?? undefined, upload.taskId, true, tx as unknown as Db);
+      // Match native mutations: lock the task before the run, then recheck
+      // assignment and governance against the locked current task.
       const [issue] = await tx.select().from(issues).where(and(eq(issues.id, upload.taskId), eq(issues.companyId, upload.companyId))).for("update");
       if (!issue || (current.grant.purpose !== "agent" && issue.conversationAgentId && issue.conversationUserId !== current.grant.userId)) throw unavailable();
-      const session = await workSession(current, row.workSessionId ?? undefined, upload.taskId, true, tx as unknown as Db);
-      const result = await issueService(tx as unknown as Db).createAttachment({ issueId: upload.taskId, ...stored, createdByUserId: session ? null : current.grant.userId, createdByAgentId: session?.agentId, createdByRunId: session?.runId });
+      await workSession(current, row.workSessionId ?? undefined, upload.taskId, true, tx as unknown as Db);
+      const publish = session ? await prepareExternalDeliverablePublication(tx as unknown as Db, {
+        companyId: upload.companyId, issueId: upload.taskId, ...session, uploadId: upload.id,
+        workSessionId: row.workSessionId!, filename: upload.originalFilename, byteSize: bytes.length, sha256: digest,
+      }) : undefined;
+      const result = upload.attachmentId
+        ? await attachmentAccess(current, upload.attachmentId, tx as unknown as Db, row.workSessionId ?? undefined)
+        : await issueService(tx as unknown as Db).createAttachment({ issueId: upload.taskId, ...stored!, createdByUserId: session ? null : current.grant.userId, createdByAgentId: session?.agentId, createdByRunId: session?.runId });
+      if (result.originalFilename !== upload.originalFilename || result.byteSize !== bytes.length || result.sha256 !== digest
+        || session && (result.originatingRunId !== session.runId || result.createdByAgentId !== session.agentId)) throw unavailable();
+      const publication = publish ? await publish(result.id) : undefined;
+      if (upload.attachmentId) return { attachment: result, publication };
       await tx.update(mcpAttachmentUploads).set({ attachmentId: result.id }).where(eq(mcpAttachmentUploads.id, upload.id));
       await logActivity(tx as unknown as Db, { companyId: upload.companyId, actorType: session ? "agent" : "user", actorId: session?.agentId ?? current.grant.userId, action: "issue.attachment_added", entityType: "issue", entityId: upload.taskId,
         details: { attachmentId: result.id, originalFilename: result.originalFilename, contentType: result.contentType, byteSize: result.byteSize, mcpConnectionId: row.grantId, ...(session ? { workSessionId: row.workSessionId, authorizingPersonId: current.grant.userId } : {}) } });
-      return result;
+      return { attachment: result, publication };
     });
-    res.json({ attachment: pick(attachment, attachmentFields) });
+    res.json({ attachment: pick(published.attachment, attachmentFields), ...(published.publication ? { publication: published.publication } : {}) });
   });
   router.get(prefix + "/download", async (req, res) => {
     const { row, principal } = await authorize(req.query.ticket, false);
@@ -181,9 +197,20 @@ export function createPublicMcpTransfers(db: Db, oauth: PublicMcpOAuth, api: Api
         await tx.update(mcpAttachmentUploads).set({ expiresAt: new Date(Date.now() + lifetime), cleanedAt: null }).where(eq(mcpAttachmentUploads.id, found.id));
         return found;
       });
-      if (upload.attachmentId) return { attachment: pick(await attachmentAccess(p, upload.attachmentId, undefined, sessionId), attachmentFields), status: "completed" };
+      if (upload.attachmentId) {
+        const attachment = await attachmentAccess(p, upload.attachmentId, undefined, sessionId);
+        const session = await workSession(p, sessionId, upload.taskId, true);
+        const publication = session ? await readExternalDeliverablePublication(db, {
+          companyId: upload.companyId, issueId: upload.taskId, ...session,
+          uploadId: upload.id, workSessionId: sessionId!, attachmentId: attachment.id,
+        }) : undefined;
+        if (!session || publication) return { attachment: pick(attachment, attachmentFields), status: "completed",
+          ...(publication ? { publication } : {}) };
+        // An older upload can lack publication proof. Verify the same bytes
+        // through another bounded PUT; never manufacture a receipt from metadata.
+      }
       return { ...await ticket(p, { uploadId: upload.id }, sessionId), method: "PUT", headers: { "Content-Type": a.contentType }, uploadId: upload.id, maxBytes: MAX_ATTACHMENT_BYTES,
-        instructions: "Send the exact file bytes with the given Content-Type. Success saves the attachment and returns its ID; there is no completion tool. Do not share this temporary file credential. Reuse requestId after a lost response." };
+        instructions: "Send the exact file bytes with the given Content-Type. Success saves the attachment and returns its ID. An agent upload also returns a verified publication receipt; cite its evidenceRef in your completion report. There is no separate upload completion tool. Do not share this temporary file credential. Reuse requestId after a lost response." };
     },
     async getDownloadUrl(p: McpPrincipal, attachmentId: string, sessionId?: string) {
       const attachment = await attachmentAccess(p, attachmentId, undefined, sessionId);

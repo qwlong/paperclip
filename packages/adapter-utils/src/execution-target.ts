@@ -1439,6 +1439,7 @@ export async function prepareAdapterExecutionTargetRuntime(input: {
   runtimeRootDir?: string;
   syncWorkspace?: boolean;
   workspaceInboundMode?: WorkspaceInboundMode;
+  workspaceSnapshotIsolation?: "worker";
   workspaceDurableSeed?: WorkspaceDurableSeedPaths;
   workspaceCheckpoint?: boolean;
   onWorkspaceCheckpoint?: (metrics: WorkspaceCheckpointMetrics) => Promise<void>;
@@ -1533,6 +1534,7 @@ export async function prepareAdapterExecutionTargetRuntime(input: {
     runtimeRootDir: input.runtimeRootDir,
     syncWorkspace: input.syncWorkspace,
     workspaceInboundMode: input.workspaceInboundMode,
+    workspaceSnapshotIsolation: input.workspaceSnapshotIsolation,
     workspaceDurableSeed: input.workspaceDurableSeed,
     workspaceCheckpoint: input.workspaceCheckpoint,
     onWorkspaceCheckpoint: input.onWorkspaceCheckpoint,

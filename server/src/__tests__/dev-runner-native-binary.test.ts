@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { paperclipRunnerSupportsPlatform } from "@paperclipai/shared";
 
 import {
   paperclipRunnerBinaryNeedsBuild,
@@ -61,6 +62,13 @@ function nativeHeader(platform: string, architecture: string): Buffer {
 }
 
 describe("paperclip runner native dev prerequisite", () => {
+  it.each(["x64", "arm64"].flatMap(architecture => [[undefined, false], ["2.38", false], ["2.39", true], ["3.0", true]].map(([glibcVersionRuntime, native]) => ({ architecture, glibcVersionRuntime, native }))))("uses the measured libc prerequisite on Linux $architecture/$glibcVersionRuntime when no native run or flag requires it", ({ architecture, glibcVersionRuntime, native }) => {
+    Object.defineProperty(process, "platform", { ...initialPlatform, value: "linux" });
+    Object.defineProperty(process, "arch", { ...initialArchitecture, value: architecture });
+    const nativeRunnerRequired = paperclipRunnerSupportsPlatform("codex_local", "linux", architecture, glibcVersionRuntime ? "glibc" : "unknown", glibcVersionRuntime as string | undefined);
+    expect(nativeRunnerRequired).toBe(native);
+    expect(paperclipRunnerBinaryNeedsBuild({ repoRoot: "/checkout/without/a/staged/binary", nativeRunnerRequired })).toBe(native);
+  });
   it("uses an explicit status response and fails safe when status is unknown", () => {
     expect(
       resolveNativeRunnerRequirement({

@@ -12,7 +12,7 @@ Agent access: [companion](../agent-access-map/agents.md).
 
 ## Sub-features
 
-- `hire`: choose identity, adapter, model, and required account settings; edit
+- `hire`: choose identity, harness, model, and required account settings; edit
   reporting relationships through the agent configuration afterward.
 - `grok-bot`: experimental existing-Bot agent setup through remote OAuth, routine credentials, and an authenticated two-way challenge; current contact, stop and explicit recovery.
 - `instructions`: edit agent configuration and instruction files with durable revisions.
@@ -50,6 +50,25 @@ Automated: [new agent page](../../ui/src/pages/NewAgent.test.tsx) and [configura
 
 Manual: Hire an agent with a distinct name and role. Complete any required approval, reload the roster, and open its configuration. Confirm manager, adapter, and model persisted; run a small task to prove execution readiness.
 
+For a new Codex hire, choose the Codex harness. Automatic selection uses Paperclip
+Runner on a qualified selected target; Advanced offers an explicit Legacy runner
+override. Other harness defaults are unchanged. Record the persisted runner and
+underlying harness, rather than treating the displayed Codex name as execution
+proof. See [runtime selection and validation](./runs-adapters.md#adapter-setup)
+and [target qualification](./execution-environments.md#environment-settings).
+
+Repeat with an explicit Legacy Codex hire. If approval is required, compare its
+reviewed execution configuration before and after restart and activation; approval
+must retain the reviewed runner. Test an existing Legacy and native agent through
+an unrelated edit, reload and restart: neither is automatically upgraded.
+
+Creation defaults also apply to API/CLI hires, built-ins, plugins and new team
+imports. Exports preserve resolved execution choices; a package without a runner
+choice uses the new-agent default, while updating an existing same-harness agent
+preserves its execution. For a native Codex import, edit a model or account binding
+and verify unchanged runtime settings survive; an explicit clear must stay cleared.
+Use the [portability recipe](./companies.md) for package preparation and boundaries.
+
 The current hiring wizard assigns the first hire CEO and subsequent hires
 General reporting to the CEO. Change manager/role afterward through supported
 configuration. Process/HTTP agents can be created through API/CLI but are excluded
@@ -60,6 +79,18 @@ from the hiring picker; API fixture creation does not prove this UI journey.
 Automated: [instruction service](../../server/src/__tests__/agent-instructions-service.test.ts) and [instruction revisions](../../server/src/__tests__/agent-instruction-revisions.test.ts) cover file/revision contracts.
 
 Manual: Save a harmless instruction edit, reload, and verify its revision and effect in the next eligible run. Pause and resume the disposable agent; confirm pause prevents new work and does not erase previous runs.
+
+For failed setup, use an unavailable model or invalid command on a disposable agent.
+Confirm the profile names the failed verification step and gives a relevant action.
+Check that it explains automatic retry and offers **Retry now**. Fix the configuration,
+retry, and reload; the failure must disappear only after readiness commits.
+Provider output and credentials must not appear in the lifecycle message.
+
+An explicit runner change is a configuration change, with normal revisions and
+session invalidation. Incompatible settings must produce a field-specific error;
+selecting another runner must not silently discard them or change an active run's
+recorded execution. Keep runner choice in Advanced and verify the next eligible
+run separately from historical transcripts.
 
 ### `organization`
 

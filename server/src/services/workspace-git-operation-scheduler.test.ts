@@ -241,27 +241,35 @@ describe("WorkspaceGitOperationScheduler", () => {
     expect(scheduler.snapshot().inFlightCount).toBe(0);
   });
 
-  it("runs a bypassed read separately instead of joining an in-flight scan", async () => {
+  it("starts a fresh scan after a file changes while an older scan is still running", async () => {
     const workspace = await makeWorkspace();
-    const gate = deferred<void>();
+    const firstCaptured = deferred();
+    const releaseFirst = deferred();
     let calls = 0;
     const runner: WorkspaceGitRunner = async () => {
       calls += 1;
-      await gate.promise;
-      return { stdout: "fresh", stderr: "" };
+      const files = await fs.readdir(workspace);
+      if (calls === 1) {
+        firstCaptured.resolve();
+        await releaseFirst.promise;
+      }
+      return { stdout: files.join("\n"), stderr: "" };
     };
-    const scheduler = createWorkspaceGitOperationScheduler({ runner, defaultCacheTtlMs: 0 });
+    const scheduler = createWorkspaceGitOperationScheduler({ runner, concurrency: 2 });
+    const input = scanInput(workspace, "freshness");
 
-    const inFlight = scheduler.run(scanInput(workspace, "same"));
-    await vi.waitFor(() => expect(scheduler.snapshot().inFlightCount).toBe(1));
-    const bypass = scheduler.run({ ...scanInput(workspace, "same"), bypassSingleFlight: true });
-    await vi.waitFor(() => expect(calls).toBe(2));
-    expect(scheduler.snapshot().totals.singleFlightJoins).toBe(0);
+    const earlier = scheduler.run(input);
+    await firstCaptured.promise;
+    await fs.writeFile(path.join(workspace, "unsaved.txt"), "keep this work\n");
+    const fresh = await scheduler.run({ ...input, bypassSingleFlight: true });
+    releaseFirst.resolve();
 
-    gate.resolve();
-    const results = await Promise.all([inFlight, bypass]);
-    expect(results.map((result) => result.singleFlightJoined)).toEqual([false, false]);
-    expect(scheduler.snapshot().inFlightCount).toBe(0);
+    expect((await earlier).stdout).toBe("");
+    expect(fresh).toMatchObject({ stdout: "unsaved.txt", cacheHit: false, singleFlightJoined: false });
+    expect(scheduler.snapshot()).toMatchObject({
+      cacheEntryCount: 0,
+      totals: { started: 2, singleFlightJoins: 0 },
+    });
   });
 
   it("serves cached results until TTL expiry and evicts least-recently-used entries", async () => {

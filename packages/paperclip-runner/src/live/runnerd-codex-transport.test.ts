@@ -1405,6 +1405,61 @@ it("reserves a bounded suspension window after close preparation", () => {
 });
 
 it.each([
+  { existingCommand: false, rejectLateRead: false },
+  { existingCommand: false, rejectLateRead: true },
+  { existingCommand: true, rejectLateRead: false },
+  { existingCommand: true, rejectLateRead: true },
+])("returns unconfirmed suspension at its deadline while a remote state read is still pending ($existingCommand, $rejectLateRead)", async ({ existingCommand, rejectLateRead }) => {
+  vi.useFakeTimers();
+  const commands: { commandId: string; type: string; status: string }[] = existingCommand
+    ? [{ commandId: "exact-suspend", type: "runner.suspend", status: "completed" }]
+    : [];
+  const readRunnerState = vi.fn(async () => {
+    await new Promise<void>(resolveRead => setTimeout(resolveRead, 10_000));
+    if (rejectLateRead) throw new Error("remote state unavailable after its own timeout");
+    return { lifecycle: "suspended" };
+  });
+  const unhandled = vi.fn();
+  process.on("unhandledRejection", unhandled);
+  const queueSuspend = vi.fn((commandId: string) => commands.push({ commandId, type: "runner.suspend", status: "completed" }));
+  const release = vi.fn();
+  let settled = false;
+  let suspended: boolean | undefined;
+  const result = runnerdRecoveryInternals.awaitRunnerSuspensionBarrier({
+    commands: () => commands,
+    queueSuspend,
+    readRunnerState,
+    runnerHasExited: async () => true,
+    pump: () => undefined,
+    deadline: Date.now() + 2_500,
+    pollIntervalMs: 0,
+  }).then(value => {
+    settled = true;
+    suspended = value;
+    if (value) release();
+    return value;
+  });
+  try {
+    await vi.advanceTimersByTimeAsync(2_500);
+    expect(readRunnerState).toHaveBeenCalledOnce();
+    expect(settled).toBe(true);
+    expect(suspended).toBe(false);
+    expect(queueSuspend).toHaveBeenCalledTimes(existingCommand ? 0 : 1);
+    expect(release).not.toHaveBeenCalled();
+  } finally {
+    try {
+      await vi.advanceTimersByTimeAsync(10_000);
+      await expect(result).resolves.toBe(false);
+      expect(release).not.toHaveBeenCalled();
+      expect(unhandled).not.toHaveBeenCalled();
+    } finally {
+      process.off("unhandledRejection", unhandled);
+      vi.useRealTimers();
+    }
+  }
+});
+
+it.each([
   { provider: "acpx" as const, acpxAgent: "pi" as const, closeGraceMs: undefined, drained: true },
   { provider: "codex" as const, acpxAgent: undefined, closeGraceMs: undefined, drained: false },
   { provider: "acpx" as const, acpxAgent: "pi" as const, closeGraceMs: 400, drained: false },
@@ -2140,6 +2195,7 @@ it("denies the isolated Codex home without denying a remote execution workspace"
     readOnlyRoots: ["/usr/local"],
   });
   const serialized = args.join("\n");
+  expect(args).not.toContain("project_doc_max_bytes=0");
 
   expect(serialized).toContain(
     '"/workspaces/task/.paperclip-runtime/paperclip-runner/sessions/session/filesystem/codex-home"="none"',
@@ -2830,12 +2886,14 @@ const fakeCodex = resolve(
   "../../runner/target/debug/fake-codex-app-server",
 );
 
-it.each(["stuck", "late-release", "late-release-error", "stuck-release", "cooperative-release", "launch-failure"] as const)(
+it.each(["stuck", "late-release", "late-release-error", "stuck-release", "cooperative-release", "launch-failure", "launch-failure-sandbox", "launch-failure-unsandboxed"] as const)(
   "bounds setup registration teardown and retains unconfirmed state (%s)",
   async mode => {
     const root = await mkdtemp(join(tmpdir(), "runnerd-setup-registration-"));
     const runtimeDirectory = join(root, "native-state");
     await mkdir(runtimeDirectory, { mode: 0o700 });
+    const launchFailure = mode.startsWith("launch-failure");
+    let template: Record<string, unknown> | null = null;
     let registrationStarted!: () => void;
     const started = new Promise<void>(resolve => { registrationStarted = resolve; });
     let returnRegistration!: (registration: { connection: { mode: "listen"; listenAddress: string; listenPort: number; listenPath: string }; release: () => Promise<void> }) => void;
@@ -2853,17 +2911,22 @@ it.each(["stuck", "late-release", "late-release-error", "stuck-release", "cooper
     };
     let registrationSignal: AbortSignal | undefined;
     const cleanup = vi.fn(async () => { await rm(runtimeDirectory, { recursive: true, force: true }); });
-    const launch = vi.fn(() => { throw new Error("owned launcher failed before execution"); });
+    const launch = vi.fn((spec: durableControlPlane.RunnerProcessLaunchSpec) => {
+      expect(spec.environment.PAPERCLIP_RUNNER_EXTERNAL_SANDBOX).toBeUndefined();
+      throw new Error("owned launcher failed before execution");
+    });
     let settled = false;
     vi.useFakeTimers();
     const result = probeNativeRunnerEnvironment({
       runtimeDirectory, provider: "codex", model: "gpt-test", timeoutMs: 1_000,
-      environment: { PATH: "", OPENAI_API_KEY: "inert-test-key" },
+      environment: { PATH: "", OPENAI_API_KEY: "inert-test-key", PAPERCLIP_RUNNER_EXTERNAL_SANDBOX: "true" },
       transportOptions: {
+        ...(mode === "launch-failure-sandbox" ? { externallySandboxed: true } : mode === "launch-failure-unsandboxed" ? { externallySandboxed: false } : {}),
         runnerBinary: resolve(import.meta.dirname, "../../package.json"),
         codexCommand: resolve(import.meta.dirname, "../../package.json"),
         sourceCodexHome: "", runnerProcessLauncher: launch,
         controlPlaneRegistration: async (_authority, _identity, signal) => {
+          template = structuredClone(_authority.store.state.runAttachTemplate!);
           registrationSignal = signal;
           if (mode === "cooperative-release") signal?.addEventListener("abort", () => returnRegistration(registered), { once: true });
           registrationStarted();
@@ -2874,16 +2937,23 @@ it.each(["stuck", "late-release", "late-release-error", "stuck-release", "cooper
     }).then(value => { settled = true; return value; }, (error: unknown) => { settled = true; return error; });
     try {
       await started;
-      if (mode === "launch-failure") returnRegistration(registered);
+      if (launchFailure) returnRegistration(registered);
       await vi.advanceTimersByTimeAsync(1_000);
       if (mode === "late-release" || mode === "late-release-error" || mode === "stuck-release") returnRegistration(registered);
       await vi.advanceTimersByTimeAsync(10_000);
-      if (mode === "late-release" || mode === "cooperative-release" || mode === "launch-failure") await result;
+      if (mode === "late-release" || mode === "cooperative-release" || launchFailure) await result;
       expect(settled).toBe(true);
       expect(registrationSignal?.aborted).toBe(true);
       const failure = await result;
+      expect(template).toMatchObject({ provider: { externallySandboxed: mode === "launch-failure-sandbox", readOnly: true, approvalPolicy: "never", collaborationMode: "plan" } });
+      const args = (template!.provider as Record<string, unknown>).args as string[];
+      expect(args).toContain("project_doc_max_bytes=0");
+      expect(args[args.indexOf("project_doc_max_bytes=0") - 1]).toBe("-c");
+      expect(args.indexOf("project_doc_max_bytes=0")).toBeLessThan(args.indexOf("app-server"));
+      expect(args).not.toContain("--dangerously-bypass-approvals-and-sandbox");
+      expect(args).toContain('permissions.paperclip-runner-workspace-read-only.network.enabled=false');
       expect(failure).toBeInstanceOf(Error);
-      expect((failure as Error).message).toContain(mode === "launch-failure" ? "owned launcher failed before execution" : "Native provider hello probe timed out.");
+      expect((failure as Error).message).toContain(launchFailure ? "owned launcher failed before execution" : "Native provider hello probe timed out.");
       if (mode === "stuck" || mode === "stuck-release" || mode === "late-release-error") {
         expect(failure).toBeInstanceOf(AggregateError);
         expect((failure as AggregateError).cause).toMatchObject({ message: "Native provider hello probe timed out." });
@@ -2900,7 +2970,7 @@ it.each(["stuck", "late-release", "late-release-error", "stuck-release", "cooper
         expect(cleanup).toHaveBeenCalledOnce();
         await expect(stat(runtimeDirectory)).rejects.toThrow();
       }
-      expect(launch).toHaveBeenCalledTimes(mode === "launch-failure" ? 1 : 0);
+      expect(launch).toHaveBeenCalledTimes(launchFailure ? 1 : 0);
       expect(vi.getTimerCount()).toBe(0);
     } finally {
       returnRegistration(registered);

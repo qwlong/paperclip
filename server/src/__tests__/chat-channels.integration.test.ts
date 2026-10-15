@@ -15,7 +15,7 @@ import { fastResponseService } from "../services/fast-responses.js";
 import { fastResponseReceipt } from "../services/fast-response-provider.js";
 import { fastResponseRequests } from "@paperclipai/db";
 import { toolAccessService } from "../services/tool-access.js";
-import { toolActionRequests, toolInvocations } from "@paperclipai/db";
+import { toolActionRequests, toolInvocations, toolPolicies } from "@paperclipai/db";
 import { GitHubPublicationLeaseLost, withGitHubPublicationLease } from "../services/chat-github-publication-lease.js";
 import { secretService } from "../services/secrets.js";
 import { githubChatWizardService } from "../services/chat-github-wizard.js";
@@ -2536,8 +2536,14 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(f.wakeup).toHaveBeenCalledTimes(wakeCount);
       expect(await readIssueCommentsByIssueId(f.conversation.issueId!)).toHaveLength(1);
     });
-    async function toolReplyFixture(threadId = "github:paperclipai/paperclip:issue:418") {
+    async function toolReplyFixture(threadId = "github:paperclipai/paperclip:issue:418", reportOnly = false) {
       const f = await reviewBotFixture();
+      if (reportOnly) {
+        const config = await f.management.configuration(f.endpoint.id, "owner-user");
+        await f.management.saveConfiguration(f.endpoint.id, { expectedRevision: config.revision,
+          configuration: { ...config.configuration, defaults: { ...config.configuration.defaults, ratingThreshold: null } },
+        }, "owner-user");
+      }
       const thread = makeThread({ channelId: "paperclipai/paperclip", id: threadId }).thread;
       await deliverMessage({ callbacks: f.callbacks, endpointId: f.endpoint.id, provider: "github", thread,
         trigger: "mention", message: makeMessage({ id: "41801", text: "Are you there?", userId: "42", userName: "octocat", mentioned: true }) });
@@ -2549,6 +2555,302 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       const session = { companyId: f.companyId, agentId: f.assignedAgentId, issueId: conversation.issueId, runId: run.id };
       return { ...f, conversation, run, session };
     }
+    async function publicationRetryFixture() {
+      const f = await toolReplyFixture("github:paperclipai/paperclip:418", true);
+      const head = "b".repeat(40);
+      const inline: Array<{ id: number; body: string; html_url: string; user: { login: string } }> = [];
+      const checks: Array<{ id: number; external_id: string; app: { id: number }; html_url: string }> = [];
+      const writes: Array<{ path: string; method: string }> = [];
+      const provider = async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/pulls/418")) return Response.json({ number: 418, state: "open", draft: false,
+          head: { sha: head }, base: { sha: "a".repeat(40), ref: "master" }, user: { id: 42, login: "octocat", type: "User" }, labels: [] });
+        if (url.includes("/files?")) return Response.json([{ filename: "src/math.ts", status: "modified", patch: "@@ -1 +1 @@\n-old\n+new" }]);
+        if (url.includes("/pulls/418/comments?")) return Response.json(inline);
+        if (url.includes("/check-runs?")) return Response.json({ check_runs: checks });
+        if (init?.method === "POST" && url.endsWith("/pulls/418/comments")) {
+          writes.push({ path: url, method: init.method });
+          const item = { id: 420 + inline.length, body: JSON.parse(String(init.body)).body,
+            html_url: "https://github.com/acme/repo/pull/418#discussion_r420", user: { login: f.endpoint.botUsername! } };
+          inline.push(item);
+          return Response.json(item);
+        }
+        if (url.includes("/check-runs") && init?.method) {
+          writes.push({ path: url, method: init.method });
+          const body = JSON.parse(String(init.body));
+          const check = checks[0] ?? { id: 419, external_id: body.external_id, app: { id: Number(f.endpoint.botExternalId) }, html_url: "https://github.com/checks/419" };
+          if (!checks.length) checks.push(check);
+          return Response.json(check);
+        }
+        return undefined;
+      };
+      f.setSupplementalProviderFetch(provider);
+      const service = githubChatReviewService(db, f.providerFetch);
+      await service.execute(f.session, "begin_review", { reviewedCommit: head });
+      const assessment = { reviewedCommit: head, score: 3, complete: true, summary: "Advisory review", rationale: "Reviewed the file",
+        coverage: { reviewedPaths: ["src/math.ts"], omittedPaths: [], limitations: [] }, findings: [] };
+      const action = async () => (await db.select().from(chatActions).where(and(
+        eq(chatActions.endpointId, f.endpoint.id), eq(chatActions.kind, "github_review_publication"),
+      )))[0];
+      return { ...f, service, head, assessment, provider, action, inline, checks, writes };
+    }
+    it.each([false, true])("recovers an approved queued GitHub review without another approval (revoked: %s)", async revoked => {
+      const f = await publicationRetryFixture();
+      let unavailable = true;
+      let attempts = 0;
+      f.setSupplementalProviderFetch(async (input, init) => {
+        if (String(input).includes("/issues/comments/") && init?.method === "PATCH") {
+          attempts++;
+          if (unavailable) return new Response("Unavailable", { status: 503, headers: { "retry-after": "120" } });
+        }
+        return f.provider(input, init);
+      });
+      vi.stubGlobal("fetch", f.providerFetch);
+      onTestFinished(() => { vi.unstubAllGlobals(); });
+      await initializeRunIdentity(db, { companyId: f.companyId, runId: f.run.id, issueId: f.conversation.issueId!,
+        responsibleUserId: null, cause: "company_default" });
+      const { createToolGatewayService } = await import("../services/tool-gateway.js");
+      const gateway = createToolGatewayService(db, { toolActionSigningSecret: "github-approval-retry-test-secret" });
+      const session = await gateway.createSession({ companyId: f.companyId, agentId: f.assignedAgentId, runId: f.run.id });
+      const tool = (await githubBotToolsForSession(db, f.session)).find(tool => tool.upstreamToolName === "submit_review")!;
+      await db.insert(toolPolicies).values({ companyId: f.companyId, name: "Review publication approval", policyType: "require_approval",
+        priority: 0, selectors: { catalogEntryId: tool.catalogEntryId! } });
+      await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: f.assessment }))
+        .rejects.toMatchObject({ reasonCode: "approval_required" });
+      const [approval] = await db.select().from(toolActionRequests).where(eq(toolActionRequests.companyId, f.companyId));
+      expect(await gateway.approveActionRequest({ companyId: f.companyId, actionRequestId: approval.id, actor: { userId: "owner-user" } }))
+        .toMatchObject({ status: "executed" });
+      const action = await f.action();
+      expect(action).toMatchObject({ status: "failed", result: { retryable: true } });
+      unavailable = false;
+      if (revoked) await db.insert(toolPolicies).values({ companyId: f.companyId, name: "Revoke approved publication", policyType: "block",
+        priority: -1, selectors: { catalogEntryId: tool.catalogEntryId! } });
+      await db.update(chatActions).set({ result: { ...action.result, retryAt: new Date(0).toISOString() } }).where(eq(chatActions.id, action.id));
+      await f.service.processPending();
+      expect((await f.action()).status).toBe(revoked ? "cancelled" : "processed");
+      if (revoked) await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: f.assessment })).rejects.toThrow();
+      else expect(await gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: f.assessment }))
+        .toMatchObject({ status: "replayed", result: { data: { status: "processed", score: 3 } } });
+      expect(attempts).toBe(revoked ? 1 : 2);
+      expect(await db.select().from(toolActionRequests).where(eq(toolActionRequests.companyId, f.companyId))).toHaveLength(1);
+    }, 25_000);
+    it("recovers lost inline and check responses without duplicate GitHub publications", async () => {
+      const f = await publicationRetryFixture();
+      const lost = new Set<string>();
+      f.setSupplementalProviderFetch(async (input, init) => {
+        const response = await f.provider(input, init);
+        if (init?.method === "POST" && /\/(?:comments|check-runs)$/.test(String(input)) && !lost.has(String(input))) {
+          lost.add(String(input));
+          throw new Error("Provider accepted the write but the response was lost");
+        }
+        return response;
+      });
+      const result = await f.service.execute(f.session, "submit_review", { ...f.assessment,
+        findings: [{ key: "note", path: "src/math.ts", line: 1, side: "RIGHT", severity: "error", category: "correctness", body: "Example finding" }],
+      }, "lost-receipts");
+      expect(result).toMatchObject({ status: "processed", score: 3, conclusion: "neutral" });
+      expect(f.inline).toHaveLength(1);
+      expect(f.checks).toHaveLength(1);
+      expect(f.writes.filter(write => write.method === "POST")).toHaveLength(2);
+      expect(f.responseComments.size).toBe(1);
+      expect((await f.action()).status).toBe("processed");
+    }, 25_000);
+    it("resumes a delayed GitHub publication after coordinator restart without another inbound event", async () => {
+      const f = await publicationRetryFixture();
+      let unavailable = true;
+      let attempts = 0;
+      f.setSupplementalProviderFetch(async (input, init) => {
+        if (String(input).includes("/issues/comments/") && init?.method === "PATCH") {
+          attempts++;
+          if (unavailable) return new Response("Unavailable", { status: 503, headers: { "retry-after": "120" } });
+        }
+        return f.provider(input, init);
+      });
+      const result = await f.service.execute(f.session, "submit_review", f.assessment, "scheduled-review");
+      expect(result).toMatchObject({ status: "failed", receipt: { retryable: true, attempts: 1 } });
+      const action = await f.action();
+      expect(await f.service.nextPendingAt()).toBe(Date.parse(String(action.result?.retryAt)));
+      expect(await f.service.processPending()).toBe(0);
+      const due = new Date(Date.now() + 1500);
+      await db.update(chatActions).set({ result: { ...action.result, retryAt: due.toISOString() } }).where(eq(chatActions.id, action.id));
+      unavailable = false;
+      const { createDeliveryWorkCoordinator } = await import("../services/delivery-work-coordinator.js");
+      const { registerChatQueueWork } = await import("../services/chat-delivery-work.js");
+      const { DELIVERY_QUEUES } = await import("../services/delivery-work-notifications.js");
+      const restarted = githubChatReviewService(db, f.providerFetch);
+      const errors = vi.fn();
+      const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: errors });
+      try {
+        await registerChatQueueWork(coordinator, { queue: DELIVERY_QUEUES.chatGitHubPublications,
+          run: restarted.processPending, next: restarted.nextPendingAt }, () => true).ready;
+        expect(coordinator.nextWakeAt()).toBe(due.getTime());
+        expect(attempts).toBe(1);
+        await expect.poll(async () => (await f.action()).status, { timeout: 10_000 }).toBe("processed");
+        expect(attempts).toBe(2);
+        expect(errors).not.toHaveBeenCalled();
+        expect(await restarted.nextPendingAt()).toBeNull();
+        expect(f.responseComments.size).toBe(1);
+      } finally {
+        await coordinator.stop();
+      }
+    }, 25_000);
+    it.each([403, 422])("does not resubmit a permanent GitHub publication rejection (HTTP %s)", async status => {
+      const f = await publicationRetryFixture();
+      let attempts = 0;
+      f.setSupplementalProviderFetch(async (input, init) => {
+        if (String(input).includes("/issues/comments/") && init?.method === "PATCH") {
+          attempts++;
+          return new Response("Rejected", { status });
+        }
+        return f.provider(input, init);
+      });
+      const result = await f.service.execute(f.session, "submit_review", f.assessment, "permanent-failure");
+      expect(result).toMatchObject({ status: "failed", receipt: { retryable: false, attempts: 1, providerStatus: status } });
+      await f.service.execute(f.session, "submit_review", f.assessment, "permanent-failure");
+      expect(await f.service.processPending()).toBe(0);
+      expect(await f.service.nextPendingAt()).toBeNull();
+      expect(attempts).toBe(1);
+    });
+    it.each(["revoked", "exhausted"] as const)("stops a queued GitHub publication after %s", async mode => {
+      const f = await publicationRetryFixture();
+      let attempts = 0;
+      f.setSupplementalProviderFetch(async (input, init) => {
+        if (String(input).includes("/issues/comments/") && init?.method === "PATCH") {
+          attempts++;
+          return new Response("Unavailable", { status: 503, headers: { "retry-after": "120" } });
+        }
+        return f.provider(input, init);
+      });
+      await f.service.execute(f.session, "submit_review", f.assessment, "bounded-retry");
+      const action = await f.action();
+      await db.update(chatActions).set({ result: { ...action.result, retryAt: new Date(0).toISOString() } }).where(eq(chatActions.id, action.id));
+      if (mode === "revoked") await db.update(chatIdentityLinks).set({ status: "revoked" }).where(eq(chatIdentityLinks.endpointId, f.endpoint.id));
+      for (let attempt = 1; attempt < (mode === "exhausted" ? 8 : 2); attempt++) {
+        const current = await f.action();
+        await db.update(chatActions).set({ result: { ...current.result, retryAt: new Date(0).toISOString() } }).where(eq(chatActions.id, current.id));
+        await f.service.processPending();
+      }
+      await f.service.processPending();
+      expect((await f.action()).result?.retryable).toBe(false);
+      expect((await f.action()).status).toBe(mode === "revoked" ? "cancelled" : "failed");
+      expect(await f.service.nextPendingAt()).toBeNull();
+      expect(attempts).toBe(mode === "exhausted" ? 8 : 1);
+    });
+    it.each([503, 429])("automatically retries a transient GitHub review publication (HTTP %s)", async providerStatus => {
+      const f = await toolReplyFixture("github:paperclipai/paperclip:418", true);
+      const head = "b".repeat(40);
+      let summaryAttempts = 0;
+      const checks: Record<string, unknown>[] = [];
+      f.setSupplementalProviderFetch(async (input, init) => {
+        const url = String(input);
+        if (url.endsWith("/pulls/418")) return Response.json({ number: 418, state: "open", draft: false,
+          head: { sha: head }, base: { sha: "a".repeat(40), ref: "master" }, user: { id: 42, login: "octocat", type: "User" }, labels: [] });
+        if (url.includes("/files?")) return Response.json([{ filename: "src/math.ts", status: "modified", patch: "@@ -1 +1 @@\n-old\n+new" }]);
+        if (url.includes("/check-runs?")) return Response.json({ check_runs: [] });
+        if (url.includes("/check-runs") && init?.method) {
+          checks.push(JSON.parse(String(init.body)));
+          return Response.json({ id: 419, html_url: "https://github.com/checks/419" });
+        }
+        if (url.includes("/issues/comments/") && init?.method === "PATCH" && ++summaryAttempts === 1)
+          return new Response("Temporary provider failure", { status: providerStatus, headers: { "retry-after": "1" } });
+        return undefined;
+      });
+      vi.stubGlobal("fetch", f.providerFetch);
+      onTestFinished(() => { vi.unstubAllGlobals(); });
+      const { createToolGatewayService } = await import("../services/tool-gateway.js");
+      const gateway = createToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: f.companyId, agentId: f.assignedAgentId, runId: f.run.id });
+      const tool = (await githubBotToolsForSession(db, f.session)).find(tool => tool.upstreamToolName === "submit_review")!;
+      await githubChatReviewService(db, f.providerFetch).execute(f.session, "begin_review", { reviewedCommit: head });
+      const assessment = { reviewedCommit: head, score: 3, complete: true, summary: "Advisory review", rationale: "Reviewed the file",
+        coverage: { reviewedPaths: ["src/math.ts"], omittedPaths: [], limitations: [] }, findings: [] };
+      const idempotencyKey = randomUUID();
+      const result = await gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: assessment, idempotencyKey });
+      expect(result).toMatchObject({ status: "completed", result: { data: { status: "processed", score: 3, conclusion: "neutral" } } });
+      expect(summaryAttempts).toBe(2);
+      expect(f.responseComments.size).toBe(1);
+      expect(checks).toEqual([expect.objectContaining({ conclusion: "neutral", status: "completed" })]);
+      const replay = await gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: assessment, idempotencyKey });
+      expect(replay).toMatchObject({ result: { data: { status: "processed", score: 3, conclusion: "neutral" } } });
+      expect(summaryAttempts).toBe(2);
+      const [action] = await db.select().from(chatActions).where(and(eq(chatActions.endpointId, f.endpoint.id), eq(chatActions.kind, "github_review_publication")));
+      expect(action).toMatchObject({ status: "processed" });
+      expect((await readChatGitHubReviewsByEndpointId(f.endpoint.id))).toHaveLength(1);
+      await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: { ...assessment, score: 5 }, idempotencyKey }))
+        .rejects.toMatchObject({ status: 409, reasonCode: "github_idempotency_conflict" });
+      await db.insert(toolPolicies).values({ companyId: f.companyId, name: "Revoke review publication", policyType: "block", priority: 0,
+        selectors: { catalogEntryId: tool.catalogEntryId! },
+      });
+      await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: assessment, idempotencyKey })).rejects.toThrow();
+      expect(summaryAttempts).toBe(2);
+    }, 25_000);
+    it("lists each GitHub bot tool once when an inline thread shares the task", async () => {
+      const f = await toolReplyFixture("github:paperclipai/paperclip:418");
+      const { id: _id, ...conversation } = f.conversation;
+      await db.insert(chatConversations).values({
+        ...conversation,
+        externalThreadId: "github:paperclipai/paperclip:418:rc:41901",
+        providerUrl: "https://github.com/paperclipai/paperclip/pull/418#discussion_r41901",
+      });
+      const tools = await githubBotToolsForSession(db, f.session);
+      expect(tools).toHaveLength(7);
+      expect(new Set(tools.map(tool => tool.name)).size).toBe(7);
+      expect(await githubBotToolsForSession(db, { ...f.session, issueId: randomUUID() })).toEqual([]);
+      expect(await readChatConversationsByEndpointId(f.endpoint.id)).toHaveLength(2);
+    });
+    it.each([
+      { label: "returns the confirmed GitHub assessment when publication takes longer than ten seconds", delayMs: 11_000, timeoutMs: undefined },
+      { label: "preserves an explicit shorter GitHub tool deadline and reconciles without duplicate publication", delayMs: 200, timeoutMs: 50 },
+    ])("recovers a durable GitHub publication receipt ($label)", async ({ delayMs, timeoutMs }) => {
+      const f = await toolReplyFixture("github:paperclipai/paperclip:418", true);
+      const head = "b".repeat(40);
+      const checks: Record<string, unknown>[] = [];
+      f.setSupplementalProviderFetch(async (input, init) => {
+        const url = String(input);
+        if (url.endsWith("/pulls/418")) return Response.json({ number: 418, state: "open", draft: false,
+          head: { sha: head }, base: { sha: "a".repeat(40), ref: "master" }, user: { id: 42, login: "octocat", type: "User" }, labels: [] });
+        if (url.includes("/files?")) return Response.json([{ filename: "src/math.ts", status: "modified", patch: "@@ -1 +1 @@\n-old\n+new" }]);
+        if (url.includes("/check-runs?")) return Response.json({ check_runs: [] });
+        if (url.includes("/check-runs") && init?.method) {
+          checks.push(JSON.parse(String(init.body)));
+          return Response.json({ id: 419, html_url: "https://github.com/checks/419" });
+        }
+        if (url.includes("/issues/comments/") && init?.method === "PATCH") {
+          await new Promise(resolve => setTimeout(resolve, delayMs));
+        }
+        return undefined;
+      });
+      vi.stubGlobal("fetch", f.providerFetch);
+      onTestFinished(() => { vi.unstubAllGlobals(); });
+      const { createToolGatewayService } = await import("../services/tool-gateway.js");
+      const gateway = createToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: f.companyId, agentId: f.assignedAgentId, runId: f.run.id });
+      const tools = await githubBotToolsForSession(db, f.session);
+      const tool = tools.find(tool => tool.upstreamToolName === "submit_review")!;
+      await githubChatReviewService(db, f.providerFetch).execute(f.session, "begin_review", { reviewedCommit: head });
+      const assessment = { reviewedCommit: head, score: 5, complete: true, summary: "Looks good", rationale: "Reviewed the changed file",
+        coverage: { reviewedPaths: ["src/math.ts"], omittedPaths: [], limitations: [] }, findings: [] };
+      const result = await gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: assessment, timeoutMs })
+        .then(value => ({ value }), error => ({ error }));
+      await expect.poll(async () => {
+        const [action] = await db.select().from(chatActions).where(and(eq(chatActions.endpointId, f.endpoint.id), eq(chatActions.kind, "github_review_publication")));
+        return action?.status;
+      }, { timeout: 15_000 }).toBe("processed");
+      expect(f.responseComments.size).toBe(1);
+      expect(f.responseWrites.map(write => write.method)).toEqual(["POST", "PATCH"]);
+      expect(checks).toContainEqual(expect.objectContaining({ conclusion: "neutral", status: "completed" }));
+      if (timeoutMs === undefined) {
+        expect(result).toMatchObject({ value: { status: "completed", result: { data: { status: "processed", score: 5, conclusion: "neutral" } } } });
+      } else {
+        expect(result).toMatchObject({ error: { status: 504, reasonCode: "tool_timeout" } });
+      }
+      const writes = f.responseWrites.length;
+      const replay = await gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: assessment });
+      expect(replay).toMatchObject({ result: { data: { status: "processed", score: 5, conclusion: "neutral" } } });
+      const [invocation] = await db.select().from(toolInvocations).where(eq(toolInvocations.id, replay.invocationId));
+      expect(invocation).toMatchObject({ status: "succeeded", errorCode: null, errorMessage: null });
+      expect(f.responseWrites).toHaveLength(writes);
+    }, 40_000);
     it("does not post a GitHub working comment when the scheduler declines the request", async () => {
       const f = await reviewBotFixture();
       f.wakeup.mockImplementation(async (agentId, opts) => {
@@ -4108,21 +4410,52 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect((await context.service.listResources(context.endpoint.id)).every(resource => !resource.enabled)).toBe(true);
       expect(await management.configuration(context.endpoint.id, "owner-user")).toMatchObject({ revision: 1, configuration: { toolsEnabled: false } });
     });
-    it.each(["current", "foreign", "invalid_signature"] as const)("verifies a repaired GitHub webhook only from a %s installation delivery", async kind => {
+    it.each([
+      ["active", "current", "enabled"], ["active", "foreign", "enabled"], ["active", "invalid_signature", "enabled"], ["active", "missing_installation", "enabled"],
+      ["attention", "current", "enabled"], ["attention", "foreign", "enabled"], ["attention", "invalid_signature", "enabled"], ["attention", "missing_installation", "enabled"],
+      ["attention", "current", "disabled"], ["attention", "current", "unavailable"],
+    ] as const)("verifies a repaired GitHub webhook in %s only from a %s installation delivery with %s repository", async (status, kind, resourceState) => {
       const f = await reviewBotFixture();
       const [endpoint] = await readChatEndpointsById(f.endpoint.id);
-      await db.update(chatEndpoints).set({ setup: { ...endpoint.setup, webhookVerifiedAt: null } }).where(eq(chatEndpoints.id, endpoint.id));
+      if (resourceState !== "enabled") {
+        await db.update(chatEndpointResources).set(resourceState === "disabled" ? { enabled: false } : { availability: "unavailable" }).where(eq(chatEndpointResources.endpointId, endpoint.id));
+      }
+      if (status === "attention") await db.update(toolConnections).set({ status: "disabled", enabled: false }).where(eq(toolConnections.id, endpoint.connectionId));
+      const resourcesBefore = await f.service.listResources(endpoint.id);
+      const conversationsBefore = await readChatConversationsByEndpointId(endpoint.id);
+      const actionsBefore = await db.select().from(chatActions).where(eq(chatActions.endpointId, endpoint.id));
+      f.wakeup.mockClear();
+      await db.update(chatEndpoints).set({ status, setup: { ...endpoint.setup, webhookVerifiedAt: null } }).where(eq(chatEndpoints.id, endpoint.id));
       const response = await f.service.handleWebhook(endpoint.publicId, "github", signedGitHubWebhookRequest({
         event: "issue_comment", delivery: randomUUID(), webhookSecret: kind === "invalid_signature" ? "wrong-secret" : f.webhookSecret,
-        payload: { action: "created", installation: { id: kind === "foreign" ? 9999 : 2468 },
+        payload: { action: "created", ...(kind === "missing_installation" ? {} : { installation: { id: kind === "foreign" ? 9999 : 2468 } }),
           repository: { id: 97531, full_name: "paperclipai/paperclip", owner: { id: 1357, login: "paperclipai" } },
-          issue: { number: 418 }, comment: { id: 41801, body: "Ordinary comment", user: { id: 42, login: "octocat" } }, sender: { id: 42, login: "octocat" } },
+          issue: { number: 418 }, comment: { id: 41801, body: status === "attention" ? `@${endpoint.botUsername} please review` : "Ordinary comment", user: { id: 42, login: "octocat" } }, sender: { id: 42, login: "octocat" } },
       }));
       if (kind === "invalid_signature") expect(response.status).toBe(401);
       else expect(response.status).toBeLessThan(300);
       const current = await f.service.get(endpoint.id);
       if (kind === "current") expect(current.setup.webhookVerifiedAt).toEqual(expect.any(String));
       else expect(current.setup.webhookVerifiedAt).toBeNull();
+      if (status === "attention") {
+        expect(current.status).toBe("attention");
+        expect(await f.service.listResources(endpoint.id)).toEqual(resourcesBefore);
+        expect(await readChatConversationsByEndpointId(endpoint.id)).toEqual(conversationsBefore);
+        expect(await db.select().from(chatActions).where(eq(chatActions.endpointId, endpoint.id))).toEqual(actionsBefore);
+        expect(f.wakeup).not.toHaveBeenCalled();
+        if (kind === "current") {
+          expect(current.setup.step).toBe("provider_setup");
+          await f.service.handleWebhook(endpoint.publicId, "github", signedGitHubWebhookRequest({
+            event: "installation_repositories", delivery: randomUUID(), webhookSecret: f.webhookSecret,
+            payload: { action: "added", installation: { id: 2468 }, repositories_added: [], repositories_removed: [] },
+          }));
+          expect((await f.service.get(endpoint.id)).status).toBe("attention");
+          expect((await readToolConnectionsById(endpoint.connectionId))[0]).toMatchObject({ status: "disabled", enabled: false });
+          expect(f.wakeup).not.toHaveBeenCalled();
+          const configured = await f.service.configure(endpoint.id, { action: "reconnect" }, "owner-user");
+          expect(configured.status).toBe("verifying");
+        }
+      }
     });
     it("stack rejects forged raw gateway deliveries without changing verification or waking an agent", async () => {
       const f = await reviewBotFixture();
@@ -5704,46 +6037,6 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       };
     }
 
-    it("persists registration before enabling the runtime and preserves unrelated commands", async () => {
-      const f = await registrationFixture();
-      try {
-        await f.configure();
-        const connected = await f.service.get(f.endpoint.id);
-        expect(connected?.capabilities).toMatchObject({
-          slashCommands: true,
-          ephemeralMessages: true,
-        });
-        expect(
-          f.runtime.configurations.get(f.endpoint.id)?.callbacks.onSlashCommand,
-        ).toBeTypeOf("function");
-        expect(f.calls).toEqual(["GET", "POST"]);
-        expect(f.commandRows().map((row) => row.name)).toEqual([
-          "other",
-          "paperclip",
-        ]);
-        const [registration] = await db
-          .select()
-          .from(chatActions)
-          .where(
-            and(
-              eq(chatActions.endpointId, f.endpoint.id),
-              eq(chatActions.kind, "discord_command_registration"),
-            ),
-          );
-        expect(registration?.status).toBe("processed");
-        expect(registration?.payload.registration).toMatchObject({
-          phase: "registered",
-        });
-        expect(JSON.stringify(registration)).not.toContain(
-          f.credentials.botToken,
-        );
-        await f.service.reconcileProviderRuntimes();
-        expect(f.calls).toEqual(["GET", "POST"]);
-      } finally {
-        await retireRegistrationFixture(f.service, f.endpoint.id);
-      }
-    });
-
     it("keeps mention setup usable on registration failure and upgrades automatically when due", async () => {
       const f = await registrationFixture("unavailable");
       try {
@@ -5817,6 +6110,37 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         )!.callbacks;
         expect(originalCallbacks.onMessage).toBeTypeOf("function");
         expect(originalCallbacks.onSlashCommand).toBeTypeOf("function");
+        const connected = await f.service.get(f.endpoint.id);
+        expect(connected?.capabilities).toMatchObject({
+          slashCommands: true,
+          ephemeralMessages: true,
+        });
+        expect(
+          f.runtime.configurations.get(f.endpoint.id)?.callbacks.onSlashCommand,
+        ).toBeTypeOf("function");
+        expect(f.calls).toEqual(["GET", "POST"]);
+        expect(f.commandRows().map((row) => row.name)).toEqual([
+          "other",
+          "paperclip",
+        ]);
+        const [registration] = await db
+          .select()
+          .from(chatActions)
+          .where(
+            and(
+              eq(chatActions.endpointId, f.endpoint.id),
+              eq(chatActions.kind, "discord_command_registration"),
+            ),
+          );
+        expect(registration?.status).toBe("processed");
+        expect(registration?.payload.registration).toMatchObject({
+          phase: "registered",
+        });
+        expect(JSON.stringify(registration)).not.toContain(
+          f.credentials.botToken,
+        );
+        await f.service.reconcileProviderRuntimes();
+        expect(f.calls).toEqual(["GET", "POST"]);
         const shutdown = vi.spyOn(original!, "shutdown");
         const targetRestart = vi.fn(async () => {
           throw new Error(
@@ -69183,6 +69507,72 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(JSON.stringify(runtime.edits)).not.toMatch(
         /PRIVATE|token=|scheduler/,
       );
+    } finally {
+      await context.service.shutdown();
+    }
+  });
+
+  it.each(["not-a-uuid", "", "uppercase"])("skips a pre-run FIFO candidate with a noncanonical coalesced owner id (%s)", async (ownerId) => {
+    const context = await deferredChatQueueFixture();
+    try {
+      const [receipt] = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, context.action.id));
+      await db
+        .update(agentWakeupRequests)
+        .set({
+          payload: {
+            ...receipt.payload,
+            coalescedIntoWakeupRequestId: ownerId === "uppercase" ? context.action.id.toUpperCase() : ownerId,
+          },
+        })
+        .where(eq(agentWakeupRequests.id, context.action.id));
+      await expect(
+        context.service.enqueueInboundWakeupPublications(),
+      ).resolves.toBe(0);
+      await expect(
+        db
+          .select()
+          .from(chatPublications)
+          .where(eq(chatPublications.endpointId, context.endpoint.id)),
+      ).resolves.toEqual([]);
+    } finally {
+      await context.service.shutdown();
+    }
+  });
+
+  it("keeps the pre-run FIFO sweep running when a valid owner's action has comment ids that are not uuids", async () => {
+    const context = await deferredChatQueueFixture();
+    try {
+      // Publish the queued notice first. The removed-comment and queued-notice
+      // checks then have real rows to compare the malformed ids against.
+      await context.service.processPendingPublications();
+      await expect(
+        db
+          .select({ state: chatPublications.state })
+          .from(chatPublications)
+          .where(eq(chatPublications.endpointId, context.endpoint.id)),
+      ).resolves.toEqual([{ state: "published" }]);
+      await db
+        .update(chatActions)
+        .set({
+          payload: {
+            ...context.action.payload,
+            issueId: "not-a-uuid",
+            commentId: "not-a-uuid",
+          },
+        })
+        .where(eq(chatActions.id, context.action.id));
+      await expect(
+        context.service.enqueueInboundWakeupPublications(),
+      ).resolves.toBe(0);
+      await expect(
+        db
+          .select({ state: chatPublications.state })
+          .from(chatPublications)
+          .where(eq(chatPublications.endpointId, context.endpoint.id)),
+      ).resolves.toEqual([{ state: "published" }]);
     } finally {
       await context.service.shutdown();
     }

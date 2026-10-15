@@ -2,6 +2,7 @@ import { and, eq, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { withHumanDirectedWork } from "./human-directed-work.js";
 import { hasOwnerChatInstructionAuthority } from "./owner-chat-instruction-authority.js";
+import { canonicalExecutionUuid } from "./execution-identity.js";
 import {
   agents,
   approvals,
@@ -728,36 +729,89 @@ export function authorizationDeniedDetails(decision: AuthorizationDecision) {
 
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 
-/**
- * Rows read while deciding, shared by every decision made through one service
- * instance that is given the memo. Give it only to a service that lives for a
- * single bounded check, never to a long-lived one.
- */
-export type AuthorizationRowMemo = Map<string, Promise<unknown>>;
+type ReadAuthorizationSnapshot = {
+  issues: Map<string, IssueAuthorizationRow & IssuePrivacyRow & { readable: boolean }>;
+  projects: Map<string, ProjectAuthorizationRow & ProjectPrivacyRow & { readable: boolean }>;
+  memo: Map<string, Promise<unknown>>;
+};
 
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const PREFETCH_CHUNK_SIZE = 500;
+type ReadAuthorizationResource = Extract<AuthorizationResource, { type: "issue" | "project" | "company" }>;
 
-export function authorizationService(db: Db | DbTransaction, options: { rowMemo?: AuthorizationRowMemo } = {}) {
-  function remember<T>(key: string, load: () => Promise<T>): Promise<T> {
-    const memo = options.rowMemo;
-    if (!memo) return load();
-    if (!memo.has(key)) memo.set(key, load());
-    return memo.get(key) as Promise<T>;
+export function authorizationService(db: Db | DbTransaction) {
+  return createAuthorizationService(db);
+}
+
+function createAuthorizationService(db: Db | DbTransaction, readSnapshot?: ReadAuthorizationSnapshot) {
+  function batchRead<T>(key: string, read: () => Promise<T>): Promise<T> {
+    if (!readSnapshot) return read();
+    let result = readSnapshot.memo.get(key);
+    if (!result) { result = read(); readSnapshot.memo.set(key, result); }
+    return result as Promise<T>;
+  }
+
+  async function decideReads(actor: AuthorizationActor, resources: ReadAuthorizationResource[]): Promise<AuthorizationDecision[]> {
+    return (await decideReadsForActors([actor], resources))[0];
+  }
+
+  async function decideReadsForActors(actors: AuthorizationActor[], resources: ReadAuthorizationResource[]): Promise<AuthorizationDecision[][]> {
+    if (!actors.length) return [];
+    const snapshots: ReadAuthorizationSnapshot[] = actors.map(() => ({ issues: new Map(), projects: new Map(), memo: new Map() }));
+    const batchActors: ResponsibleUserActorWithMemo[] = actors.map(actor => ({ ...actor, __responsibleUserSnapshotMemo: undefined }));
+    const privacyKey = (actor: AuthorizationActor) => JSON.stringify([actor.type, actor.agentId, actor.userId, actor.onBehalfOfUserId]);
+    const privacyActors = [...new Map(batchActors.map(actor => [privacyKey(actor), actor])).values()];
+    const privacyIndexes = batchActors.map(actor => privacyActors.findIndex(peer => privacyKey(peer) === privacyKey(actor)));
+    const issueIds = [...new Set(resources.flatMap(resource => resource.type === "issue" && resource.issueId ? [resource.issueId] : []))];
+    const projectIds = new Set(resources.flatMap(resource => resource.type === "project" && resource.projectId ? [resource.projectId]
+      : resource.type === "issue" && resource.projectId ? [resource.projectId] : []));
+    for (let offset = 0; offset < issueIds.length; offset += 500) {
+      const rows = await db.select({
+        id: issues.id, companyId: issues.companyId, projectId: issues.projectId, parentId: issues.parentId,
+        assigneeAgentId: issues.assigneeAgentId, assigneeUserId: issues.assigneeUserId, checkoutRunId: issues.checkoutRunId,
+        status: issues.status, executionPolicy: issues.executionPolicy, originKind: issues.originKind, originId: issues.originId,
+        visibility: issues.visibility, privacyRootIssueId: issues.privacyRootIssueId,
+        responsibleUserId: issues.responsibleUserId, createdByUserId: issues.createdByUserId,
+        readable: sql<boolean[]>`ARRAY[${sql.join(privacyActors.map(actor => issuePrivacyCondition(actor)), sql`, `)}]`,
+      }).from(issues).where(inArray(issues.id, issueIds.slice(offset, offset + 500)));
+      for (const row of rows) {
+        for (let index = 0; index < snapshots.length; index++) snapshots[index].issues.set(row.id, { ...row, readable: row.readable[privacyIndexes[index]] });
+        if (row.projectId) projectIds.add(row.projectId);
+      }
+    }
+    const ids = [...projectIds];
+    for (let offset = 0; offset < ids.length; offset += 500) {
+      const rows = await db.select({ id: projects.id, companyId: projects.companyId,
+        executionWorkspacePolicy: projects.executionWorkspacePolicy, visibility: projects.visibility,
+        readable: sql<boolean[]>`ARRAY[${sql.join(privacyActors.map(actor => projectPrivacyCondition(actor)), sql`, `)}]`,
+      }).from(projects).where(inArray(projects.id, ids.slice(offset, offset + 500)));
+      for (const row of rows) for (let index = 0; index < snapshots.length; index++) {
+        snapshots[index].projects.set(row.id, { ...row, readable: row.readable[privacyIndexes[index]] });
+      }
+    }
+    const results: AuthorizationDecision[][] = [];
+    for (let index = 0; index < batchActors.length; index++) {
+      const batch = createAuthorizationService(db, snapshots[index]);
+      const decisions: AuthorizationDecision[] = [];
+      for (const resource of resources) decisions.push(await batch.decide({ actor: batchActors[index], resource,
+        action: resource.type === "issue" ? "issue:read" : resource.type === "project" ? "project:read" : "company_scope:read" }));
+      results.push(decisions);
+    }
+    return results;
   }
 
   async function isInstanceAdmin(userId: string | null | undefined): Promise<boolean> {
     if (!userId) return false;
-    if (
-      await db
-        .select({ id: instanceUserRoles.id })
-        .from(instanceUserRoles)
-        .where(and(eq(instanceUserRoles.userId, userId), eq(instanceUserRoles.role, "instance_admin")))
-        .then((rows) => rows[0] ?? null)
-    ) {
-      return true;
-    }
-    return false;
+    return batchRead(`admin:${userId}`, async () => {
+      if (
+        await db
+          .select({ id: instanceUserRoles.id })
+          .from(instanceUserRoles)
+          .where(and(eq(instanceUserRoles.userId, userId), eq(instanceUserRoles.role, "instance_admin")))
+          .then((rows) => rows[0] ?? null)
+      ) {
+        return true;
+      }
+      return false;
+    });
   }
 
   async function getActiveMembership(
@@ -765,18 +819,20 @@ export function authorizationService(db: Db | DbTransaction, options: { rowMemo?
     principalType: PrincipalType,
     principalId: string,
   ) {
-    return remember(`membership:${companyId}:${principalType}:${principalId}`, () => db
-      .select()
-      .from(companyMemberships)
-      .where(
-        and(
-          eq(companyMemberships.companyId, companyId),
-          eq(companyMemberships.principalType, principalType),
-          eq(companyMemberships.principalId, principalId),
-          eq(companyMemberships.status, "active"),
-        ),
-      )
-      .then((rows) => rows[0] ?? null));
+    return batchRead(`membership:${companyId}:${principalType}:${principalId}`, async () => {
+      return db
+        .select()
+        .from(companyMemberships)
+        .where(
+          and(
+            eq(companyMemberships.companyId, companyId),
+            eq(companyMemberships.principalType, principalType),
+            eq(companyMemberships.principalId, principalId),
+            eq(companyMemberships.status, "active"),
+          ),
+        )
+        .then((rows) => rows[0] ?? null);
+    });
   }
 
   async function loadResponsibleUserSnapshot(companyId: string, userId: string): Promise<ResponsibleUserSnapshot> {
@@ -937,22 +993,25 @@ export function authorizationService(db: Db | DbTransaction, options: { rowMemo?
   }
 
   async function loadAgent(agentId: string): Promise<AgentAuthorizationRow | null> {
-    return remember(`agent:${agentId}`, () => db
-      .select({
-        id: agents.id,
-        companyId: agents.companyId,
-        role: agents.role,
-        status: agents.status,
-        reportsTo: agents.reportsTo,
-        permissions: agents.permissions,
-      })
-      .from(agents)
-      .where(eq(agents.id, agentId))
-      .then((rows) => rows[0] ?? null));
+    return batchRead(`agent:${agentId}`, async () => {
+      return db
+        .select({
+          id: agents.id,
+          companyId: agents.companyId,
+          role: agents.role,
+          status: agents.status,
+          reportsTo: agents.reportsTo,
+          permissions: agents.permissions,
+        })
+        .from(agents)
+        .where(eq(agents.id, agentId))
+        .then((rows) => rows[0] ?? null);
+    });
   }
 
   async function loadProject(projectId: string): Promise<ProjectAuthorizationRow | null> {
-    return remember(`project:${projectId}`, () => db
+    if (readSnapshot?.projects.has(projectId)) return readSnapshot.projects.get(projectId)!;
+    return db
       .select({
         id: projects.id,
         companyId: projects.companyId,
@@ -960,90 +1019,50 @@ export function authorizationService(db: Db | DbTransaction, options: { rowMemo?
       })
       .from(projects)
       .where(eq(projects.id, projectId))
-      .then((rows) => rows[0] ?? null));
+      .then((rows) => rows[0] ?? null);
   }
-
-  const issueAuthorizationColumns = () => ({
-    id: issues.id,
-    companyId: issues.companyId,
-    projectId: issues.projectId,
-    parentId: issues.parentId,
-    assigneeAgentId: issues.assigneeAgentId,
-    assigneeUserId: issues.assigneeUserId,
-    checkoutRunId: issues.checkoutRunId,
-    status: issues.status,
-    executionPolicy: issues.executionPolicy,
-    originKind: issues.originKind,
-    originId: issues.originId,
-  });
-  const issuePrivacyColumns = () => ({
-    id: issues.id,
-    companyId: issues.companyId,
-    visibility: issues.visibility,
-    privacyRootIssueId: issues.privacyRootIssueId,
-    responsibleUserId: issues.responsibleUserId,
-    createdByUserId: issues.createdByUserId,
-    assigneeUserId: issues.assigneeUserId,
-    assigneeAgentId: issues.assigneeAgentId,
-    projectId: issues.projectId,
-  });
-  const issueKey = (issueId: string) => `issue:${issueId}`;
-  const issuePrivacyRowKey = (companyId: string, issueId: string) => `issue-privacy-row:${companyId}:${issueId}`;
-  const issuePrivacyReadKey = (actor: AuthorizationActor, companyId: string, issueId: string) =>
-    `issue-privacy-read:${JSON.stringify(actor)}:${companyId}:${issueId}`;
 
   async function loadIssue(issueId: string): Promise<IssueAuthorizationRow | null> {
-    return remember(issueKey(issueId), () => db
-      .select(issueAuthorizationColumns())
+    if (readSnapshot?.issues.has(issueId)) return readSnapshot.issues.get(issueId)!;
+    return db
+      .select({
+        id: issues.id,
+        companyId: issues.companyId,
+        projectId: issues.projectId,
+        parentId: issues.parentId,
+        assigneeAgentId: issues.assigneeAgentId,
+        assigneeUserId: issues.assigneeUserId,
+        checkoutRunId: issues.checkoutRunId,
+        status: issues.status,
+        executionPolicy: issues.executionPolicy,
+        originKind: issues.originKind,
+        originId: issues.originId,
+      })
       .from(issues)
       .where(eq(issues.id, issueId))
-      .then((rows) => rows[0] ?? null));
-  }
-
-  /**
-   * Seeds the memo with every row an `issue:read` decision reads for these
-   * tasks, in a few statements instead of a few per task. Without a memo it
-   * does nothing, and every later decision reads exactly what it would have.
-   */
-  async function prefetchIssues(actor: AuthorizationActor, companyId: string, issueIds: Iterable<string>) {
-    const memo = options.rowMemo;
-    if (!memo) return;
-    const ids = [...new Set(issueIds)].filter((id) => UUID_PATTERN.test(id) && !memo.has(issueKey(id)));
-    for (let start = 0; start < ids.length; start += PREFETCH_CHUNK_SIZE) {
-      const chunk = ids.slice(start, start + PREFETCH_CHUNK_SIZE);
-      const authorizationRows = await db.select(issueAuthorizationColumns()).from(issues).where(inArray(issues.id, chunk));
-      const privacyRows = await db.select(issuePrivacyColumns()).from(issues)
-        .where(and(inArray(issues.id, chunk), eq(issues.companyId, companyId)));
-      const readable = await db.select({ id: issues.id }).from(issues)
-        .where(and(inArray(issues.id, chunk), eq(issues.companyId, companyId), issuePrivacyCondition(actor)));
-      const authorizationById = new Map(authorizationRows.map((row) => [row.id, row]));
-      const privacyById = new Map(privacyRows.map((row) => [row.id, row]));
-      const readableIds = new Set(readable.map((row) => row.id));
-      for (const id of chunk) {
-        memo.set(issueKey(id), Promise.resolve(authorizationById.get(id) ?? null));
-        memo.set(issuePrivacyRowKey(companyId, id), Promise.resolve(privacyById.get(id) ?? null));
-        memo.set(issuePrivacyReadKey(actor, companyId, id), Promise.resolve(readableIds.has(id)));
-      }
-    }
+      .then((rows) => rows[0] ?? null);
   }
 
   async function loadRunPolicy(runId: string | null | undefined, companyId: string, agentId: string) {
-    if (!runId) return null;
-    const row = await remember(`run:${runId}`, () => db
-      .select({
-        id: heartbeatRuns.id,
-        companyId: heartbeatRuns.companyId,
-        agentId: heartbeatRuns.agentId,
-        contextSnapshot: heartbeatRuns.contextSnapshot,
-      })
-      .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.id, runId))
-      .then((rows) => rows[0] ?? null));
-    if (!row || row.companyId !== companyId || row.agentId !== agentId) return null;
-    const context = isPlainRecord(row.contextSnapshot) ? row.contextSnapshot : null;
-    return isPlainRecord(context?.executionPolicy)
-      ? { companyId: row.companyId, executionPolicy: context.executionPolicy }
-      : null;
+    return batchRead(`run:${companyId}:${agentId}:${runId}`, async () => {
+      if (!runId) return null;
+      const row = await db
+        .select({
+          id: heartbeatRuns.id,
+          companyId: heartbeatRuns.companyId,
+          agentId: heartbeatRuns.agentId,
+          contextSnapshot: sql<Record<string, unknown>>`jsonb_build_object('executionPolicy', ${heartbeatRuns.contextSnapshot}->'executionPolicy')`,
+        })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      if (!row || row.companyId !== companyId || row.agentId !== agentId) return null;
+      const context = isPlainRecord(row.contextSnapshot) ? row.contextSnapshot : null;
+      return isPlainRecord(context?.executionPolicy)
+        ? { companyId: row.companyId, executionPolicy: context.executionPolicy }
+        : null;
+    });
+
   }
 
   async function loadRunIssueId(runId: string | null | undefined, companyId: string, agentId: string) {
@@ -1052,7 +1071,7 @@ export function authorizationService(db: Db | DbTransaction, options: { rowMemo?
       .select({
         companyId: heartbeatRuns.companyId,
         agentId: heartbeatRuns.agentId,
-        contextSnapshot: heartbeatRuns.contextSnapshot,
+        contextSnapshot: sql<Record<string, unknown>>`jsonb_build_object('issueId', ${heartbeatRuns.contextSnapshot}->'issueId', 'taskId', ${heartbeatRuns.contextSnapshot}->'taskId')`,
       })
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, runId))
@@ -2724,12 +2743,14 @@ export function authorizationService(db: Db | DbTransaction, options: { rowMemo?
       && intersectedDecision.reason !== "allow_local_board"
       && issuePrivacyMode() !== "off"
     ) {
-      const project = await db
+      const retainedProject = readSnapshot?.projects.get(input.resource.projectId);
+      const project = retainedProject?.companyId === input.resource.companyId ? retainedProject : await db
         .select({ id: projects.id, companyId: projects.companyId, visibility: projects.visibility })
         .from(projects)
         .where(and(eq(projects.id, input.resource.projectId), eq(projects.companyId, input.resource.companyId)))
         .then((rows) => rows[0] ?? null);
-      if (project && !(await canActorReadProjectPrivacy(db, input.actor, project))) {
+      if (project && !(retainedProject?.companyId === input.resource.companyId
+        ? retainedProject.readable : await canActorReadProjectPrivacy(db, input.actor, project))) {
         const denied = deny({
           action: input.action,
           reason: "deny_project_private",
@@ -2758,14 +2779,24 @@ export function authorizationService(db: Db | DbTransaction, options: { rowMemo?
       || issuePrivacyMode() === "off"
     ) return intersectedDecision;
 
-    const { companyId, issueId } = input.resource;
-    const issue = await remember(issuePrivacyRowKey(companyId, issueId), () => db
-      .select(issuePrivacyColumns())
+    const retainedIssue = readSnapshot?.issues.get(input.resource.issueId);
+    const issue = retainedIssue?.companyId === input.resource.companyId ? retainedIssue : await db
+      .select({
+        id: issues.id,
+        companyId: issues.companyId,
+        visibility: issues.visibility,
+        privacyRootIssueId: issues.privacyRootIssueId,
+        responsibleUserId: issues.responsibleUserId,
+        createdByUserId: issues.createdByUserId,
+        assigneeUserId: issues.assigneeUserId,
+        assigneeAgentId: issues.assigneeAgentId,
+        projectId: issues.projectId,
+      })
       .from(issues)
-      .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)))
-      .then((rows) => rows[0] ?? null));
-    if (!issue || await remember(issuePrivacyReadKey(input.actor, issue.companyId, issue.id),
-      () => canActorReadIssuePrivacy(db, input.actor, issue))) return intersectedDecision;
+      .where(and(eq(issues.id, input.resource.issueId), eq(issues.companyId, input.resource.companyId)))
+      .then((rows) => rows[0] ?? null);
+    if (!issue || (retainedIssue?.companyId === input.resource.companyId
+      ? retainedIssue.readable : await canActorReadIssuePrivacy(db, input.actor, issue))) return intersectedDecision;
 
     const denied = deny({
       action: input.action,
@@ -2807,15 +2838,12 @@ export function authorizationService(db: Db | DbTransaction, options: { rowMemo?
 
   return {
     decide,
-    prefetchIssues,
+    decideReads,
+    decideReadsForActors,
     projectDiscoveryCandidateIds,
     decidePrincipalGrant,
   };
 }
-
-// The retain_workspace_privacy_sources trigger keys retained sources by issues.id::text.
-// Matching on the uuid lets the lookup use the primary key; a key in any other form matches nothing.
-const retainedSourceIssueId = sql`(case when source.id ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' then source.id::uuid end)`;
 
 /** A workspace can contain several tasks. Reading files/operations requires
  * access to every task bound to it, not just the task that originally made it. */
@@ -2827,7 +2855,7 @@ export async function executionWorkspaceReadSqlCondition(db: Db | DbTransaction,
       select 1 from ${projects} where ${projects.id} = ${executionWorkspaces.projectId}
         and ${projects.companyId} = ${executionWorkspaces.companyId} and ${projectCondition}))
     and not exists (select 1 from jsonb_object_keys(coalesce(${executionWorkspaces.metadata}->'_issuePrivacySources', '{}'::jsonb)) source(id)
-      where not exists (select 1 from ${issues} where ${issues.id} = ${retainedSourceIssueId}
+      where not exists (select 1 from ${issues} where ${issues.id} = ${canonicalExecutionUuid(sql`source.id`)}
         and ${issues.companyId} = ${executionWorkspaces.companyId} and ${issueCondition}))
     and not exists (select 1 from ${issues}
       where ${issues.companyId} = ${executionWorkspaces.companyId}

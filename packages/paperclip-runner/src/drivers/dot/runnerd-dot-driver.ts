@@ -1,3 +1,4 @@
+import type { RunnerExecutionDriver } from "../../control-plane/runner-execution-driver.js";
 import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
@@ -8,27 +9,36 @@ import type { PrpEvent } from "../../protocol/replay-contract.js";
 import { validatePrpStructuredRunResult } from "../../protocol/replay-contract.js";
 import { DurablePrpControlPlane, spawnRunner, type RunnerProcessHandle } from "../../control-plane/durable-prp-control-plane.js";
 import type { DurableRecoveryIdentity } from "../../contracts/durable-recovery.js";
-import { authorizedToolSetForProvider, defaultCapabilityRunnerdBinary, readRunnerdArtifactBinding, type CapabilityRunnerdCodexTransportOptions } from "../../live/runnerd-codex-transport.js";
+import { authorizedToolSetForProvider, defaultCapabilityRunnerdBinary, readRunnerdArtifactBinding } from "../../live/runnerd-codex-transport.js";
 import { codexSemanticToolSpecs } from "../codex/codex-driver-values.js";
 import { nativeSystemInstructions } from "../../backends/runtime-context.js";
 import type { CodexNativeSessionBackendOptions } from "../../backends/codex-native-backend.js";
 
-export interface RunnerdDotDriverOptions {
+export interface RunnerdDotDriverOptions extends Pick<RunnerExecutionDriver, "runnerStateDirectory" | "runnerProcessLauncher" | "controlPlaneRegistration" | "adoptExistingRunner"> {
   execution: NativeExecutionInputV6;
   stateDirectory: string;
   identity: DurableRecoveryIdentity;
   port: ExternalProviderPort;
   runnerBinary?: string;
-  runnerStateDirectory?: string;
-  runnerProcessLauncher?: CapabilityRunnerdCodexTransportOptions["runnerProcessLauncher"];
   /** Reads the checkpoint from the execution target. Missing state cannot authorize replay. */
   readProviderState?: () => Promise<Record<string, unknown> | null>;
-  controlPlaneRegistration?: CapabilityRunnerdCodexTransportOptions["controlPlaneRegistration"];
   onSpawn?: CodexNativeSessionBackendOptions["onSpawn"];
   dynamicTools?: CodexNativeSessionBackendOptions["dynamicTools"];
   dynamicToolHandler?: CodexNativeSessionBackendOptions["dynamicToolHandler"];
   completionFeedback?: CodexNativeSessionBackendOptions["completionFeedback"];
-  adoptExistingRunner?: CapabilityRunnerdCodexTransportOptions["adoptExistingRunner"];
+}
+
+/** Keep the remote monitor's closed failure code without logging its stderr,
+ * which can contain private transport details. */
+export function externalRunnerExitMessage(result: Awaited<RunnerProcessHandle["completion"]>): string {
+  const diagnostics = result.stderr ?? "";
+  const reasons = [
+    ["transport_reconnect_grace_exceeded", "transport reconnect grace exceeded"],
+    ["transport_reconnect_deadline_exceeded", "transport reconnect deadline elapsed"],
+    ["lease_expired_requires_bootstrap", "connection lease expired"],
+  ] as const;
+  const reason = reasons.find(([code, message]) => diagnostics.includes(code) || diagnostics.includes(message))?.[0];
+  return `dot_runner_process_exited_recovery_required: code=${result.code} signal=${result.signal}${reason ? ` reason=${reason}` : ""}`;
 }
 
 const capabilities = {
@@ -90,6 +100,11 @@ async function readProviderCheckpoint(options: RunnerdDotDriverOptions): Promise
   if (!existsSync(path)) return null;
   if (statSync(path).size > 32 * 1024 * 1024) throw new Error("dot_provider_checkpoint_too_large");
   return JSON.parse(readFileSync(path, "utf8"));
+}
+
+export function runnerDisconnectDiagnostic(core: Pick<DurablePrpControlPlane, "runnerDisconnectedForMs">): string {
+  const disconnectedMs = core.runnerDisconnectedForMs();
+  return `disconnectedMs=${disconnectedMs ?? "none"}`;
 }
 
 class RunnerdDotSession implements HarnessSession {
@@ -168,11 +183,13 @@ class RunnerdDotSession implements HarnessSession {
         // Remote monitors do not report an exit code. The authenticated,
         // persisted receipt is the evidence of shutdown, for either launcher.
         if (core.getCommand("dot_shutdown")?.status === "completed") return;
-        this.#failure ??= new Error(`dot_runner_process_exited_recovery_required: code=${result.code} signal=${result.signal}`);
+        // Retain closed remote-monitor codes and the controller's safe
+        // disconnect age; raw stderr must never reach the run failure message.
+        this.#failure ??= new Error(`${externalRunnerExitMessage(result)} ${runnerDisconnectDiagnostic(core)}`);
         this.#wake();
       }, () => {
         if (this.#closed || core.getCommand("dot_shutdown")?.status === "completed") return;
-        this.#failure ??= new Error("dot_runner_process_exited_recovery_required");
+        this.#failure ??= new Error(`dot_runner_process_exited_recovery_required: ${runnerDisconnectDiagnostic(core)}`);
         this.#wake();
       });
     } else if (!await o.adoptExistingRunner.isAlive()) { throw new Error("dot_runner_adoption_failed"); }

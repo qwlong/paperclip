@@ -8,7 +8,7 @@ import type { CredentialMutationLeaseGuard } from "../../chat-credential-mutatio
 import { chatEndpoints } from "@paperclipai/db";
 import { logger } from "../../../middleware/logger.js";
 import { logActivity } from "../../activity-log.js";
-import type { EndpointRow } from "../runtime-types.js";
+import type { EndpointRow, InternalSetupState } from "../runtime-types.js";
 import type { GitHubWebhookScope } from "./webhook-scope.js";
 import type { createGitHubWebhookIngress } from "./webhook-ingress.js";
 import type { createChatCredentials } from "../credentials.js";
@@ -42,7 +42,7 @@ export function createGitHubWebhookAuthentication(db: Db, options: Authenticatio
       // that authenticated the original provider bytes.
       await credentialLease.assertOwned(tx);
       await tx.update(chatEndpoints).set({
-        setup: { ...endpoint.setup, webhookVerifiedAt: verifiedAt.toISOString() },
+        setup: { ...endpoint.setup, ...(endpoint.status === "attention" ? { step: "provider_setup" as const } : {}), webhookVerifiedAt: verifiedAt.toISOString() },
         healthMessage: "GitHub webhook verified", updatedAt: verifiedAt,
       }).where(eq(chatEndpoints.id, endpoint.id));
       await logActivity(tx as unknown as Db, {
@@ -55,7 +55,10 @@ export function createGitHubWebhookAuthentication(db: Db, options: Authenticatio
   }
   async function authenticateGitHubWebhook(endpoint: EndpointRow, request: Request, scope: GitHubWebhookScope): Promise<Response | null> {
     const { replayingDurableGitHubIngress, matchesGitHubIngressFence, completeGitHubPreflightBeforeDeadline } = scope;
-    if (!replayingDurableGitHubIngress) {
+    const eventType = request.headers.get("x-github-event")?.trim() ?? "";
+    const verificationOnly = !replayingDurableGitHubIngress && endpoint.status === "attention" &&
+      ["issue_comment", "issues", "pull_request", "pull_request_review", "pull_request_review_comment"].includes(eventType);
+    if (!replayingDurableGitHubIngress && !verificationOnly) {
       await options.githubWebhookAuthenticationBarrier?.();
       let staged: GitHubIngressStageResult;
       try {
@@ -95,7 +98,6 @@ export function createGitHubWebhookAuthentication(db: Db, options: Authenticatio
     const inspection = request.clone();
     const body = await inspection.text();
     const signature = inspection.headers.get("x-hub-signature-256");
-    const eventType = inspection.headers.get("x-github-event");
     if (!replayingDurableGitHubIngress)
       await options.githubWebhookAuthenticationBarrier?.();
     if (eventType === "ping") {
@@ -171,6 +173,8 @@ export function createGitHubWebhookAuthentication(db: Db, options: Authenticatio
           !current ||
           current.endpoint.provider !== "github" ||
           !matchesGitHubIngressFence(runtimeContextForRecord(current)) ||
+          (verificationOnly && (current.endpoint.status !== "attention" ||
+            runtimeContextForRecord(current).generation !== ((endpoint.setup as InternalSetupState).runtimeGeneration ?? 0))) ||
           current.endpoint.status === "archived" ||
           current.endpoint.status === "paused" ||
           (current.endpoint.status === "revoked" &&
@@ -202,6 +206,7 @@ export function createGitHubWebhookAuthentication(db: Db, options: Authenticatio
         } catch {
           // Let the native adapter return its normal invalid-JSON response.
         }
+        const lifecycleEvent = ["github_app_authorization", "installation", "installation_repositories"].includes(eventType ?? "");
         if (payload) {
           const incomingInstallationId = payload.installation?.id;
           if (
@@ -224,12 +229,15 @@ export function createGitHubWebhookAuthentication(db: Db, options: Authenticatio
           // after repair even when Cloud has already deduplicated the old ping.
           // Foreign/lifecycle traffic cannot qualify a changed installation.
           if (!current.endpoint.setup.webhookVerifiedAt &&
-              ["active", "verifying"].includes(current.endpoint.status) &&
+              ["active", "verifying", "attention"].includes(current.endpoint.status) &&
               incomingInstallationId !== undefined &&
               String(incomingInstallationId) === credentials.installationId &&
-              eventType !== "installation") {
+              !lifecycleEvent) {
             await recordVerifiedWebhook(current.endpoint, credentialLease, inspection.headers.get("x-github-delivery"));
           }
+        }
+        if (current.endpoint.status === "attention" && !lifecycleEvent) return "ignored";
+        if (payload) {
           await reconcileGitHubWebhookRepository(
             current.endpoint,
             payload,

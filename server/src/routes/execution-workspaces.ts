@@ -1196,9 +1196,7 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
     );
 
     if (req.body.status === "archived" && existing.status !== "archived") {
-      // The archive below force-removes the worktree, so the decision must not
-      // come from a cached Git read. The board display read stays cached.
-      const readiness = await svc.getCloseReadiness(existing.id, { freshGitStatus: true });
+      const readiness = await svc.getCloseReadiness(existing.id);
       if (!readiness) {
         res.status(404).json({ error: "Execution workspace not found" });
         return;

@@ -13,6 +13,7 @@ import type {
   MatrixExecution,
   SecretReference,
   SecretReferenceMap,
+  RunnerE2ERuntimeUsage,
 } from "./types.js";
 
 interface CompanyRecord {
@@ -65,6 +66,9 @@ export interface LiveFixtureValues {
   project?: ProjectRecord;
   aiConnection?: ManagedAccountFixture;
   setupProbe?: { leaseId: string; durationMs: number; defaultRunner?: string };
+  setupLeases?: Array<{ leaseId: string; phase: "platform" | "adapter"; durationMs: number }>;
+  setupLeaseAccountingIncomplete?: boolean;
+  setupQualification?: { recorded: boolean; adapterType: string | null; platformResponses: number; adapterResponses: number };
 
   onboardingRuntime?: {
     mode: "production-wizard" | "post-onboarding-runtime-switch";
@@ -83,17 +87,24 @@ function value<T>(resolved: ReadonlyMap<string, unknown>, id: string): T {
 
 export function selectFixtureRuntimeLeases<T extends {
   id: string; provider?: string | null; heartbeatRunId?: string | null; issueId?: string | null;
-}>(input: { leases: T[]; runIds: string[]; issueId?: string; setupProbeLeaseId?: string }): T[] {
+}>(input: { leases: T[]; runIds: string[]; issueId?: string; setupProbeLeaseId?: string; setupLeaseIds?: readonly string[] }): T[] {
   const selectedRunIds = new Set(input.runIds);
+  const setupIds = new Set([...(input.setupLeaseIds ?? []), ...(input.setupProbeLeaseId ? [input.setupProbeLeaseId] : [])]);
   const relevant = input.leases.filter(lease => lease.provider === "daytona" && (
-    lease.id === input.setupProbeLeaseId || selectedRunIds.size === 0
+    setupIds.has(lease.id) || (input.setupLeaseIds === undefined && selectedRunIds.size === 0)
     || (lease.heartbeatRunId && selectedRunIds.has(lease.heartbeatRunId))
     || (input.issueId && lease.issueId === input.issueId)
   ));
-  return relevant.length > 0 ? relevant : input.leases;
+  return input.setupLeaseIds !== undefined || relevant.length > 0 ? relevant : input.leases;
 }
 
-async function deleteDaytonaEnvironment(api: RunnerApi, environmentId: string) {
+export function fixtureRuntimeCostCoverage(usage: RunnerE2ERuntimeUsage, fixtures: Pick<LiveFixtureValues, "setupLeaseAccountingIncomplete">): RunnerE2ERuntimeUsage {
+  if (!fixtures.setupLeaseAccountingIncomplete) return usage;
+  const { estimatedListCostUsd: _estimate, ...known } = usage;
+  return { ...known, costStatus: "unavailable", costSource: "provider_cost_unavailable" };
+}
+
+export async function deleteDaytonaEnvironment(api: Pick<RunnerApi, "delete">, environmentId: string) {
   const deadlineAt = Date.now() + 120_000;
   let lastError: unknown;
   while (Date.now() < deadlineAt) {
@@ -115,6 +126,14 @@ async function deleteDaytonaEnvironment(api: RunnerApi, environmentId: string) {
   );
 }
 
+export async function installFixtureDaytonaProvider(api: Pick<RunnerApi, "post">, execution: MatrixExecution) {
+  const installed = await verifyInstalledDaytonaPlugin(process.env, [execution]);
+  return api.post<PluginRecord>("/api/plugins/install", {
+    packageName: installed?.packageRoot ?? path.resolve(import.meta.dirname, "../../packages/plugins/sandbox-providers/daytona"),
+    isLocalPath: true,
+  }, { timeout: 120_000 });
+}
+
 export async function setupLiveFixtures(input: {
   api: RunnerApi;
   execution: MatrixExecution;
@@ -131,14 +150,7 @@ export async function setupLiveFixtures(input: {
     registry.register<PluginRecord>({
       id: "sandbox-provider",
       async setup() {
-        const installed = await verifyInstalledDaytonaPlugin(process.env, [execution]);
-        return api.post<PluginRecord>("/api/plugins/install", {
-          packageName: installed?.packageRoot ?? path.resolve(
-            import.meta.dirname,
-            "../../packages/plugins/sandbox-providers/daytona",
-          ),
-          isLocalPath: true,
-        }, { timeout: 120_000 });
+        return installFixtureDaytonaProvider(api, execution);
       },
       async teardown() {
         // The plugin is installed only in the isolated instance/database. The

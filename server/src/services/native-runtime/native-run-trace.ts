@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
+import { isSpanContextValid, ROOT_CONTEXT, trace } from "@opentelemetry/api";
 
 import { runWithRuntimeParent } from "@paperclipai/adapter-utils/acpx-engine/startup-timing";
 import type { AdapterRuntimeEvent } from "../../adapters/index.js";
@@ -210,6 +211,7 @@ export function createNativeRunTrace(input: {
   const runIdHash = hashedId(input.runId);
   let rootSpan: SpanHandle;
   try {
+    const trigger = trace.getActiveSpan()?.spanContext();
     rootSpan = tracing.tracer.startSpan("task.provider_session", {
       startTime: traceStartedAtMs,
       attributes: {
@@ -218,7 +220,8 @@ export function createNativeRunTrace(input: {
         "paperclip.task.run.trace_schema_version":
           NATIVE_RUN_TRACE_SCHEMA_VERSION,
       },
-    });
+      ...(trigger && isSpanContextValid(trigger) ? { links: [{ context: trigger }] } : {}),
+    }, ROOT_CONTEXT);
   } catch {
     rootSpan = NOOP_SPAN;
   }

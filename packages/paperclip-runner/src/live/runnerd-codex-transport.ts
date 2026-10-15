@@ -1,3 +1,4 @@
+import type { RunnerExecutionDriver } from "../control-plane/runner-execution-driver.js";
 import { resolvePinnedOpenCodeCommand } from "../drivers/opencode/opencode-server-driver.js";
 import { ACPX_CAPABILITY_PROFILES } from "../drivers/acpx/capability-profiles.js";
 import { admittedPiThinkingLevel, resolvePiThinkingLevel } from "../drivers/acpx/pi-thinking.js";
@@ -64,7 +65,6 @@ import {
   waitForProcess,
   type RunnerProcessHandle,
   type RunnerProcessConnection,
-  type RunnerProcessLaunchSpec,
   type DurablePrpControlPlaneOptions,
 } from "../control-plane/durable-prp-control-plane.js";
 import {
@@ -781,6 +781,22 @@ async function awaitRunnerSuspensionBarrier(input: {
   deadline: number;
   pollIntervalMs?: number;
 }): Promise<boolean> {
+  if (Date.now() >= input.deadline) return false;
+  const readRunnerState = async (): Promise<Record<string, unknown> | undefined> => {
+    const remainingMs = input.deadline - Date.now();
+    if (remainingMs <= 0) return undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        input.readRunnerState(),
+        new Promise<undefined>(resolveDeadline => {
+          timer = setTimeout(() => resolveDeadline(undefined), remainingMs);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  };
   let existing = [...input.commands()]
     .reverse()
     .find(
@@ -793,13 +809,16 @@ async function awaitRunnerSuspensionBarrier(input: {
     // Reuse its receipt only when the current exact durable state is already
     // suspended; otherwise issue a new command rather than waiting on history.
     try {
-      if ((await input.readRunnerState()).lifecycle === "suspended")
+      const state = await readRunnerState();
+      if (state === undefined) return false;
+      if (state.lifecycle === "suspended")
         return Date.now() < input.deadline;
     } catch {
       // The normal bounded barrier below handles unavailable state.
     }
     existing = undefined;
   }
+  if (Date.now() >= input.deadline) return false;
   const commandId =
     existing?.commandId ??
     `command_close_suspend_${randomUUID().replaceAll("-", "")}`;
@@ -819,11 +838,14 @@ async function awaitRunnerSuspensionBarrier(input: {
     }
     let lifecycle: unknown;
     try {
-      lifecycle = (await input.readRunnerState()).lifecycle;
+      const state = await readRunnerState();
+      if (state === undefined) return false;
+      lifecycle = state.lifecycle;
     } catch {
       // A remote filesystem can lag the command-result delivery by a small
       // amount. Keep the single close deadline as the fail-closed bound.
     }
+    if (Date.now() >= input.deadline) return false;
     if (
       command?.status === "completed" &&
       lifecycle === "suspended" &&
@@ -1206,7 +1228,7 @@ export interface CapabilityRunnerdProcessEvidence {
   diagnostics: string[];
 }
 
-export interface CapabilityRunnerdCodexTransportOptions {
+export interface CapabilityRunnerdCodexTransportOptions extends RunnerExecutionDriver {
   provider?: "codex" | "opencode" | "claude_managed" | "aws_agentcore" | "acpx";
   opencodePermissionMode?: NativeOpenCodePermissionMode;
   acpxAgent?: QualifiedAcpxAgent;
@@ -1261,6 +1283,7 @@ export interface CapabilityRunnerdCodexTransportOptions {
   runnerBinary?: string;
   codexCommand?: string;
   codexArgs?: string[];
+  disableCodexProjectInstructions?: boolean;
   /** Controller-visible Codex home used only to seed the isolated runner home. */
   sourceCodexHome?: string | null;
   opencodeCommand?: string;
@@ -1331,25 +1354,6 @@ export interface CapabilityRunnerdCodexTransportOptions {
     turnId: string;
     itemId: string;
   };
-  /** Registers the run-bound PRP authority on Paperclip's shared HTTP server. */
-  controlPlaneRegistration?: (
-    authority: DurablePrpControlPlane,
-    identity?: DurableRecoveryIdentity,
-    signal?: AbortSignal,
-  ) => Promise<{
-    connectUrl?: string;
-    connection?: RunnerProcessConnection;
-    activate?: () => Promise<void> | void;
-    ready?: () => Promise<void>;
-    failure?: Promise<never>;
-    startupFailureCode?:
-      | "runner_local_connect_failed"
-      | "runner_direct_wss_failed"
-      | "runner_ingress_unavailable";
-    /** Persists only exact, independently verified suspended remote state. */
-    checkpoint?: (settlement: "settled" | "unsettled") => Promise<void> | void;
-    release: () => Promise<void> | void;
-  }>;
   /** Existing server-owned routes only; never provision two ingress owners. */
   warmTransitionRegistrationMode?: "routed_connect";
   /** Rechecks the server-owned recovery claim after each asynchronous boundary. */
@@ -1360,35 +1364,6 @@ export interface CapabilityRunnerdCodexTransportOptions {
   onWarmTransitionRecoveryCompleted?: (input: {
     transitionId: string;
   }) => void | Promise<void>;
-  /** Optional remote process owner used only by the new runner coordinator. */
-  runnerProcessLauncher?: (
-    spec: RunnerProcessLaunchSpec,
-  ) => RunnerProcessHandle;
-  /** Durable runner state path in the process owner's filesystem. */
-  runnerStateDirectory?: string;
-  /** Read the live durable runner state when runnerd owns a remote filesystem. */
-  readRunnerState?: () => Promise<Record<string, unknown>>;
-  /** Materializes a verified external checkpoint before authority rotation. */
-  prepareExternalRunnerState?: () => Promise<void>;
-  /** Idempotently archives and returns the verified suspended runner binding. */
-  archiveExternalRunnerState?: (input: {
-    archiveKey: string;
-    priorIdentity: DurableRecoveryIdentity;
-  }) => Promise<Record<string, unknown>>;
-  /** Active-connection recovery budget. Omitted for the existing local mode. */
-  runnerReconnectGraceMs?: number;
-  /**
-   * A verified local runner that outlived its controller. Adoption registers
-   * the durable authority and waits for this exact process to reconnect; it
-   * never calls the process launcher while the process remains alive.
-   */
-  adoptExistingRunner?: {
-    pid: number;
-    processGroupId: number | null;
-    startedAt: string;
-    isAlive: () => Promise<boolean> | boolean;
-    signal?: (signal: NodeJS.Signals) => Promise<boolean> | boolean;
-  };
 }
 
 export type RunnerdCodexTransportOptions =
@@ -3462,20 +3437,24 @@ export function createRunnerdCodexAppServerArgs(input: {
   codexCommand?: string;
   readOnlyRoots?: string[];
   instructionWorkingCopyRoot?: string;
+  disableProjectInstructions?: boolean;
 }): string[] {
   // The filesystem policy denies HOME and CODEX_HOME to keep credentials and
   // runner state outside provider reach. Always bind those names to the actual
   // isolated runner home; a stale controller environment must never cause the
   // execution workspace itself to become an explicit deny root.
-  return createIsolatedCodexAppServerArgs(
-    {
-      ...input.environment,
-      HOME: input.codexHome,
-      CODEX_HOME: input.codexHome,
-    },
-    [...(input.readOnlyRoots ?? []), ...codexExecutableReadOnlyRoots(input.environment ?? {}, input.codexCommand)],
-    input.instructionWorkingCopyRoot,
-  );
+  return [
+    ...(input.disableProjectInstructions ? ["-c", "project_doc_max_bytes=0"] : []),
+    ...createIsolatedCodexAppServerArgs(
+      {
+        ...input.environment,
+        HOME: input.codexHome,
+        CODEX_HOME: input.codexHome,
+      },
+      [...(input.readOnlyRoots ?? []), ...codexExecutableReadOnlyRoots(input.environment ?? {}, input.codexCommand)],
+      input.instructionWorkingCopyRoot,
+    ),
+  ];
 }
 
 export function unwrapToolResponse(response: Record<string, unknown>, preserveEnvelope = false): {
@@ -5028,6 +5007,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
                           codexHome,
                           codexCommand: effectiveCodexCommand,
                           instructionWorkingCopyRoot: runtimeContext?.instructions.workingCopy?.rootPath,
+                          disableProjectInstructions: this.options.disableCodexProjectInstructions,
                           readOnlyRoots: [
                             ...trustedRuntimeReadOnlyRoots(
                               this.options.environment,
@@ -5523,6 +5503,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
             codexHome,
             codexCommand: typeof recordedCommand === "string" ? recordedCommand : this.options.codexCommand,
             instructionWorkingCopyRoot: runtimeContext?.instructions.workingCopy?.rootPath,
+            disableProjectInstructions: this.options.disableCodexProjectInstructions,
             readOnlyRoots: [
               ...trustedRuntimeReadOnlyRoots(this.options.environment),
               ...(runtimeContext
@@ -7210,7 +7191,8 @@ export async function probeNativeRunnerEnvironment(options: {
     sourceCodexHome: sourceCodexHome ?? "",
     stateDirectory: options.runtimeDirectory,
     environment,
-    externallySandboxed: false,
+    externallySandboxed: options.transportOptions?.externallySandboxed === true,
+    disableCodexProjectInstructions: true,
     closeGraceMs: 10_000,
     lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null },
   });

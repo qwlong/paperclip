@@ -18,12 +18,6 @@ Agent access: [companion](../agent-access-map/instance-operations.md).
 - `diagnostics`: use doctor/health output to distinguish readiness from a listening port.
 - `backup`: create and inspect backups and verify restore only into a separate disposable target.
 
-Routine HTTP monitoring may use `GET /api/liveness` (or `HEAD`). It returns only
-process startup status and the public build commit without SQL or authentication.
-It remains reachable during an idle drain. Use `/api/health` for explicit database
-readiness, signed bootstrap, and authorized diagnostics; liveness does not
-establish database health or claim a workspace.
-
 ## How to get to it (user POV)
 
 ### `operator-cli`
@@ -43,6 +37,12 @@ Preconditions: follow the [baseline](./README.md#before-driving-a-journey). Use 
 Automated: [doctor](../../cli/src/__tests__/doctor.test.ts), [update command](../../cli/src/__tests__/update-command.test.ts), and [service manager](../../cli/src/__tests__/service-manager.test.ts) cover command contracts.
 
 Manual: Inspect the selected installation/channel and configuration, start the isolated instance, confirm health and browser access, then stop that instance. For update changes, use the dry-run/check path first and verify installed version and rollback state on an owned disposable installation.
+
+Routine HTTP monitoring may use `GET /api/liveness` (or `HEAD`). It returns only
+process startup status and the public build commit without SQL or authentication.
+It remains reachable during an idle drain. Use `/api/health` for explicit database
+readiness, signed bootstrap, and authorized diagnostics; liveness does not
+establish database health or claim a workspace.
 
 ### `settings-backup`
 

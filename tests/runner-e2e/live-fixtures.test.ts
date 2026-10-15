@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { RunnerApi } from "./api.js";
 import { buildRuntimeUsage } from "./billing.js";
 import { runnerMatrix } from "./catalog.js";
-import { setupLiveFixtures, selectFixtureRuntimeLeases } from "./live-fixtures.js";
+import { setupLiveFixtures, selectFixtureRuntimeLeases, fixtureRuntimeCostCoverage } from "./live-fixtures.js";
 
 describe("live runner fixtures", () => {
   it.each(["runner-codex", "runner-acpx-claude", "runner-opencode"].flatMap(profile =>
@@ -396,5 +396,33 @@ describe("live runner fixtures", () => {
       calls.indexOf("POST /api/companies/company-1/environments"),
     ).toBeLessThan(calls.indexOf("POST /api/companies/company-1/projects"));
     await fixtures.teardown();
+  });
+});
+
+describe("owned browser setup lease accounting", () => {
+  it("includes both exact setup IDs and task runs while excluding unrelated leases", () => {
+    const leases = [{ id: "platform", provider: "daytona" }, { id: "adapter", provider: "daytona" },
+      { id: "task", provider: "daytona", heartbeatRunId: "run" }, { id: "unrelated", provider: "daytona" }];
+    expect(selectFixtureRuntimeLeases({ leases, runIds: ["run"], setupLeaseIds: ["platform", "adapter"] }).map(lease => lease.id)).toEqual(["platform", "adapter", "task"]);
+    expect(selectFixtureRuntimeLeases({ leases, runIds: [], setupLeaseIds: ["platform"] }).map(lease => lease.id)).toEqual(["platform"]);
+    expect(selectFixtureRuntimeLeases({ leases, runIds: [], setupLeaseIds: [] })).toEqual([]);
+  });
+});
+
+describe("managed setup runtime cost coverage", () => {
+  it("prices both exact setup windows with task usage and keeps missing attribution unknown", () => {
+    const leases = ["platform", "adapter", "task", "unrelated"].map((id, index) => ({ id, provider: "daytona", heartbeatRunId: id === "task" ? "run" : null,
+      acquiredAt: "2026-10-13T00:00:00Z", releasedAt: `2026-10-13T00:00:0${index + 1}Z`, metadata: { cpu: 4, memory: 4, disk: 10 } }));
+    const selected = selectFixtureRuntimeLeases({ leases, runIds: ["run"], setupLeaseIds: ["platform", "adapter"] });
+    const usage = buildRuntimeUsage({ environmentId: "daytona", runs: [], leases: selected });
+    expect(usage.leaseCount).toBe(3);
+    expect(usage.leaseDurationMs).toBe(6000);
+    expect(usage.estimatedListCostUsd).toBeGreaterThan(0);
+    expect(fixtureRuntimeCostCoverage(usage, {})).toEqual(usage);
+    const incomplete = fixtureRuntimeCostCoverage(usage, { setupLeaseAccountingIncomplete: true });
+    expect(incomplete.costStatus).toBe("unavailable");
+    expect(incomplete.costSource).toBe("provider_cost_unavailable");
+    expect(incomplete).not.toHaveProperty("estimatedListCostUsd");
+    expect(incomplete.leaseCount).toBe(3);
   });
 });
