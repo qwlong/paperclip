@@ -2859,7 +2859,7 @@ export async function canActorReadApproval(db: Db | DbTransaction, actor: Author
     .limit(1).then(rows => rows.length > 0);
 }
 
-export async function canActorReadExecutionWorkspace(db: Db, actor: AuthorizationActor, id: string) {
+export async function canActorReadExecutionWorkspace(db: Db | DbTransaction, actor: AuthorizationActor, id: string) {
   return db.select({ id: executionWorkspaces.id }).from(executionWorkspaces)
     .where(and(eq(executionWorkspaces.id, id), await executionWorkspaceReadSqlCondition(db, actor)))
     .limit(1).then(rows => rows.length > 0);
