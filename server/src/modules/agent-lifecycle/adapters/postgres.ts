@@ -10,6 +10,32 @@ export function assertRootDatabase(db: Db) {
   if ("nestedIndex" in db) throw new AgentLifecycleConflict("Lifecycle commands require the root database connection");
 }
 
+type AgentRow = typeof agents.$inferSelect;
+const reconcileSkippedStates = ["pending_approval", "terminating", "cleaning_up", "terminated", "rejected"];
+
+async function policyHolds(db: Db, effects: LifecycleEffects, agent: AgentRow) {
+  const [company] = await db.select().from(companies).where(eq(companies.id, agent.companyId));
+  const policies = await db.select().from(budgetPolicies).where(and(eq(budgetPolicies.companyId, agent.companyId),
+    eq(budgetPolicies.scopeType, "agent"), eq(budgetPolicies.scopeId, agent.id)));
+  let budgetBlocked = false;
+  for (const policy of policies) if (await effects.policyBlocks(db, policy)) budgetBlocked = true;
+  const holds = agent.lifecycleHolds.filter(hold => hold !== "budget" && hold !== "company_archived" && hold !== "company_paused");
+  if (budgetBlocked) holds.push("budget");
+  if (company.status === "archived") holds.push("company_archived");
+  if (company.status === "paused") holds.push("company_paused");
+  return holds;
+}
+
+function reconciledState(agent: AgentRow, holds: string[]) {
+  return holds.length && !["pausing", "paused"].includes(agent.lifecycleState) ? "pausing" as const
+    : !holds.length && agent.lifecycleState === "paused" ? "resuming" as const : agent.lifecycleState;
+}
+
+function reconcileChanges(agent: AgentRow, holds: string[]) {
+  return reconciledState(agent, holds) !== agent.lifecycleState
+    || JSON.stringify(holds) !== JSON.stringify(agent.lifecycleHolds) || agent.pauseReason !== (holds[0] ?? null);
+}
+
 export function createLifecycleStore(db: Db, effects: LifecycleEffects): LifecycleStore {
   const get = (id: string) => db.select().from(agents).where(eq(agents.id, id)).then(rows => rows[0] ?? null);
   return {
@@ -17,6 +43,10 @@ export function createLifecycleStore(db: Db, effects: LifecycleEffects): Lifecyc
     async change(id, command, options = {}) {
       const existing = await get(id);
       if (!existing) return null;
+      // Reconcile runs after every budget check; one that changes nothing must
+      // not queue behind the company accounting lock. A change re-reads under it.
+      if (command === "reconcile" && options.version === undefined && (reconcileSkippedStates.includes(existing.lifecycleState)
+        || !reconcileChanges(existing, await policyHolds(db, effects, existing)))) return existing;
       return effects.transaction(db, existing.companyId, async tx => {
         const [agent] = await tx.select().from(agents).where(eq(agents.id, id)).for("update", command === "reconcile" ? { skipLocked: true } : undefined);
         if (!agent) return null;
@@ -36,22 +66,13 @@ export function createLifecycleStore(db: Db, effects: LifecycleEffects): Lifecyc
         let holds = agent.lifecycleHolds;
         const reason = options.reason ?? "manual";
         if (command === "reconcile") {
-          if (["pending_approval", "terminating", "cleaning_up", "terminated", "rejected"].includes(agent.lifecycleState)) return agent;
-          const [company] = await tx.select().from(companies).where(eq(companies.id, agent.companyId));
-          const policies = await tx.select().from(budgetPolicies).where(and(eq(budgetPolicies.companyId, agent.companyId),
-            eq(budgetPolicies.scopeType, "agent"), eq(budgetPolicies.scopeId, id)));
-          let budgetBlocked = false;
-          for (const policy of policies) if (await effects.policyBlocks(tx, policy)) budgetBlocked = true;
-          holds = holds.filter(hold => hold !== "budget" && hold !== "company_archived" && hold !== "company_paused");
-          if (budgetBlocked) holds.push("budget");
-          if (company.status === "archived") holds.push("company_archived");
-          if (company.status === "paused") holds.push("company_paused");
+          if (reconcileSkippedStates.includes(agent.lifecycleState)) return agent;
+          holds = await policyHolds(tx, effects, agent);
         }
         if (command === "pause") holds = [...new Set([...holds, reason])];
         if (command === "resume") holds = holds.filter(hold => reason === "user" ? ["budget", "company_archived", "company_paused"].includes(hold) : hold !== reason);
         let next = command === "reconcile"
-          ? holds.length && !["pausing", "paused"].includes(agent.lifecycleState) ? "pausing" as const
-            : !holds.length && agent.lifecycleState === "paused" ? "resuming" as const : agent.lifecycleState
+          ? reconciledState(agent, holds)
           : command === "resume" && (holds.length || agent.lifecycleState === "pausing") ? agent.lifecycleState
           : transition(agent.lifecycleState, command, agent.lifecycleOperation?.resumeState);
         if (command === "complete" && next === "ready" && holds.length) next = "pausing";

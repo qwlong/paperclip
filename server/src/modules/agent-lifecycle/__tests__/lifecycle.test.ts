@@ -537,13 +537,72 @@ const support = await getEmbeddedPostgresTestSupport();
     expect((await current(agent.id)).lifecycleState).toBe("ready");
   });
 
+  describe("policy reconcile takes the company lock only to change something", () => {
+    function countingStore() {
+      const effects = createAgentLifecycleEffects();
+      const counter = { transactions: 0 };
+      const transaction = effects.transaction;
+      effects.transaction = ((...args: Parameters<typeof transaction>) => { counter.transactions++; return transaction(...args); }) as typeof transaction;
+      return { store: createStore(db, effects), counter };
+    }
+
+    it.each([
+      ["ready with no holds", async () => { const work = worker(); const agent = await hire(); await work.process(agent.id); return agent.id; }],
+      ["paused by hand", async () => {
+        const work = worker(); const agent = await hire(); await work.process(agent.id);
+        await createAgentLifecycle(db).pauseAgent(agent.id); await work.process(agent.id); return agent.id;
+      }],
+      ["paused by company status", async () => {
+        const work = worker(); const agent = await hire(); await work.process(agent.id);
+        await db.update(companies).set({ status: "paused" }).where(eq(companies.id, companyId));
+        await createAgentLifecycle(db).reconcilePolicyHolds(companyId); await work.process(agent.id); return agent.id;
+      }],
+    ])("leaves an agent %s untouched without a transaction", async (_label, arrange) => {
+      const id = await arrange();
+      const before = await current(id);
+      const { store, counter } = countingStore();
+
+      expect(await store.change(id, "reconcile")).toMatchObject({ id, lifecycleState: before.lifecycleState });
+      expect(counter.transactions).toBe(0);
+      expect(await current(id)).toEqual(before);
+    });
+
+    it("still applies a hold that policy now requires", async () => {
+      const work = worker(); const agent = await hire(); await work.process(agent.id);
+      await db.update(companies).set({ status: "archived" }).where(eq(companies.id, companyId));
+      const { store, counter } = countingStore();
+
+      await store.change(agent.id, "reconcile");
+
+      expect(counter.transactions).toBe(1);
+      expect(await current(agent.id)).toMatchObject({ lifecycleState: "pausing", lifecycleHolds: ["company_archived"] });
+    });
+
+    it("still releases a hold that policy no longer requires", async () => {
+      const work = worker(); const agent = await hire(); await work.process(agent.id);
+      await db.update(companies).set({ status: "paused" }).where(eq(companies.id, companyId));
+      await createAgentLifecycle(db).reconcilePolicyHolds(companyId); await work.process(agent.id);
+      expect((await current(agent.id)).lifecycleState).toBe("paused");
+      await db.update(companies).set({ status: "active" }).where(eq(companies.id, companyId));
+      const { store, counter } = countingStore();
+
+      await store.change(agent.id, "reconcile");
+
+      expect(counter.transactions).toBe(1);
+      expect(await current(agent.id)).toMatchObject({ lifecycleState: "resuming", lifecycleHolds: [] });
+    });
+  });
+
   it("defers automatic policy changes while a task holds the agent lock", async () => {
     const agent = await hire("paused");
+    await db.update(companies).set({ status: "archived" }).where(eq(companies.id, companyId));
     await db.transaction(async tx => {
       await tx.select().from(agents).where(eq(agents.id, agent.id)).for("update");
       expect(await createLifecycleStore(db).change(agent.id, "reconcile")).toBeNull();
     });
+    expect((await current(agent.id)).lifecycleHolds).not.toContain("company_archived");
     expect(await createLifecycleStore(db).change(agent.id, "reconcile")).not.toBeNull();
+    expect((await current(agent.id)).lifecycleHolds).toContain("company_archived");
   });
 
   it("retains the failed phase and the same operation for retry", async () => {
