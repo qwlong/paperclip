@@ -4,6 +4,7 @@ import { deleteCompany } from "../../../services/company-deletion.js";
 import { agentLifecycleCompanyDeletion } from "../company-deletion.js";
 import { requireServerAdapter } from "../../../adapters/index.js";
 import { agentExecutionsHaveStopped } from "../../../services/agent-execution-stop.js";
+import { legacyControllerBootId } from "../../../services/legacy-controller-lease.js";
 import { remoteTerminationReceipt } from "../../../services/remote-execution-termination.js";
 import { approvalService } from "../../../services/approvals.js";
 import { updateAgentConfigurationInTransaction } from "../../../services/agent-configuration-transaction.js";
@@ -16,7 +17,7 @@ import { errorHandler } from "../../../middleware/error-handler.js";
 import { createLifecycleDriver } from "../../../services/agent-lifecycle-driver.js";
 import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
-import { agents, approvals, projects, issues, heartbeatRuns, nativeRunFinalizations, budgetPolicies, environmentLeases, agentApiKeys, activityLog, agentConfigRevisions, userCompanyPreferences, companies, companyMemberships, principalPermissionGrants, plugins, pluginCompanySettings, createDb, type Db } from "@paperclipai/db";
+import { agents, approvals, projects, issues, heartbeatRuns, heartbeatRunEvents, nativeRunFinalizations, budgetPolicies, environmentLeases, agentApiKeys, activityLog, agentConfigRevisions, userCompanyPreferences, companies, companyMemberships, principalPermissionGrants, plugins, pluginCompanySettings, createDb, type Db } from "@paperclipai/db";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../../__tests__/helpers/embedded-postgres.js";
 import { createAgentLifecycle, configureAgentLifecycle } from "../../../services/agent-lifecycle.js";
@@ -208,6 +209,45 @@ const support = await getEmbeddedPostgresTestSupport();
       status: "cancelled", invocationSource: "on_demand", runtimeMode: "legacy", executionStage: "preparing",
       startedAt: new Date(), finishedAt: new Date(), errorCode: "adapter_failed",
       resultJson: { stopReason: "cancelled", executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } });
+    const work = worker(createLifecycleDriver(db, {} as never).runHost);
+    await createAgentLifecycle(db).pauseAgent(agent.id);
+    await work.process(agent.id);
+    expect((await current(agent.id)).lifecycleState).toBe("paused");
+  });
+
+  const otherBoot = randomUUID();
+  const conversationClaim = { adapterDispatch: { adapterType: "claude_local" } };
+  it.each([
+    ["was still preparing when a previous boot stopped", { executionStage: "preparing", controllerBootId: otherBoot }, false, true],
+    ["settled before runtime selection", { executionStage: "settled", controllerBootId: legacyControllerBootId }, false, true],
+    ["is still preparing under this boot", { executionStage: "preparing", controllerBootId: legacyControllerBootId }, false, false],
+    ["is preparing without a controller claim", { executionStage: "preparing", controllerBootId: null }, false, false],
+    ["reached dispatch under a previous boot", { executionStage: "dispatching", controllerBootId: otherBoot, runtimeModeResolvedAt: new Date() }, false, false],
+    ["reached dispatch before runtime selection was recorded", { executionStage: "dispatching", controllerBootId: otherBoot }, false, false],
+    ["was declined by the dispatch gate", { executionStage: "dispatching", controllerBootId: otherBoot, runtimeModeResolvedAt: new Date(), errorCode: "legacy_disposition_repair_suppressed" }, false, true],
+    ["was declined by the dispatch gate but recorded an adapter invocation", { executionStage: "dispatching", controllerBootId: otherBoot, runtimeModeResolvedAt: new Date(), errorCode: "legacy_disposition_repair_suppressed" }, true, false],
+    ["settled after runtime selection", { executionStage: "settled", controllerBootId: legacyControllerBootId, runtimeModeResolvedAt: new Date() }, false, false],
+    ["settled before runtime selection but recorded an adapter invocation", { executionStage: "settled", controllerBootId: legacyControllerBootId }, true, false],
+    ["still holds its controller lease", { executionStage: "preparing", controllerBootId: otherBoot, controllerLeaseExpiresAt: new Date(Date.now() + 60_000) }, false, false],
+  ] as const)("treats a processless cancelled conversation run as stopped only when it never reached dispatch: %s", async (_, fields, invoked, stopped) => {
+    const agent = await hire();
+    const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id,
+      status: "cancelled", invocationSource: "on_demand", runtimeMode: "legacy", runnerProfileJson: conversationClaim,
+      startedAt: new Date(), finishedAt: new Date(), resultJson: { stopReason: "cancelled" }, ...fields }).returning();
+    if (invoked) await db.insert(heartbeatRunEvents).values({ companyId, runId: run.id, agentId: agent.id, seq: 1,
+      eventType: "adapter.invoke", stream: "system", level: "info", message: "adapter invocation", payload: { adapterType: "claude_local" } });
+    expect(await agentExecutionsHaveStopped(db, [agent.id])).toBe(stopped);
+  });
+
+  it("finishes pausing an agent whose conversation runs were cancelled before dispatch", async () => {
+    const agent = await hire();
+    for (const fields of [{ executionStage: "preparing", controllerBootId: otherBoot }, { executionStage: "settled", controllerBootId: legacyControllerBootId }]) {
+      await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id,
+        status: "cancelled", invocationSource: "automation", runtimeMode: "legacy", runnerProfileJson: conversationClaim,
+        startedAt: new Date(), finishedAt: new Date(), errorCode: "agent_not_invokable",
+        resultJson: { stopReason: "cancelled", startupCancellation: { requestedAt: new Date().toISOString(), beforeNativeSelection: false } },
+        ...fields });
+    }
     const work = worker(createLifecycleDriver(db, {} as never).runHost);
     await createAgentLifecycle(db).pauseAgent(agent.id);
     await work.process(agent.id);

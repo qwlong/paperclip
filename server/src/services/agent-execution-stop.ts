@@ -2,7 +2,8 @@ import { readProcessStartedAt } from "./hot-restart.js";
 import { runUsedConversationAdapter } from "./conversation-continuation.js";
 import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { environmentLeases, heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
-import { hasNativeLocalProcessStop } from "./native-local-process-stop.js";
+import { hasNativeLocalProcessStop, hasRecordedExecution } from "./native-local-process-stop.js";
+import { DISPATCH_DECLINED_FOR_REPAIR_CODE, legacyControllerBootId } from "./legacy-controller-lease.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { isCancelledNativeStartup } from "./cancelled-native-startup.js";
 
@@ -11,6 +12,19 @@ import { isCancelledNativeStartup } from "./cancelled-native-startup.js";
 function provesNoProviderWork(run: typeof heartbeatRuns.$inferSelect) {
   const recovery = run.resultJson?.executionRecovery as Record<string, unknown> | undefined;
   return recovery?.kind === "bootstrap" && recovery.providerWorkStarted === false;
+}
+
+/** The controller persists "dispatching" in the lease renewal that admits the
+ * adapter, and runtime selection precedes that admission. A run that stayed
+ * "preparing" under a boot that is gone, that settled before runtime selection,
+ * or that the dispatch gate declined, never reached its adapter. */
+async function neverReachedDispatch(db: Db, run: typeof heartbeatRuns.$inferSelect) {
+  if (run.executionStage === "preparing") {
+    return Boolean(run.controllerBootId && run.controllerBootId !== legacyControllerBootId);
+  }
+  const declined = run.executionStage === "settled" && !run.runtimeModeResolvedAt
+    || run.errorCode === DISPATCH_DECLINED_FOR_REPAIR_CODE;
+  return declined && !await hasRecordedExecution(db, run);
 }
 
 /** Cancellation changes admission. Process and lease evidence controls cleanup. */
@@ -64,6 +78,7 @@ export async function agentExecutionsHaveStopped(db: Db, agentIds: string[]) {
     if (run.runtimeMode === "legacy" && !run.processPid && !run.processGroupId &&
         (run.resultJson?.executionCancellation as Record<string, unknown> | undefined)?.state !== "acknowledged" &&
         !provesNoProviderWork(run) &&
+        !await neverReachedDispatch(db, run) &&
         !(run.executionStage === "settled" && !await runUsedConversationAdapter(db, run)) &&
         !await isCancelledNativeStartup(db, run, coordinators.find(row => row.runId === run.id))) return false;
   }

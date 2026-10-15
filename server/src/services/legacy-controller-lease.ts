@@ -14,6 +14,9 @@ type Run = typeof heartbeatRuns.$inferSelect;
  * continuation is retryable rather than an opaque `setup_failed`. */
 export const CONTROLLER_LEASE_LOST_FAILURE_CODE = "controller_lease_lost";
 
+/** The dispatch gate cancels with this code instead of entering the adapter. */
+export const DISPATCH_DECLINED_FOR_REPAIR_CODE = "legacy_disposition_repair_suppressed";
+
 /** Abort reason for a lost lease, so completion can attribute the stop. */
 export class LegacyControllerLeaseLostError extends Error {
   constructor(
