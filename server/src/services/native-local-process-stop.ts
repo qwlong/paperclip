@@ -1,10 +1,22 @@
-import { and, desc, eq, inArray, isNull } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, isNull, or } from "drizzle-orm";
 import { environmentLeases, heartbeatRunEvents, heartbeatRuns, type Db } from "@paperclipai/db";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 
 export const PROCESS_START_REQUESTED = "native.process_start_requested";
 export const PROCESS_IDENTITY_RECORDED = "native.process_identity_recorded";
 const LOCAL_PROCESS_STOPPED = "native.local_process_stopped";
+
+/** Any event that an adapter, harness or provider records once execution begins. */
+export async function hasRecordedExecution(db: Db, run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId">) {
+  const [execution] = await db.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(
+    eq(heartbeatRunEvents.companyId, run.companyId), eq(heartbeatRunEvents.runId, run.id),
+    or(isNotNull(heartbeatRunEvents.sourceEventId),
+      inArray(heartbeatRunEvents.eventType, ["adapter.invoke", PROCESS_START_REQUESTED, PROCESS_IDENTITY_RECORDED,
+        "harness.ready", "session.started", "session.resumed", "session.updated", "turn.started",
+        "provider.event", "provider.rpc_result", "tool.execution.started"])),
+  )).limit(1);
+  return Boolean(execution);
+}
 
 function absent(pid: number): boolean {
   try {

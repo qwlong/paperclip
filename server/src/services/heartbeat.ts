@@ -242,6 +242,7 @@ import {
 } from "./native-local-process-stop.js";
 
 import {
+  DISPATCH_DECLINED_FOR_REPAIR_CODE,
   legacyControllerBootId,
   watchLegacyControllerLease,
 } from "./legacy-controller-lease.js";
@@ -2805,7 +2806,7 @@ export function heartbeatService(
         const repairBlock = await recovery.legacyRepairDispatchBlock(run.id);
         if (repairBlock) {
           const cancelled = await setRunStatusIfRunning(run.id, "cancelled", {
-            finishedAt: new Date(), errorCode: "legacy_disposition_repair_suppressed",
+            finishedAt: new Date(), errorCode: DISPATCH_DECLINED_FOR_REPAIR_CODE,
             error: `Disposition repair suppressed: ${repairBlock}`,
           });
           if (cancelled.updated) {
