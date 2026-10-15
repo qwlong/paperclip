@@ -178,6 +178,47 @@ describe("getServerInfoSnapshot", () => {
     resetServerInfoCacheForTests();
   });
 
+  describe("in a built server", () => {
+    const BUILT = "0123456789abcdef0123456789abcdef01234567";
+    let gitCalls: string[];
+    const recording = (name: string, output: string) => async () => {
+      gitCalls.push(name);
+      return output;
+    };
+    const snapshotAt = (now: number) =>
+      getServerInfoSnapshot({
+        now,
+        buildCommitCommand: () => BUILT,
+        gitCommand: recording("log", [`${"f".repeat(40)}`, "fffffff", "Checkout moved on", "2026-06-25T17:00:00-07:00"].join("\n")),
+        gitStatusCommand: recording("status", ""),
+        gitBranchCommand: recording("branch", "main\n"),
+      });
+
+    beforeEach(() => {
+      gitCalls = [];
+    });
+
+    it.each([0, 2_999, 3_000, 60_000, 86_400_000])("reports the built commit at t=%i ms without running git", async (now) => {
+      await snapshotAt(0);
+      const snapshot = await snapshotAt(now);
+
+      expect(snapshot.git).toMatchObject({ available: true, fullSha: BUILT, shortSha: BUILT.slice(0, 7) });
+      expect(gitCalls).toEqual([]);
+    });
+
+    it("still reads git when the server runs from source", async () => {
+      await getServerInfoSnapshot({
+        now: 0,
+        buildCommitCommand: () => null,
+        gitCommand: recording("log", [BUILT, BUILT.slice(0, 7), "Source", "2026-06-25T17:00:00-07:00"].join("\n")),
+        gitStatusCommand: recording("status", ""),
+        gitBranchCommand: recording("branch", "main\n"),
+      });
+
+      expect(gitCalls.sort()).toEqual(["branch", "log", "status"]);
+    });
+  });
+
   it("re-reads the running commit after the cache TTL expires", async () => {
     const first = await getServerInfoSnapshot({
       now: 0,
