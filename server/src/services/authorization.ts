@@ -2813,6 +2813,10 @@ export function authorizationService(db: Db | DbTransaction, options: { rowMemo?
   };
 }
 
+// The retain_workspace_privacy_sources trigger keys retained sources by issues.id::text.
+// Matching on the uuid lets the lookup use the primary key; a key in any other form matches nothing.
+const retainedSourceIssueId = sql`(case when source.id ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' then source.id::uuid end)`;
+
 /** A workspace can contain several tasks. Reading files/operations requires
  * access to every task bound to it, not just the task that originally made it. */
 export async function executionWorkspaceReadSqlCondition(db: Db | DbTransaction, actor: AuthorizationActor): Promise<SQL<boolean>> {
@@ -2823,7 +2827,7 @@ export async function executionWorkspaceReadSqlCondition(db: Db | DbTransaction,
       select 1 from ${projects} where ${projects.id} = ${executionWorkspaces.projectId}
         and ${projects.companyId} = ${executionWorkspaces.companyId} and ${projectCondition}))
     and not exists (select 1 from jsonb_object_keys(coalesce(${executionWorkspaces.metadata}->'_issuePrivacySources', '{}'::jsonb)) source(id)
-      where not exists (select 1 from ${issues} where ${issues.id}::text = source.id
+      where not exists (select 1 from ${issues} where ${issues.id} = ${retainedSourceIssueId}
         and ${issues.companyId} = ${executionWorkspaces.companyId} and ${issueCondition}))
     and not exists (select 1 from ${issues}
       where ${issues.companyId} = ${executionWorkspaces.companyId}
