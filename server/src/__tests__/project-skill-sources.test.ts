@@ -189,6 +189,68 @@ describe.skipIf(!support.supported)('automatic project skill sources', () => {
     await db.update(projectSkillSources).set({ active: false, lastError: null });
   });
 
+  describe('deferred admission while another writer holds the company row', () => {
+    // Resolves "blocked" once any session waits on the holder's lock, so the
+    // verdict does not depend on how fast the machine is.
+    async function withCompanyLocked<T>(lockedCompanyId: string, check: () => Promise<T>) {
+      let release!: () => void, locked!: (pid: number) => void;
+      const held = new Promise<void>(resolve => { release = resolve; });
+      const ready = new Promise<number>(resolve => { locked = resolve; });
+      const holder = db.transaction(async tx => {
+        await tx.select({ id: companies.id }).from(companies).where(eq(companies.id, lockedCompanyId)).for('no key update');
+        const [{ pid }] = await tx.execute<{ pid: number }>(sql`select pg_backend_pid() as pid`);
+        locked(pid);
+        await held;
+      });
+      const holderPid = await ready;
+      let settled = false;
+      const result = check().finally(() => { settled = true; });
+      const blocked = (async () => {
+        while (!settled) {
+          const [{ waiting }] = await db.execute<{ waiting: number }>(
+            sql`select count(*)::int as waiting from pg_stat_activity where ${holderPid} = any(pg_blocking_pids(pid))`);
+          if (waiting > 0) return 'blocked' as const;
+          await new Promise(resolve => setTimeout(resolve, 20));
+        }
+        return result;
+      })();
+      try {
+        return await Promise.race([result, blocked]);
+      } finally {
+        release();
+        await holder;
+        await result.catch(() => undefined);
+      }
+    }
+
+    it('returns without the lock when nothing is waiting for capacity', async () => {
+      const idleCompanyId = randomUUID();
+      await db.insert(companies).values({ id: idleCompanyId, name: 'Idle skill queue', issuePrefix: 'IDL' });
+      const [project] = await db.insert(projects).values({ companyId: idleCompanyId, name: 'Idle' }).returning();
+      const [row] = await db.insert(projectWorkspaces).values({ companyId: idleCompanyId, projectId: project!.id, name: 'Repository',
+        repoUrl: 'https://github.com/acme/skills', defaultRef: 'idle-active' }).returning();
+      // An active import alone is not deferred work.
+      await db.insert(projectSkillSources).values({ companyId: idleCompanyId, projectId: project!.id, workspaceId: row!.id,
+        repositoryUrl: row!.repoUrl!, trackingRef: row!.defaultRef!, active: true });
+
+      expect(await withCompanyLocked(idleCompanyId, () => admitDeferredSkillImports(db, idleCompanyId, new Date()))).toBeUndefined();
+    });
+
+    it('takes the lock and admits work waiting for capacity', async () => {
+      const busyCompanyId = randomUUID();
+      await db.insert(companies).values({ id: busyCompanyId, name: 'Waiting skill queue', issuePrefix: 'WTQ' });
+      const [project] = await db.insert(projects).values({ companyId: busyCompanyId, name: 'Waiting' }).returning();
+      const [row] = await db.insert(projectWorkspaces).values({ companyId: busyCompanyId, projectId: project!.id, name: 'Repository',
+        repoUrl: 'https://github.com/acme/skills', defaultRef: 'waiting-capacity' }).returning();
+      const [waiting] = await db.insert(projectSkillSources).values({ companyId: busyCompanyId, projectId: project!.id, workspaceId: row!.id,
+        repositoryUrl: row!.repoUrl!, trackingRef: row!.defaultRef!, active: false, lastError: SKILL_IMPORT_CAPACITY_WAIT }).returning();
+
+      expect(await withCompanyLocked(busyCompanyId, () => admitDeferredSkillImports(db, busyCompanyId, new Date()))).toBe('blocked');
+      const [saved] = await db.select().from(projectSkillSources).where(eq(projectSkillSources.id, waiting!.id));
+      expect(saved).toMatchObject({ active: true, lastError: null });
+    });
+  });
+
   it('adoption waits for the company queue before taking repository binding locks', async () => {
     const row = await workspace('adoption-lock-order');
     const binding = await enqueueProjectSkillSource(db, row);
