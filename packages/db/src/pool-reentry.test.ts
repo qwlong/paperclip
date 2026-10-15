@@ -29,6 +29,18 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(reports[0]!.stack).toContain("pool-reentry.test.ts");
   });
 
+  it("names the code that opened the transaction holding the first connection", async () => {
+    async function openLedgerTransaction() {
+      return db.transaction(async () => { await queryFromElsewhere(); });
+    }
+    async function queryFromElsewhere() {
+      await db.execute(sql`select 1`);
+    }
+    expect(await recorded(openLedgerTransaction)).toBe(1);
+    expect(reports[0]!.openedAt).toContain("openLedgerTransaction");
+    expect(reports[0]!.stack).toContain("queryFromElsewhere");
+  });
+
   it("reports root-pool queries from inside a nested savepoint", async () => {
     expect(await recorded(() => db.transaction(tx => tx.transaction(async () => {
       await db.execute(sql`select 1`);
