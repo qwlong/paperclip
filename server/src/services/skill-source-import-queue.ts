@@ -13,8 +13,19 @@ export async function lockSkillImportQueue(db: Db, companyId: string) {
     .limit(MAX_COMPANY_PENDING_SKILL_IMPORTS);
 }
 
-/** Deferred provenance stays durable; free slots admit it without user ceremony. */
+function waitingForCapacity(companyId: string) {
+  return and(eq(projectSkillSources.companyId, companyId), eq(projectSkillSources.active, false),
+    isNull(projectSkillSources.sourceId), eq(projectSkillSources.status, 'pending'),
+    eq(projectSkillSources.lastError, SKILL_IMPORT_CAPACITY_WAIT));
+}
+
+/** Deferred provenance stays durable; free slots admit it without user ceremony.
+ * The periodic sweep calls this for every company, so an empty queue must not
+ * take the company lock; the locked pass re-reads what it admits. */
 export async function admitDeferredSkillImports(db: Db, companyId: string, now: Date) {
+  const [anyWaiting] = await db.select({ id: projectSkillSources.id }).from(projectSkillSources)
+    .where(waitingForCapacity(companyId)).limit(1);
+  if (!anyWaiting) return;
   return db.transaction(async tx => {
     const pending = await lockSkillImportQueue(tx as unknown as Db, companyId);
     let count = pending.length;
@@ -24,9 +35,7 @@ export async function admitDeferredSkillImports(db: Db, companyId: string, now: 
     const fullProjects = [...perProject].filter(([, count]) => count >= MAX_PROJECT_PENDING_SKILL_IMPORTS).map(([id]) => id);
     const waiting = await tx.select({ id: projectSkillSources.id, projectId: projectSkillSources.projectId })
       .from(projectSkillSources).innerJoin(projectWorkspaces, eq(projectWorkspaces.id, projectSkillSources.workspaceId))
-      .where(and(eq(projectSkillSources.companyId, companyId), eq(projectSkillSources.active, false),
-        isNull(projectSkillSources.sourceId), eq(projectSkillSources.status, 'pending'),
-        eq(projectSkillSources.lastError, SKILL_IMPORT_CAPACITY_WAIT),
+      .where(and(waitingForCapacity(companyId),
         ...(fullProjects.length ? [notInArray(projectSkillSources.projectId, fullProjects)] : [])))
       .orderBy(asc(projectSkillSources.createdAt)).limit(MAX_COMPANY_PENDING_SKILL_IMPORTS);
     for (const row of waiting) {
