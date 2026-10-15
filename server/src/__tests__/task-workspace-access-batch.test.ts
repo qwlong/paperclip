@@ -5,7 +5,7 @@ import { createDb, executionWorkspaces, heartbeatRuns, issues, projects, type Db
 import { assertExecutionWorkspaceRootReadAccess, executionWorkspaceRepositoryService } from "../services/execution-workspace-repositories.js";
 import { assertTaskWorkspaceAccess, assertTaskWorkspaceSourceProjectAccess, assertTaskWorkspacesAccess } from "../services/task-workspace-source-access.js";
 import { accessService } from "../services/access.js";
-import { executionWorkspaceReadSqlCondition, type AuthorizationActor } from "../services/authorization.js";
+import { authorizationService, executionWorkspaceReadSqlCondition, type AuthorizationActor } from "../services/authorization.js";
 import { forbidden } from "../errors.js";
 import { getEmbeddedPostgresTestSupport } from "./helpers/embedded-postgres.js";
 import { createRepositoryTrustFixture } from "./helpers/repository-trust-fixture.js";
@@ -114,7 +114,7 @@ const support = await getEmbeddedPostgresTestSupport();
   beforeAll(async () => { ({ db } = await context.setup()); }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
   afterEach(() => { vi.clearAllMocks(); });
   afterAll(context.cleanup);
-  const { fixture, standardPeer, privateTask } = context;
+  const { fixture, standardPeer, privateTask, grantPeer } = context;
 
   async function addPeers(f: Awaited<ReturnType<typeof fixture>>, count: number, shared: { projectId?: string; sourceIssueId?: string } = {}) {
     const ids: string[] = [];
@@ -165,6 +165,56 @@ const support = await getEmbeddedPostgresTestSupport();
     await accessService(counted.db).decide({ actor: f.actor, action: "issue:read", resource: { type: "issue", companyId: f.companyId, issueId: probe.id } });
     expect(await outcome(assertTaskWorkspacesAccess(db, f.actor, f.companyId, [])), "premise: an empty list is allowed").toBe("allowed");
     expect((large - small) / 8).toBeLessThan(counted.statements());
+  });
+
+  it("issues a fixed number of statements however many tasks share the root", async () => {
+    const f = await fixture();
+    const ids = await addPeers(f, 2);
+    await assertTaskWorkspacesAccess(db, f.actor, f.companyId, ids);
+    const few = countingDb(db);
+    await assertTaskWorkspacesAccess(few.db, f.actor, f.companyId, ids);
+    ids.push(...await addPeers(f, 10));
+    const many = countingDb(db);
+    await assertTaskWorkspacesAccess(many.db, f.actor, f.companyId, ids);
+    const [probe] = await db.insert(issues).values({ companyId: f.companyId, title: "Probe", assigneeAgentId: f.agentId }).returning();
+    const single = countingDb(db);
+    await accessService(single.db).decide({ actor: f.actor, action: "issue:read", resource: { type: "issue", companyId: f.companyId, issueId: probe.id } });
+    expect(single.statements(), "premise: deciding one task read issues statements").toBeGreaterThan(0);
+    expect(many.statements()).toBe(few.statements());
+  });
+
+  it.each([
+    ["the private task's sponsor", "owner"],
+    ["another sponsor without a grant", "peer"],
+    ["another sponsor with a grant", "granted"],
+  ] as const)("decides task reads for %s the same with issues prefetched", async (_label, who) => {
+    const f = await fixture();
+    const peer = await standardPeer(f);
+    await privateTask(f);
+    if (who === "granted") await grantPeer(f, peer);
+    const actor = who === "owner" ? f.actor : peer.actor;
+    const issueIds = [f.issueId, peer.issueId, randomUUID()];
+    const plain = authorizationService(db);
+    const reference = [];
+    for (const issueId of issueIds) reference.push(await plain.decide({ actor, action: "issue:read", resource: { type: "issue", companyId: f.companyId, issueId } }));
+    if (who === "peer") expect(reference[0]!.allowed, "premise: a sponsor without a grant cannot read the private task").toBe(false);
+    else expect(reference[0]!.allowed, "premise: the private task is readable").toBe(true);
+    const prefetched = authorizationService(db, { rowMemo: new Map() });
+    await prefetched.prefetchIssues(actor, f.companyId, issueIds);
+    const decisions = [];
+    for (const issueId of issueIds) decisions.push(await prefetched.decide({ actor, action: "issue:read", resource: { type: "issue", companyId: f.companyId, issueId } }));
+    expect(decisions.map(d => [d.allowed, d.reason])).toEqual(reference.map(d => [d.allowed, d.reason]));
+  });
+
+  it("does not answer one actor's private task read from another actor's prefetch", async () => {
+    const f = await fixture();
+    const peer = await standardPeer(f);
+    await privateTask(f);
+    const shared = authorizationService(db, { rowMemo: new Map() });
+    await shared.prefetchIssues(f.actor, f.companyId, [f.issueId]);
+    const read = { action: "issue:read", resource: { type: "issue", companyId: f.companyId, issueId: f.issueId } } as const;
+    expect((await shared.decide({ actor: f.actor, ...read })).allowed, "premise: the sponsor reads the private task").toBe(true);
+    expect((await shared.decide({ actor: peer.actor, ...read })).allowed).toBe(false);
   });
 
   it("checks each workspace once when the same list repeats", async () => {

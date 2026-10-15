@@ -67,6 +67,7 @@ export async function assertTaskWorkspacesAccess(
       ? inArray(sql<string>`${issues.id}::text`, allRetained) : undefined),
   ));
   const authorization = authorizationService(db, { rowMemo: new Map() });
+  await authorization.prefetchIssues(actor, companyId, linkedIssues.map(issue => issue.id));
   const decisions = new Map<string, ReturnType<typeof authorization.decide>>();
   const decide = (input: Omit<Parameters<typeof authorization.decide>[0], "actor">) => {
     const key = JSON.stringify(input);

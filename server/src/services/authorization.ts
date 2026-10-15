@@ -735,6 +735,9 @@ type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
  */
 export type AuthorizationRowMemo = Map<string, Promise<unknown>>;
 
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const PREFETCH_CHUNK_SIZE = 500;
+
 export function authorizationService(db: Db | DbTransaction, options: { rowMemo?: AuthorizationRowMemo } = {}) {
   function remember<T>(key: string, load: () => Promise<T>): Promise<T> {
     const memo = options.rowMemo;
@@ -960,24 +963,68 @@ export function authorizationService(db: Db | DbTransaction, options: { rowMemo?
       .then((rows) => rows[0] ?? null));
   }
 
+  const issueAuthorizationColumns = {
+    id: issues.id,
+    companyId: issues.companyId,
+    projectId: issues.projectId,
+    parentId: issues.parentId,
+    assigneeAgentId: issues.assigneeAgentId,
+    assigneeUserId: issues.assigneeUserId,
+    checkoutRunId: issues.checkoutRunId,
+    status: issues.status,
+    executionPolicy: issues.executionPolicy,
+    originKind: issues.originKind,
+    originId: issues.originId,
+  };
+  const issuePrivacyColumns = {
+    id: issues.id,
+    companyId: issues.companyId,
+    visibility: issues.visibility,
+    privacyRootIssueId: issues.privacyRootIssueId,
+    responsibleUserId: issues.responsibleUserId,
+    createdByUserId: issues.createdByUserId,
+    assigneeUserId: issues.assigneeUserId,
+    assigneeAgentId: issues.assigneeAgentId,
+    projectId: issues.projectId,
+  };
+  const issueKey = (issueId: string) => `issue:${issueId}`;
+  const issuePrivacyRowKey = (companyId: string, issueId: string) => `issue-privacy-row:${companyId}:${issueId}`;
+  const issuePrivacyReadKey = (actor: AuthorizationActor, companyId: string, issueId: string) =>
+    `issue-privacy-read:${JSON.stringify(actor)}:${companyId}:${issueId}`;
+
   async function loadIssue(issueId: string): Promise<IssueAuthorizationRow | null> {
-    return db
-      .select({
-        id: issues.id,
-        companyId: issues.companyId,
-        projectId: issues.projectId,
-        parentId: issues.parentId,
-        assigneeAgentId: issues.assigneeAgentId,
-        assigneeUserId: issues.assigneeUserId,
-        checkoutRunId: issues.checkoutRunId,
-        status: issues.status,
-        executionPolicy: issues.executionPolicy,
-        originKind: issues.originKind,
-        originId: issues.originId,
-      })
+    return remember(issueKey(issueId), () => db
+      .select(issueAuthorizationColumns)
       .from(issues)
       .where(eq(issues.id, issueId))
-      .then((rows) => rows[0] ?? null);
+      .then((rows) => rows[0] ?? null));
+  }
+
+  /**
+   * Seeds the memo with every row an `issue:read` decision reads for these
+   * tasks, in a few statements instead of a few per task. Without a memo it
+   * does nothing, and every later decision reads exactly what it would have.
+   */
+  async function prefetchIssues(actor: AuthorizationActor, companyId: string, issueIds: Iterable<string>) {
+    const memo = options.rowMemo;
+    if (!memo) return;
+    const ids = [...new Set(issueIds)].filter((id) => UUID_PATTERN.test(id) && !memo.has(issueKey(id)));
+    for (let start = 0; start < ids.length; start += PREFETCH_CHUNK_SIZE) {
+      const chunk = ids.slice(start, start + PREFETCH_CHUNK_SIZE);
+      const authorizationRows = await db.select(issueAuthorizationColumns).from(issues).where(inArray(issues.id, chunk));
+      const privacyRows = await db.select(issuePrivacyColumns).from(issues)
+        .where(and(inArray(issues.id, chunk), eq(issues.companyId, companyId)));
+      const readable = await db.select({ id: issues.id }).from(issues)
+        .where(and(inArray(issues.id, chunk), eq(issues.companyId, companyId), issuePrivacyCondition(actor)));
+      const authorizationById = new Map(authorizationRows.map((row) => [row.id, row]));
+      const privacyById = new Map(privacyRows.map((row) => [row.id, row]));
+      const readableIds = new Set(readable.map((row) => row.id));
+      for (const id of chunk) {
+        memo.set(issueKey(id), Promise.resolve(authorizationById.get(id) ?? null));
+        memo.set(issuePrivacyRowKey(companyId, id), Promise.resolve(privacyById.get(id) ?? null));
+        memo.set(issuePrivacyReadKey(actor, companyId, id), Promise.resolve(readableIds.has(id)));
+      }
+    }
   }
 
   async function loadRunPolicy(runId: string | null | undefined, companyId: string, agentId: string) {
@@ -2711,22 +2758,14 @@ export function authorizationService(db: Db | DbTransaction, options: { rowMemo?
       || issuePrivacyMode() === "off"
     ) return intersectedDecision;
 
-    const issue = await db
-      .select({
-        id: issues.id,
-        companyId: issues.companyId,
-        visibility: issues.visibility,
-        privacyRootIssueId: issues.privacyRootIssueId,
-        responsibleUserId: issues.responsibleUserId,
-        createdByUserId: issues.createdByUserId,
-        assigneeUserId: issues.assigneeUserId,
-        assigneeAgentId: issues.assigneeAgentId,
-        projectId: issues.projectId,
-      })
+    const { companyId, issueId } = input.resource;
+    const issue = await remember(issuePrivacyRowKey(companyId, issueId), () => db
+      .select(issuePrivacyColumns)
       .from(issues)
-      .where(and(eq(issues.id, input.resource.issueId), eq(issues.companyId, input.resource.companyId)))
-      .then((rows) => rows[0] ?? null);
-    if (!issue || await canActorReadIssuePrivacy(db, input.actor, issue)) return intersectedDecision;
+      .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)))
+      .then((rows) => rows[0] ?? null));
+    if (!issue || await remember(issuePrivacyReadKey(input.actor, issue.companyId, issue.id),
+      () => canActorReadIssuePrivacy(db, input.actor, issue))) return intersectedDecision;
 
     const denied = deny({
       action: input.action,
@@ -2768,6 +2807,7 @@ export function authorizationService(db: Db | DbTransaction, options: { rowMemo?
 
   return {
     decide,
+    prefetchIssues,
     projectDiscoveryCandidateIds,
     decidePrincipalGrant,
   };
