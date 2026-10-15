@@ -1,6 +1,7 @@
 import { and, desc, eq, inArray, isNotNull, isNull, or } from "drizzle-orm";
 import { environmentLeases, heartbeatRunEvents, heartbeatRuns, type Db } from "@paperclipai/db";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
+import { runProcessGroupAlive } from "./run-process-group.js";
 
 export const PROCESS_START_REQUESTED = "native.process_start_requested";
 export const PROCESS_IDENTITY_RECORDED = "native.process_identity_recorded";
@@ -42,7 +43,7 @@ export async function recordNativeLocalProcessStop(db: Db, run: typeof heartbeat
     ));
   if (leases.some(lease => lease.provider !== "local")) return false;
   if ((run.processPid && !absent(run.processPid)) ||
-      (run.processGroupId && !absent(-run.processGroupId))) return false;
+      await runProcessGroupAlive(run)) return false;
   await appendHeartbeatRunEvent(db, {
     companyId: run.companyId,
     runId: run.id,
