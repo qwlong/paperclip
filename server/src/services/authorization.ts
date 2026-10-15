@@ -728,7 +728,21 @@ export function authorizationDeniedDetails(decision: AuthorizationDecision) {
 
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 
-export function authorizationService(db: Db | DbTransaction) {
+/**
+ * Rows read while deciding, shared by every decision made through one service
+ * instance that is given the memo. Give it only to a service that lives for a
+ * single bounded check, never to a long-lived one.
+ */
+export type AuthorizationRowMemo = Map<string, Promise<unknown>>;
+
+export function authorizationService(db: Db | DbTransaction, options: { rowMemo?: AuthorizationRowMemo } = {}) {
+  function remember<T>(key: string, load: () => Promise<T>): Promise<T> {
+    const memo = options.rowMemo;
+    if (!memo) return load();
+    if (!memo.has(key)) memo.set(key, load());
+    return memo.get(key) as Promise<T>;
+  }
+
   async function isInstanceAdmin(userId: string | null | undefined): Promise<boolean> {
     if (!userId) return false;
     if (
@@ -748,7 +762,7 @@ export function authorizationService(db: Db | DbTransaction) {
     principalType: PrincipalType,
     principalId: string,
   ) {
-    return db
+    return remember(`membership:${companyId}:${principalType}:${principalId}`, () => db
       .select()
       .from(companyMemberships)
       .where(
@@ -759,7 +773,7 @@ export function authorizationService(db: Db | DbTransaction) {
           eq(companyMemberships.status, "active"),
         ),
       )
-      .then((rows) => rows[0] ?? null);
+      .then((rows) => rows[0] ?? null));
   }
 
   async function loadResponsibleUserSnapshot(companyId: string, userId: string): Promise<ResponsibleUserSnapshot> {
@@ -920,7 +934,7 @@ export function authorizationService(db: Db | DbTransaction) {
   }
 
   async function loadAgent(agentId: string): Promise<AgentAuthorizationRow | null> {
-    return db
+    return remember(`agent:${agentId}`, () => db
       .select({
         id: agents.id,
         companyId: agents.companyId,
@@ -931,11 +945,11 @@ export function authorizationService(db: Db | DbTransaction) {
       })
       .from(agents)
       .where(eq(agents.id, agentId))
-      .then((rows) => rows[0] ?? null);
+      .then((rows) => rows[0] ?? null));
   }
 
   async function loadProject(projectId: string): Promise<ProjectAuthorizationRow | null> {
-    return db
+    return remember(`project:${projectId}`, () => db
       .select({
         id: projects.id,
         companyId: projects.companyId,
@@ -943,7 +957,7 @@ export function authorizationService(db: Db | DbTransaction) {
       })
       .from(projects)
       .where(eq(projects.id, projectId))
-      .then((rows) => rows[0] ?? null);
+      .then((rows) => rows[0] ?? null));
   }
 
   async function loadIssue(issueId: string): Promise<IssueAuthorizationRow | null> {
@@ -968,7 +982,7 @@ export function authorizationService(db: Db | DbTransaction) {
 
   async function loadRunPolicy(runId: string | null | undefined, companyId: string, agentId: string) {
     if (!runId) return null;
-    const row = await db
+    const row = await remember(`run:${runId}`, () => db
       .select({
         id: heartbeatRuns.id,
         companyId: heartbeatRuns.companyId,
@@ -977,7 +991,7 @@ export function authorizationService(db: Db | DbTransaction) {
       })
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, runId))
-      .then((rows) => rows[0] ?? null);
+      .then((rows) => rows[0] ?? null));
     if (!row || row.companyId !== companyId || row.agentId !== agentId) return null;
     const context = isPlainRecord(row.contextSnapshot) ? row.contextSnapshot : null;
     return isPlainRecord(context?.executionPolicy)
