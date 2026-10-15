@@ -112,20 +112,23 @@ async function readGitInfo(
     if (!buildCommit) {
       return { available: false, unavailableReason: "git_unavailable" };
     }
-
-    return {
-      available: true,
-      fullSha: buildCommit,
-      shortSha: buildCommit.slice(0, 7),
-      branchName: null,
-      subject: "Source build",
-      committedAt: null,
-      localChanges: {
-        available: false,
-        unavailableReason: "git_status_unavailable",
-      },
-    };
+    return buildCommitGitInfo(buildCommit);
   }
+}
+
+function buildCommitGitInfo(buildCommit: string): ServerGitInfo {
+  return {
+    available: true,
+    fullSha: buildCommit,
+    shortSha: buildCommit.slice(0, 7),
+    branchName: null,
+    subject: "Source build",
+    committedAt: null,
+    localChanges: {
+      available: false,
+      unavailableReason: "git_status_unavailable",
+    },
+  };
 }
 
 export async function createServerInfoSnapshot(
@@ -148,15 +151,18 @@ export async function createServerInfoSnapshot(
   };
 }
 
-// processStartedAt is a true boot constant, but the running commit can change
-// without the Node process restarting: a managed dev-server restart re-runs the
-// code while keeping this module alive, so a commit captured once at boot goes
-// stale. Re-read git HEAD on demand, throttled by a short TTL so frequent health
-// polls don't spawn git on every request. Callers that arrive while a refresh
-// is running share it.
+// processStartedAt is a true boot constant. A built server runs the commit it
+// was built from until it restarts; its checkout can move on without changing
+// the running code, so its build stamp is the answer and git is never asked.
+// A server running from source can change commit without the Node process
+// restarting: a managed dev-server restart re-runs the code while keeping this
+// module alive, so a commit captured once at boot goes stale. Re-read git HEAD
+// on demand, throttled by a short TTL so frequent health polls don't spawn git
+// on every request. Callers that arrive while a refresh is running share it.
 const GIT_INFO_CACHE_TTL_MS = 3000;
 export const serverProcessStartedAt = new Date().toISOString();
 let gitInfoCache: { value: Promise<ServerGitInfo>; expiresAt: number; settled: boolean } | null = null;
+let builtGitInfo: ServerGitInfo | null | undefined;
 
 export async function getServerInfoSnapshot(
   opts: {
@@ -167,6 +173,12 @@ export async function getServerInfoSnapshot(
     buildCommitCommand?: BuildCommitCommand;
   } = {},
 ): Promise<ServerInfoSnapshot> {
+  if (builtGitInfo === undefined) {
+    const buildCommit = parseBuildCommit((opts.buildCommitCommand ?? readBuildCommit)());
+    builtGitInfo = buildCommit ? buildCommitGitInfo(buildCommit) : null;
+  }
+  if (builtGitInfo) return { processStartedAt: serverProcessStartedAt, git: builtGitInfo };
+
   const now = opts.now ?? Date.now();
   if (!gitInfoCache || (gitInfoCache.settled && now >= gitInfoCache.expiresAt)) {
     const entry = {
@@ -184,4 +196,5 @@ export async function getServerInfoSnapshot(
 
 export function resetServerInfoCacheForTests(): void {
   gitInfoCache = null;
+  builtGitInfo = undefined;
 }
