@@ -193,6 +193,8 @@ async function computeObservedSpends(db: Db, policies: SpendPolicy[]): Promise<O
     const pending = and(
       eq(heartbeatRuns.companyId, policy.companyId), eq(heartbeatRuns.costAccountingPending, true),
       inArray(heartbeatRuns.status, ["succeeded", "failed", "timed_out", "cancelled", "interrupted"]),
+      // Included subscription usage settles at $0 (run-cost-accounting), so it is never budget debt.
+      sql`${heartbeatRuns.usageJson}->>'billingType' is distinct from 'subscription_included'`,
       policy.scopeType === "agent" ? eq(heartbeatRuns.agentId, policy.scopeId) : undefined,
       policy.scopeType === "project" ? sql`${heartbeatRuns.usageJson}->'ledgerScope'->>'projectId' = ${policy.scopeId}` : undefined,
       policy.windowKind === "calendar_month_utc" ? sql`coalesce(${heartbeatRuns.finishedAt}, ${heartbeatRuns.createdAt}) >= ${start.toISOString()}::timestamptz
