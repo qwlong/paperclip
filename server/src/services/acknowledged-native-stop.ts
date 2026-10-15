@@ -2,6 +2,7 @@ import { and, eq } from "drizzle-orm";
 import { environmentLeases, heartbeatRuns, type Db } from "@paperclipai/db";
 import { hasNativeLocalProcessStop } from "./native-local-process-stop.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
+import { runProcessGroupAlive } from "./run-process-group.js";
 
 /** A server-recorded run-only Stop must not manufacture a recovery incident. */
 function hasAcknowledgedNativeRunStopReceipt(run: {
@@ -50,5 +51,5 @@ export async function acknowledgedNativeStopExecutionHasStopped(db: Db, run: typ
     try { process.kill(pid, 0); return false; }
     catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; }
   };
-  return (!run.processPid || absent(run.processPid)) && (!run.processGroupId || absent(-run.processGroupId));
+  return (!run.processPid || absent(run.processPid)) && !await runProcessGroupAlive(run);
 }

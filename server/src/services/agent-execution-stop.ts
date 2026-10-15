@@ -5,6 +5,7 @@ import { environmentLeases, heartbeatRuns, nativeRunFinalizations, type Db } fro
 import { hasNativeLocalProcessStop, hasRecordedExecution } from "./native-local-process-stop.js";
 import { DISPATCH_DECLINED_FOR_REPAIR_CODE, legacyControllerBootId } from "./legacy-controller-lease.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
+import { runProcessGroupAlive } from "./run-process-group.js";
 import { isCancelledNativeStartup } from "./cancelled-native-startup.js";
 
 /** Recorded only after the adapter returned, setup failed, or a queued run was
@@ -60,7 +61,7 @@ export async function agentExecutionsHaveStopped(db: Db, agentIds: string[]) {
       continue;
     }
     let processAlive = Boolean(run.processPid && !absent(run.processPid));
-    let groupAlive = Boolean(run.processGroupId && !absent(-run.processGroupId));
+    let groupAlive = await runProcessGroupAlive(run);
     if (processAlive && run.processStartedAt) {
       const observed = await readProcessStartedAt(run.processPid!).catch(() => null);
       if (observed && new Date(observed).getTime() !== run.processStartedAt.getTime()) {

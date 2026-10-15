@@ -10,6 +10,7 @@ import { approvalService } from "../../../services/approvals.js";
 import { updateAgentConfigurationInTransaction } from "../../../services/agent-configuration-transaction.js";
 import { agentService as agentConfiguration } from "../../../services/agents.js";
 import { readFileSync } from "node:fs";
+import { spawn } from "node:child_process";
 import express from "express";
 import request from "supertest";
 import { agentRoutes } from "../../../routes/agents.js";
@@ -238,6 +239,23 @@ const support = await getEmbeddedPostgresTestSupport();
     if (invoked) await db.insert(heartbeatRunEvents).values({ companyId, runId: run.id, agentId: agent.id, seq: 1,
       eventType: "adapter.invoke", stream: "system", level: "info", message: "adapter invocation", payload: { adapterType: "claude_local" } });
     expect(await agentExecutionsHaveStopped(db, [agent.id])).toBe(stopped);
+  });
+
+  it.skipIf(process.platform === "win32").each([
+    ["a process group it still owns", 0, false],
+    ["a group ID the OS reissued to a program started an hour after the run ended", -3_600_000, true],
+  ] as const)("judges a finished run's live process group by its members' start times: %s", async (_, finishedOffset, stopped) => {
+    const agent = await hire();
+    const child = spawn("sleep", ["60"], { detached: true, stdio: "ignore" });
+    await new Promise(resolve => child.once("spawn", resolve));
+    try {
+      await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id, status: "failed", invocationSource: "on_demand",
+        runtimeMode: "legacy", processGroupId: child.pid!, startedAt: new Date(Date.now() + finishedOffset - 60_000),
+        finishedAt: new Date(Date.now() + finishedOffset) });
+      expect(await agentExecutionsHaveStopped(db, [agent.id])).toBe(stopped);
+    } finally {
+      process.kill(-child.pid!, "SIGKILL");
+    }
   });
 
   it("finishes pausing an agent whose conversation runs were cancelled before dispatch", async () => {
