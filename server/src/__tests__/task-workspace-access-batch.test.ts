@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import fs from "node:fs/promises";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { and, eq, getTableName, inArray, isTable, or, sql } from "drizzle-orm";
 import { createDb, executionWorkspaces, heartbeatRuns, issues, projects, type Db, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
@@ -215,6 +216,23 @@ const support = await getEmbeddedPostgresTestSupport();
     const read = { action: "issue:read", resource: { type: "issue", companyId: f.companyId, issueId: f.issueId } } as const;
     expect((await shared.decide({ actor: f.actor, ...read })).allowed, "premise: the sponsor reads the private task").toBe(true);
     expect((await shared.decide({ actor: peer.actor, ...read })).allowed).toBe(false);
+  });
+
+  it("resolves each distinct workspace directory once however many workspaces share it", async () => {
+    const f = await fixture();
+    await addPeers(f, 2);
+    const realpaths = async () => {
+      const spy = vi.spyOn(fs, "realpath");
+      try {
+        await assertExecutionWorkspaceRootReadAccess(db, { companyId: f.companyId, cwd: f.admission.cwd, actor: f.actor });
+        return spy.mock.calls.length;
+      } finally { spy.mockRestore(); }
+    };
+    const few = await realpaths();
+    await addPeers(f, 10);
+    const many = await realpaths();
+    expect(few, "premise: resolving the root reads real paths").toBeGreaterThan(0);
+    expect(many).toBe(few);
   });
 
   it("checks each workspace once when the same list repeats", async () => {

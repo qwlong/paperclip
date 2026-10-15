@@ -91,12 +91,17 @@ async function resolveRepositoryRootSources(tx: Db | DbTransaction, input: {
   if (input.sourceWorkspaceId) { sourceIds.add(input.sourceWorkspaceId); sharedSourceIds.add(input.sourceWorkspaceId); addSharedSource(input.sourceWorkspaceId, canonicalCwd); }
   const workspaces = await tx.select({ id: executionWorkspaces.id, cwd: executionWorkspaces.cwd }).from(executionWorkspaces)
     .where(eq(executionWorkspaces.companyId, input.companyId));
-  for (const workspace of workspaces) {
-    if (!workspace.cwd) continue;
-    const peerRoot = await canonicalRepositoryRoot(workspace.cwd).catch((error: NodeJS.ErrnoException) => {
+  const peerRoots = new Map<string, Promise<string | null>>();
+  const peerRootOf = (cwd: string) => {
+    if (!peerRoots.has(cwd)) peerRoots.set(cwd, canonicalRepositoryRoot(cwd).catch((error: NodeJS.ErrnoException) => {
       if (["ENOTDIR", "EACCES", "EPERM", "ELOOP", "ENAMETOOLONG"].includes(error.code ?? "")) return null;
       throw error;
-    });
+    }));
+    return peerRoots.get(cwd)!;
+  };
+  for (const workspace of workspaces) {
+    if (!workspace.cwd) continue;
+    const peerRoot = await peerRootOf(workspace.cwd);
     if (peerRoot && repositoryRootsOverlap(peerRoot, canonicalCwd)) {
       sourceIds.add(workspace.id); sharedSourceIds.add(workspace.id); addSharedSource(workspace.id, peerRoot);
     }
