@@ -998,6 +998,15 @@ export async function deliverBudgetEnforcement(db: Db, hooks: BudgetServiceHooks
   }
 }
 
+async function hasScopePolicy(db: Db, companyId: string, agentId: string | null, projectId: string | null) {
+  const scopes = [and(eq(budgetPolicies.scopeType, "company"), eq(budgetPolicies.scopeId, companyId))];
+  if (agentId) scopes.push(and(eq(budgetPolicies.scopeType, "agent"), eq(budgetPolicies.scopeId, agentId)));
+  if (projectId) scopes.push(and(eq(budgetPolicies.scopeType, "project"), eq(budgetPolicies.scopeId, projectId)));
+  const [row] = await db.select({ id: budgetPolicies.id }).from(budgetPolicies)
+    .where(and(eq(budgetPolicies.companyId, companyId), or(...scopes))).limit(1);
+  return Boolean(row);
+}
+
 export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
   const reads = budgetServiceInTransaction(db);
   async function mutate<T>(companyId: string, work: (service: ReturnType<typeof budgetServiceInTransaction>) => Promise<T>, agentId?: string | null) {
@@ -1026,8 +1035,16 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
       mutate(companyId, (service) => service.upsertPolicy(companyId, input, actorUserId)),
     evaluateCostEvent: (event: typeof costEvents.$inferSelect) =>
       mutate(event.companyId, (service) => service.evaluateCostEvent(event)),
-    getInvocationBlock: (companyId: string, agentId: string | null, context?: { issueId?: string | null; projectId?: string | null }) =>
-      mutate(companyId, (service) => service.getInvocationBlock(companyId, agentId, context), agentId),
+    getInvocationBlock: async (companyId: string, agentId: string | null, context?: { issueId?: string | null; projectId?: string | null }) => {
+      // With no policy on any scope, admission only reads pause state and writes
+      // nothing, so it must not queue behind the company accounting lock.
+      if (await hasScopePolicy(db, companyId, agentId, context?.projectId ?? null)) {
+        return mutate(companyId, (service) => service.getInvocationBlock(companyId, agentId, context), agentId);
+      }
+      const block = await reads.getInvocationBlock(companyId, agentId, context);
+      await deliverBudgetEnforcement(db, hooks, companyId, agentId);
+      return block;
+    },
     resolveIncident: (companyId: string, incidentId: string, input: BudgetIncidentResolutionInput, actorUserId: string) =>
       mutate(companyId, (service) => service.resolveIncident(companyId, incidentId, input, actorUserId)),
   };
