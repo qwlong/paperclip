@@ -50,4 +50,5 @@ export const grokBotDispatches = pgTable("grok_bot_dispatches", {
 }, t => [
   uniqueIndex("grok_dispatch_event_uq").on(t.bindingId, t.bindingGeneration, t.routineRevision, t.sourceEventId),
   index("grok_dispatch_company_status_idx").on(t.companyId, t.status),
+  index("grok_dispatch_assignment_kind_idx").on(t.assignmentId, t.kind),
 ]);

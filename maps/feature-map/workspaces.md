@@ -90,6 +90,12 @@ SSH keeps its explicit remote provision-command path; these checks
 do not claim a new sandbox provision transport.
 Low-trust closed-worktree reopening, including a board-comment reopen of a projectless task, must also suppress both kinds of host provision script. Returned checkpoints must reject file, symlink or missing parents before host writes, even if a nested file is marked unchanged. The retained host file and recovery evidence must survive rejection. These are automated safety contracts, not new live runtime acceptance.
 
+An unchanged returned snapshot skips the host scan after acquiring the writer lock
+and checking authority. Concurrent host edits remain untouched; changed files,
+modes, symlinks and deletions still take the conflict path. The
+[unchanged restore regression](../../packages/adapter-utils/src/workspace-restore-unchanged.test.ts)
+checks both hooks under the lock. This is source-level coverage, not a cloud latency result.
+
 For a child created by an admitted agent with an explicit existing workspace, verify that a matching sandbox boundary permits creation before the child has an ID. A changed child policy, unrelated parent, or forged creator run must fail. See the [child workspace trust regression](../../server/src/__tests__/task-workspace-child-trust.test.ts). This automated contract does not add live acceptance evidence.
 
 ### `workspace-management`
@@ -107,6 +113,16 @@ Manual: Provision a disposable workspace, wait for readiness, start an available
 
 - A link or running badge does not prove the service is reachable from the user’s browser.
 - Workspace IDs, runtime leases, and repository paths are not interchangeable.
+- Terminal workspace cleanup wakes after committed task/workspace/PR changes and
+  restores cooldown deadlines at startup. Empty lanes stop scanning. Display Git
+  results can lag by thirty seconds. Compatible records share one advisory Git
+  inspection per bounded page, while each record keeps its own delivery check.
+  Destructive cleanup starts a separate Git scan even if an older scan is running.
+  The [worker tests](../../server/src/__tests__/terminal-workspace-work.test.ts)
+  cover quiet lanes and deadlines. The
+  [service tests](../../server/src/__tests__/execution-workspaces-service.test.ts)
+  cover real PostgreSQL signals and retained worktrees. These tests do not
+  qualify an external wake alarm or a live provider deployment.
 - Organizational project, source project, task files, personal `AGENT_HOME`, and
   provider home have separate meanings. Private source ownership remains attached
   to copied files after source configuration changes or workspace closure.

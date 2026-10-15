@@ -111,7 +111,7 @@ async function fetchVerifiedRun(
   candidateRunId: string | null | undefined,
   agentId: string,
   issueId: string,
-): Promise<{ id: string; status: string } | null> {
+): Promise<{ id: string; status: string; errorCode: string | null } | null> {
   if (!candidateRunId) return null;
   const runRes = await board.get(`${BASE_URL}/api/heartbeat-runs/${candidateRunId}`);
   if (!runRes.ok()) return null;
@@ -119,7 +119,9 @@ async function fetchVerifiedRun(
   const context = candidateRun.contextSnapshot ?? {};
   if (candidateRun.agentId !== agentId) return null;
   if (context.issueId !== issueId && context.taskId !== issueId) return null;
-  return { id: candidateRunId, status: candidateRun.status };
+  const errorCode = typeof candidateRun.errorCode === "string" && /^[a-z][a-z0-9_.-]{0,79}$/i.test(candidateRun.errorCode)
+    ? candidateRun.errorCode : null;
+  return { id: candidateRunId, status: candidateRun.status, errorCode };
 }
 
 /**
@@ -289,7 +291,7 @@ async function waitForFixtureRun(
     status = run!.status;
     if (status === "succeeded") return true;
     if (status === "cancelled" && allowCancelledLock) return false;
-    expect(["queued", "running"], `Fixture run ${runId} ended as ${status}`).toContain(status);
+    expect(["queued", "running"], `Fixture run ${runId} ended as ${status} (errorCode=${run!.errorCode ?? "unavailable"})`).toContain(status);
     await new Promise((resolve) => setTimeout(resolve, WAKEUP_POLL_INTERVAL_MS));
   } while (Date.now() < deadline);
   throw new Error(`Fixture run ${runId} did not succeed within ${waitBudgetMs}ms (last status: ${status})`);

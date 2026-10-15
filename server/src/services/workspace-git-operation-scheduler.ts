@@ -65,15 +65,7 @@ export interface WorkspaceGitScanInput {
    */
   fairnessKeys?: readonly string[];
   signal?: AbortSignal;
-  /** Successful-result cache duration. Use zero for correctness-sensitive guards. */
   cacheTtlMs?: number;
-  /**
-   * Never coalesce this read onto an already in-flight scan. A correctness-
-   * sensitive caller (the archive/close decision) can observe a Git change
-   * after the in-flight scan captured its status; joining it would accept a
-   * stale clean result. The bypassed read still obeys concurrency and fairness
-   * scheduling, it just runs as its own scan.
-   */
   bypassSingleFlight?: boolean;
   /** Per-operation wall-clock deadline. Defaults to the process-wide setting. */
   timeoutMs?: number;
@@ -162,7 +154,6 @@ interface PendingScan {
   maxStdoutBytes: number;
   maxStderrBytes: number;
   cacheTtlMs: number;
-  bypassSingleFlight: boolean;
   enqueuedAt: number;
   state: "queued" | "running";
   controller: AbortController;
@@ -306,9 +297,6 @@ export class WorkspaceGitOperationScheduler {
   private cacheBytes = 0;
   private activeCount = 0;
   private serviceSequence = 0;
-  // Distinguishes bypassed scans that share a content key, so a fresh read is
-  // never mistaken for (or joins) an in-flight scan that may be stale.
-  private bypassSequence = 0;
   private readonly totals = {
     started: 0,
     succeeded: 0,
@@ -376,19 +364,13 @@ export class WorkspaceGitOperationScheduler {
       maxStdoutBytes,
       maxStderrBytes,
     });
-    // A bypassed read gets its own single-flight identity, so it can neither
-    // consume a cached entry nor join an in-flight scan that may predate a
-    // change the caller just observed.
-    const bypassSingleFlight = input.bypassSingleFlight === true;
-    const singleFlightKey = bypassSingleFlight
-      ? `${key}#fresh:${this.bypassSequence++}`
-      : key;
-    const cacheTtlMs = input.onStdout
+    const inFlightKey = input.bypassSingleFlight ? `${key}#fresh:${randomUUID()}` : key;
+    const cacheTtlMs = input.onStdout || input.bypassSingleFlight
       ? 0
       : clampInteger(input.cacheTtlMs, this.defaultCacheTtlMs, 0, 60_000);
     // A correctness-sensitive caller that explicitly disables caching must not
     // consume a result populated earlier by the file browser.
-    const cached = cacheTtlMs > 0 && !bypassSingleFlight ? this.readCache(key) : null;
+    const cached = cacheTtlMs > 0 ? this.readCache(key) : null;
     if (cached) {
       this.totals.cacheHits += 1;
       logger.debug({
@@ -411,7 +393,7 @@ export class WorkspaceGitOperationScheduler {
       };
     }
 
-    const existing = this.inFlight.get(singleFlightKey);
+    const existing = this.inFlight.get(inFlightKey);
     if (existing) {
       existing.joinCount += 1;
       this.totals.singleFlightJoins += 1;
@@ -446,7 +428,7 @@ export class WorkspaceGitOperationScheduler {
       ...(input.fairnessKeys ?? []).filter(Boolean),
     ])).sort();
     const scan: PendingScan = {
-      key: singleFlightKey,
+      key: inFlightKey,
       operation: input.operation,
       canonicalWorkspacePath,
       workspaceHash,
@@ -458,14 +440,13 @@ export class WorkspaceGitOperationScheduler {
       maxStdoutBytes,
       maxStderrBytes,
       cacheTtlMs,
-      bypassSingleFlight,
       enqueuedAt: this.now(),
       state: "queued",
       controller: new AbortController(),
       waiters: new Map(),
       joinCount: 0,
     };
-    this.inFlight.set(singleFlightKey, scan);
+    this.inFlight.set(inFlightKey, scan);
     this.queue.push(scan);
     const promise = this.addWaiter(scan, input.signal, false);
     this.drain();
@@ -601,9 +582,7 @@ export class WorkspaceGitOperationScheduler {
     startedAt: number,
   ): void {
     this.totals.succeeded += 1;
-    if (scan.cacheTtlMs > 0 && !scan.bypassSingleFlight) {
-      this.writeCache(scan.key, scan, result);
-    }
+    if (scan.cacheTtlMs > 0) this.writeCache(scan.key, scan, result);
     const responseBase = {
       stdout: result.stdout,
       stderr: result.stderr,

@@ -231,7 +231,7 @@ export function skillSourceSyncService(db: Db, options: { context?: (setup: Setu
         const linked = await tx.update(projectSkillSources).set({ sourceId, status: 'ready', lastError: null, failureCount: 0, leaseToken: null, leaseExpiresAt: null })
           .where(and(eq(projectSkillSources.id, binding.id), eq(projectSkillSources.companyId, binding.companyId),
             eq(projectSkillSources.active, true), eq(projectSkillSources.leaseToken, token))).returning({ id: projectSkillSources.id });
-        if (linked.length) await settleInitialSkillWork(tx as unknown as Db, binding.companyId, scan.packageMode === 'skills' ? {} : scan);
+        if (linked.length) await settleInitialSkillWork(tx as unknown as Db, binding.companyId, scan.packageMode === 'skills' || scan.repositorySubset ? {} : scan);
         return linked.length > 0;
       });
     } catch (error) {

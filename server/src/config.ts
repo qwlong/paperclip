@@ -80,6 +80,7 @@ export interface Config {
   databaseBackupRetentionDays: number;
   databaseBackupDir: string;
   workspaceReaperCooldownDays: number;
+  workspaceCompactionDelayHours: number | null;
   serveUi: boolean;
   uiDevMiddleware: boolean;
   secretsProvider: SecretProvider;
@@ -281,8 +282,10 @@ export function loadConfig(): Config {
   // becomes terminal before it archives the workspace. A person can reopen the
   // work inside this window. A value of 0 disables the cooldown and restores
   // immediate reaping. A negative or non-numeric value falls back to the
-  // default. The day granularity and the default of 7 obey the
-  // PAPERCLIP_DB_BACKUP_RETENTION_DAYS precedent above.
+  // default. The day granularity obeys the PAPERCLIP_DB_BACKUP_RETENTION_DAYS
+  // precedent above. The default is 1 day: regenerable files are compacted
+  // after a few hours anyway, so a longer hold only keeps source checkouts of
+  // delivered work, and a recurring task produces one workspace per run.
   const workspaceReaperCooldownDaysEnv =
     process.env.PAPERCLIP_WORKSPACE_REAPER_COOLDOWN_DAYS?.trim();
   const workspaceReaperCooldownDaysRaw = Number(workspaceReaperCooldownDaysEnv);
@@ -291,7 +294,25 @@ export function loadConfig(): Config {
       && Number.isFinite(workspaceReaperCooldownDaysRaw)
       && workspaceReaperCooldownDaysRaw >= 0
       ? workspaceReaperCooldownDaysRaw
-      : 7;
+      : 1;
+  // The terminal-workspace reaper removes regenerable files (installed
+  // dependencies, build output, tool caches) from a terminal workspace this
+  // many hours after its issue tree becomes terminal. The worktree and every
+  // source file stay; a resumed task regenerates the files when its workspace
+  // is provisioned again. 0 compacts on the next sweep. A negative, empty, or
+  // non-numeric value falls back to the default of 1 hour.
+  // PAPERCLIP_WORKSPACE_COMPACTION_ENABLED=false turns compaction off.
+  const workspaceCompactionDelayHoursEnv =
+    process.env.PAPERCLIP_WORKSPACE_COMPACTION_DELAY_HOURS?.trim();
+  const workspaceCompactionDelayHoursRaw = Number(workspaceCompactionDelayHoursEnv);
+  const workspaceCompactionDelayHours =
+    process.env.PAPERCLIP_WORKSPACE_COMPACTION_ENABLED?.trim().toLowerCase() === "false"
+      ? null
+      : workspaceCompactionDelayHoursEnv
+          && Number.isFinite(workspaceCompactionDelayHoursRaw)
+          && workspaceCompactionDelayHoursRaw >= 0
+        ? workspaceCompactionDelayHoursRaw
+        : 1;
   const bindValidationErrors = validateConfiguredBindMode({
     deploymentMode,
     deploymentExposure,
@@ -338,6 +359,7 @@ export function loadConfig(): Config {
     databaseBackupRetentionDays,
     databaseBackupDir,
     workspaceReaperCooldownDays,
+    workspaceCompactionDelayHours,
     serveUi:
       process.env.SERVE_UI !== undefined
         ? process.env.SERVE_UI === "true"

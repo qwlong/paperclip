@@ -466,6 +466,9 @@ describe.skipIf(!support.supported)('automatic project skill sources', () => {
       await expect(companySkillService(db).createLocalSkill(companyId, { name: 'Unsafe publication', forkedFromSkillId: skillId, sharingScope: 'public_link' })).rejects.toThrow(/public link/);
     });
     await withSkillActor(actor('bob'), async () => {
+      const branchRead = vi.fn(context.read(null));
+      await expect(skillSourceService(db).branches(companyId, source.id, {}, { ...context, read: () => branchRead })).rejects.toThrow(/not found/);
+      expect(branchRead).not.toHaveBeenCalled();
       await expect(companySkillService(db).importFromSource(companyId, privateSnapshotPath)).rejects.toThrow(/not found/);
       expect(await companySkillService(db).getById(companyId, skillId)).toBeNull();
       expect(await companySkillService(db).readFile(companyId, skillId, 'SKILL.md')).toBeNull();
@@ -487,6 +490,9 @@ describe.skipIf(!support.supported)('automatic project skill sources', () => {
     });
     for (const denied of [agentActor(reader!.id, 'bob'), agentActor(outsider!.id, 'alice'), { ...agentActor(reader!.id, 'alice'), companyId: randomUUID() }]) {
       await withSkillActor(denied, async () => {
+        const branchRead = vi.fn(context.read(null));
+        await expect(skillSourceService(db).branches(companyId, source.id, {}, { ...context, read: () => branchRead })).rejects.toThrow(/not found/);
+        expect(branchRead).not.toHaveBeenCalled();
         expect(await companySkillService(db).readFile(companyId, skillId, 'SKILL.md')).toBeNull();
         expect((await companySkillService(db).listRuntimeSkillEntries(companyId)).some(entry => entry.key.includes('private'))).toBe(false);
       });
@@ -783,7 +789,7 @@ describe.skipIf(!support.supported)('automatic project skill sources', () => {
       return fixture;
     } };
     const result = await service.refresh(companyId, original.id, growing);
-    expect(result.source.packageMode).toBe('skills');
+    expect(result.source.packageMode).toBe('repository');
     expect(result.warnings.join(' ')).toContain('repository exceeds');
     expect(result.source.entries[0]!.skillId).toBe(skillId);
     expect(result.updated).toHaveLength(1);

@@ -70,6 +70,14 @@ cover durable ordering, authorization, steering acknowledgements, interrupt
 recovery, and concurrent dispatch. [Composer](../../ui/src/components/task-chat/TaskChatComposer.test.tsx)
 covers drafts and uncertain saves.
 
+[Task-detail delivery races](../../ui/src/pages/IssueDetail.test.tsx) cover a
+consumed message whose send response and queue snapshot arrive late. A started
+run's input receipt removes that message from pending, while a separate unsent
+message stays queued. Admission to a run that has not started is not delivery.
+A later retry of the same message remains visible in its new authoritative queue.
+Receipts retain the primary wake and coalesced source queue IDs. They clear a late
+snapshot even when its target names the preceding run or is null.
+
 ```sh
 pnpm exec vitest run ui/src/components/task-chat/TaskChatQueuedMessages.test.tsx server/src/__tests__/issue-queued-comments-routes.test.ts
 ```
@@ -82,6 +90,8 @@ fixture and opt-in prerequisites; skipped native cases are not native proof.
 
 Manual: queue three distinguishable messages. Edit one, reorder them, reload,
 and confirm the saved order. Discard one and confirm it never reaches execution.
+After a queued message enters a started run, confirm it leaves pending even if
+the send response arrives later. Reload and confirm it appears once in history.
 Steer one while busy and verify the agent receives that exact message once.
 Repeat with a rejected steer and a stale second-tab edit; the UI must preserve
 retryable content and explain the conflict. On a fresh run, interrupt with a

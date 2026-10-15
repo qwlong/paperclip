@@ -22,6 +22,13 @@ bounded timeout diagnostics. Missing, stale, or incorrect metadata cannot grant
 or retain ownership. PID reuse, PID namespaces, and wall-clock changes do not
 decide whether a writer owns the lock.
 
+An unchanged returned snapshot still acquires the target writer lock and runs
+both authorization/publication hooks. If every returned path, type, file hash,
+file mode and symlink target matches the baseline, there is no incoming delta.
+The merge then skips the host snapshot scan and leaves concurrent host edits
+untouched. Changed exports retain the full conflict preflight. Checkpoint and
+archive validation still run before the merge.
+
 **Never delete, replace, or move a `.lock.sqlite` file while an instance can
 write to it.** Its stable inode is part of the locking contract. Replacing it
 could let two writers lock different files for the same target. Files remain

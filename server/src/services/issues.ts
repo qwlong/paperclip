@@ -6,6 +6,7 @@ import { assertTaskWorkspaceAccess, assertTaskWorkspaceSourceProjectAccess } fro
 import { type TaskWorkspaceSelection, type TaskWorkspaceIntent } from "@paperclipai/shared";
 import { executionWorkspaceService } from "./execution-workspaces.js";
 import { notifyChatPublicationWork } from "./chat-work-notifications.js";
+import { notifyTerminalWorkspaceWork } from "./terminal-workspace-work.js";
 import { recordChatHandoff, recordChatCompletion, existingChatCompletionReply, acknowledgeChatCompletionReply } from "./chat-completion-delivery.js";
 import { mirrorSlackBoardComment, slackBoardReplyBindings } from "./slack-board-messages.js";
 import { assertAgentRunWriteAllowed } from "../agent-run-cancellation.js";
@@ -10484,6 +10485,10 @@ export function issueService(db: Db) {
           }),
         );
 
+        if (values.parentId || values.executionWorkspaceId || values.status === "done" || values.status === "cancelled") {
+          await notifyTerminalWorkspaceWork(tx, values.executionWorkspaceId ? `workspace:${values.executionWorkspaceId}`
+            : values.parentId ? `issue:${values.parentId}` : undefined);
+        }
         const [issue] = await tx.insert(issues).values(values).returning();
         await attachOwnedDraftImages(tx, issue, issue.description, { userId: issueData.createdByUserId, agentId: issueData.createdByAgentId });
         if (issue.visibility === "private" && !inheritedPrivateSubtree && issueData.createdByAgentId) {
@@ -11301,6 +11306,11 @@ export function issueService(db: Db) {
                 (blockedByIssueIds !== undefined || issueData.unblockDescriptor !== undefined)))) {
           patch.statusVersion = sql`${issues.statusVersion} + 1` as unknown as number;
         }
+        if ((patch.status !== undefined && patch.status !== receiptExisting.status)
+          || patch.completedAt !== undefined || patch.cancelledAt !== undefined
+          || issueData.parentId !== undefined || issueData.executionWorkspaceId !== undefined) {
+          await notifyTerminalWorkspaceWork(tx, `issue:${id}`);
+        }
         const updated = await tx
           .update(issues)
           .set(patch)
@@ -11702,6 +11712,7 @@ export function issueService(db: Db) {
 
         let removedIssue;
         try {
+          await notifyTerminalWorkspaceWork(tx, `issue:${id}`);
           removedIssue = await tx
             .delete(issues)
             .where(eq(issues.id, id))
@@ -12201,6 +12212,7 @@ export function issueService(db: Db) {
         const isTerminal = existing.status === "done" || existing.status === "cancelled";
         const releaseStatus =
           existing.status === "in_progress" ? "todo" : existing.status;
+        await notifyTerminalWorkspaceWork(tx, `issue:${id}`);
         const updated = await tx
           .update(issues)
           .set({
@@ -12250,6 +12262,7 @@ export function issueService(db: Db) {
           patch.assigneeAgentId = null;
         }
 
+        await notifyTerminalWorkspaceWork(tx, `issue:${id}`);
         const updated = await tx
           .update(issues)
           .set(patch)

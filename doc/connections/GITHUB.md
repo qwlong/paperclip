@@ -220,6 +220,12 @@ callback recovery scanner and its callback-mismatch warning; the Cloud inbox own
 relay delivery retries. Only that local check can verify a connection or
 admit work. After a repair, a fresh authenticated event for the bound installation
 can verify webhook delivery even when the relay deduplicates a redelivered old ping.
+This also applies while the connection needs attention: the signed event verifies
+delivery without retaining its content, admitting work, or changing repository
+access, even when its repository is disabled or unavailable. Verification returns
+the connection to the provider-setup step; later installation events cannot
+activate it. The manager must still complete reconnect and activation before new
+review requests can run.
 Shared-App account connectors keep the behavior described above.
 
 Unverified gateway traffic has request, byte, pending-queue, retention and wake
@@ -236,6 +242,12 @@ manual existing-App recovery remain available. Connecting does not prove that
 an agent runtime can execute a review.
 
 ### One editable response per request
+
+A pull request task can retain both its main discussion and inline finding
+threads. Bot tool discovery lists each endpoint/catalog tool once across those
+threads. Publishing an inline finding therefore does not duplicate the tool
+catalog on the task's next run. Both conversation mappings remain available for
+authorized follow-up replies.
 
 After accepting authorized GitHub work, Paperclip posts **Working on this…**
 before starting the agent. Issue and PR discussion comments use the same GitHub

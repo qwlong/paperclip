@@ -89,3 +89,6 @@ test-results/
 
 # Local native Runner test/session state
 .paperclip-runner-prp/
+
+# Opt-in CI timing artifacts
+.ci-profile/

@@ -290,9 +290,11 @@ export function createGitHubInstallationLifecycle(db: Db, options: GitHubInstall
       const intentionallyUnavailable =
         canonical.endpoint.status === "paused" ||
         canonical.endpoint.status === "archived" ||
+        (canonical.endpoint.status === "attention" && canonical.endpoint.setup.step === "provider_setup") ||
         !canonical.endpoint.setup.webhookVerifiedAt;
       const advanceRuntimeGeneration =
         refreshRuntimeAfterLifecycle ||
+        (canonical.endpoint.status === "attention" && canonical.endpoint.setup.step === "provider_setup") ||
         !canonical.endpoint.setup.webhookVerifiedAt;
       await db.transaction(async (tx) => {
         await credentialLease.assertOwned(tx);
@@ -374,7 +376,7 @@ export function createGitHubInstallationLifecycle(db: Db, options: GitHubInstall
           );
         await credentialLease.assertOwned(tx);
       });
-      if (!canonical.endpoint.setup.webhookVerifiedAt) {
+      if (intentionallyUnavailable) {
         stopRuntimeAfterLifecycle = true;
       }
     } catch (error) {
@@ -383,6 +385,7 @@ export function createGitHubInstallationLifecycle(db: Db, options: GitHubInstall
         !latest ||
         latest.endpoint.status === "paused" ||
         latest.endpoint.status === "archived" ||
+        (latest.endpoint.status === "attention" && latest.endpoint.setup.step === "provider_setup") ||
         !latest.endpoint.setup.webhookVerifiedAt;
       if (!preserveIntentionalState) {
         const failedAt = new Date();

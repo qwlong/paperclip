@@ -92,3 +92,5 @@ export { probeAcpxClaudeInstallation, probeAcpxGrokInstallation, probeAcpxPiInst
 export { bundledRemoteProviderPackManifestPath, bundledRemoteRunnerBinary } from "./live/bundled-remote-provider-pack.js";
 
 export { RunnerdDotDriver, type RunnerdDotDriverOptions } from "./drivers/dot/runnerd-dot-driver.js";
+
+export type { RunnerExecutionDriver } from "./control-plane/runner-execution-driver.js";

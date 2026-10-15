@@ -58,6 +58,13 @@ For GitHub, submit a disposable PR and verify the summary heading uses the bot's
 display name and the check remains **Paperclip Review**. For two separate bots on one PR, verify
 their App-scoped checks and comments remain independent.
 
+For GitHub publication recovery, interrupt a response after GitHub accepts a
+write and verify one summary, finding, and App-scoped check. Retry the same tool
+call and verify it returns the saved receipt. Leave a transient failure queued,
+restart the instance, and verify publication resumes at its saved deadline
+without another inbound message. Revoked access and permanent rejections must
+stop retries. These recipes are separate from live provider proof.
+
 Configure optional project and workspace defaults at the connection and destination
 levels. Start a new conversation and inspect its task workspace. Verify that
 inheritance, an explicit selection, and clearing a default remain distinct.

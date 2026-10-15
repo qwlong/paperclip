@@ -112,6 +112,42 @@ it("renews one authenticated connection for three weeks without replacing its au
   }
 }, 30_000);
 
+it("reports how long the authenticated Runner has been disconnected", async () => {
+  const root = mkdtempSync(resolve(tmpdir(), "runner-disconnect-age-"));
+  const core = new DurablePrpControlPlane({ stateDirectory: root, identity, expectedRunnerVersion, expectedRunnerDigest });
+  try {
+    await core.start();
+    expect(core.runnerDisconnectedForMs()).toBeNull();
+    // An unauthenticated peer closing is not a Runner disconnect.
+    let closeUnauthenticated = () => {};
+    const unauthenticated = core.attachWireConnection({
+      onJson: () => {},
+      onClose: (listener) => {
+        closeUnauthenticated = () => listener({ message: "closed" });
+      },
+      close: () => closeUnauthenticated(),
+      sendJson: () => {},
+    });
+    expect(unauthenticated.isAuthenticated()).toBe(false);
+    closeUnauthenticated();
+    expect(core.runnerDisconnectedForMs()).toBeNull();
+    const client = (await authenticate(core, core.issueBootstrapTicket()))!;
+    expect(core.runnerDisconnectedForMs()).toBeNull();
+    const before = Date.now();
+    client.socket.destroy();
+    await vi.waitFor(() => expect(core.activeRunnerConnectionCount()).toBe(0), { timeout: 1_000 });
+    const after = Date.now();
+    expect(core.runnerDisconnectedForMs(after + 300_000)).toBeGreaterThanOrEqual(300_000);
+    expect(core.runnerDisconnectedForMs(after + 300_000)).toBeLessThanOrEqual(300_000 + after - before);
+    const resumed = (await authenticate(core, client.leaseToken!))!;
+    expect(core.runnerDisconnectedForMs()).toBeNull();
+    resumed.socket.destroy();
+  } finally {
+    await core.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 30_000);
+
 it.each(["expired", "revoked", "wrong-run", "wrong-connection", "wrong-epoch", "future-expiry"])(
   "cannot renew a lease with %s authority",
   async (fault) => {

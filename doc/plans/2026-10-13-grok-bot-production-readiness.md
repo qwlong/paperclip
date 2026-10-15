@@ -1,6 +1,39 @@
 # Grok Bot production readiness
 
-Status: implementation and qualification in progress. Actual client OAuth and a routine wake with an exact chat acknowledgement are observed. The candidate has local authenticated challenge receipts, real Rust assigned-work/file/finalization tests, and durable proactive-intake tests. Deployed two-way work acceptance remains a release gate.
+Status as of October 15: real assigned and Bot-initiated tasks reach canonical completion. The active-session wake correction is merged. A real proactive test found a delayed-admission echo; its correction is under verification. Production acceptance is incomplete. The current release goal and matrix below supersede the earlier dated campaign entries. Historical successes and failures remain evidence for the revisions actually tested.
+
+## Current production finish line — October 14
+
+Ship Grok Bot as a user-selectable, opt-in experimental agent in production Paperclip Cloud. A user can connect an existing Bot, assign ordinary tasks and receive questions and useful outputs in Paperclip; the Bot can independently initiate governed work. The user selected a dedicated synthetic Grok Qualification production workspace, which has been created without an agent grant or smoke task.
+
+There is no testing call, case-count, token or spending cap. The former six-case/twenty-webhook limit is withdrawn by the user. Test as needed to meet the finish conditions. Normal company permissions, recorded budgets, admission, delivery reconciliation and resource cleanup remain required; Grok spending is unknown.
+
+| Finish condition | Evidence required | Current outcome / next action |
+| --- | --- | --- |
+| Ordinary onboarding works | Actual Grok UI, fixed agent consent, saved setup, wrong-key behavior, authenticated challenge, refresh, reconnect and revocation | Resumed real Grok authorization, saved setup Done, authenticated routine challenge and automatic refresh passed on the October 15 serving revision. Runtime reconnect copy fix is merged; verify its published UI and fresh production setup next. |
+| Assigned work reaches a usable result | One actual managed workflow: progress, question and answer, document, downloaded file/hash, canonical completion or review and cleanup | A preliminary comparison task on serving Core ff0 completed progress → question → answer → report/CSV → canonical Done, with both cleanup receipts. The cited CSV downloads with the exact publication hash. Two distinct CSV uploads accompanied an active-session result wake; correct that wake behavior and requalify the final candidate. |
+| Bot initiates governed work | Real-client task creation/claim/completion with stable receipts and no outbound echo or duplicate effects | A real idle-conversation request created one task and one managed run, saved a 100-word report, reached accepted Done and cleaned up its lease. A delayed-admission wake and two acceptance attempts were also recorded. Functional completion passed; no-echo acceptance failed. Requalify the correction. |
+| Recovery and authority are reliable | Healthy work past the prior five-minute failure window; actual controller restart preserving assignment/session/process and no duplicate wake; Stop, pause, reassignment, revocation, stale calls, queues and cleanup | The old hold was inspected and cleared. The successful comparison continuation ended below five minutes. Healthy work beyond that window, an actual restart and active Stop remain unverified; protocol tests are separate evidence. |
+| One identifiable reviewed candidate passes source gates | Focused protocol/auth/Runner/UI tests, full CI/typecheck/tests/build/token/Storybook evidence and exact artifacts | Active-session wake correction #16394 merged with 55 passing checks, two optional skips and review 5/5. The proactive echo correction started from master 7fc2dc8b3236e1149ae32756b6153a503623404b and was rebased onto freshly fetched master 250429942e27d568f20d3bc7dddcfc84a666480a before submission. Two regression cases reproduce the real delayed-admission wake before the fix. All 214 focused protocol/auth/question checks pass, including 80 Grok and Dot checks. Repository typecheck/build, token gates, the 2,731-story structure and Storybook build pass. Fresh CI, review, publication and the real no-echo repeat remain required. |
+| Production opt-in is delivered and smoke-tested | Staging acceptance, correct served Core/distribution/Runner, normal editable opt-in controls/defaults, actual production Bot workflow and inspectable task/output links | Cloud opt-in policy and release-guide corrections are merged. Staging Cloud provenance and minimal feature values were verified, with Dot disabled and defaults unchanged. The corrected wake candidate, remaining real-client cases, ordinary production opt-in controls and production smoke are outstanding. |
+
+The critical path is to review and publish the proactive-admission echo correction, verify its served identity, then complete the remaining real-client acceptance cases. The selected staging workspace remains the test destination. Preserve one source manifest per case; do not combine incompatible runs into one green release.
+
+Real Grok reconnect restored the same agent, plugin and webhook-only routine. Saved setup reached Done after both delivery and authenticated MCP acknowledgement. After the initial access token expired, Grok refreshed it and acknowledged another challenge without reauthorization. Grok/MCP/Runner were enabled with Dot disabled; setup allocated no managed Runner. The operator used the existing saved-invitation path to get the secure pairing-code copy control before the Runtime copy correction published. Record that as assisted recovery, not proof of unassisted fresh onboarding. The copy correction is merged in #16373 after 55 passing CI checks, two optional skips and review 5/5.
+
+The preliminary comparison task ran on serving Core ff0f976de1036555fb9deda8c1f31a5f748723f6. Grok accepted it, posted progress, asked a question, resumed after the synthetic Solo builder answer and saved a 284-word report with official links. Canonical completion accepted the authenticated file-publication evidence and set the task to Done. Both managed runs committed and both leases have successful cleanup receipts. The cited CSV opens through the normal download link and matches its recorded 1,277-byte hash, three rows and five columns. No chat nudge or manual task disposition was used. The continuation ended after about 280 seconds, below the prior five-minute failure window.
+
+An unread asynchronous tool result also caused a webhook during accepted work. Two CSV versions with different request IDs and hashes appeared. Their cause cannot be established without the provider transcript, but quiet MCP traffic cannot establish provider idleness. The correction removes receipt and accepted-feedback self-wakes, retains durable polling and inbox/history reads, and cancels queued dispatches whose offer was already accepted. Late acknowledgements still work. Assignment reads supply current polling guidance to existing connections. Three regressions failed before the correction. Review then identified acceptance during the last send check and during credential resolution. The final handoff now shares an advisory lock with Grok acceptance receipts; it holds no binding or assignment row lock across HTTP. Obsolete unsent wakes are cancelled. The 31 Grok protocol checks and 47 existing Dot Runner checks pass, including forced acceptance races, authenticated replies and Stop during pending delivery. Earlier broader protocol, onboarding, real-daemon, repository typecheck/build, token and Storybook checks passed; final-head CI remains required. These are source checks, not actual-provider requalification.
+
+Core d73d7a8651db0897cb50adbca42731bcb8aed550 and its canonical private Cloud composition passed publication. One single-workspace request passed preparation but was blocked by an existing shared rollout; it created no campaign. The existing rollout later released the reservation. That prepared source is now superseded by the wake correction. Keep its receipts as history and do not resume its older deployment request. Select a new immutable reviewed source after this fix passes CI and review. Production opt-in policy and release-guide changes are merged, but production rollout and smoke remain outstanding.
+
+Desktop control recovered on October 15. One ordinary message in the actual Grok conversation initiated the proactive source investigation; the operator created no preliminary task and sent no extra nudge. Serving Core 11d69d04c7531cf7eb37f7994b7112797e145837 includes #16394. The Bot created one task and one run, saved a 100-word report, submitted an accepted canonical result and reached Done. Its managed lease has a successful cleanup receipt. The exact public PR marker matches the saved control value, was absent from the operator prompt and appears in the saved report with its source. No Paperclip proxy operation occurred. The report records native GitHub API use; a complete provider tool transcript is unavailable.
+
+The proactive run also received an authenticated delayed-admission webhook while its original conversation was waiting. Two acceptance requests and two title writes were recorded. This fails the no-echo release condition despite successful task completion. Two local regressions reproduce the extra webhook for a delayed offer and a prepared intent recovered after restart. The correction keeps admission in the original caller's polling path and rejects old prepared proactive wakes. Human assignments and question continuations retain their ordinary dispatch paths. Source and real-client requalification are required.
+
+Normal staging automation has advanced beyond the older prepared candidate. No shared CI routing switch was changed. The earlier temporary fallback request is no longer needed for the already served successor. The dedicated production workspace still has no qualification agent grant or smoke task.
+
+Keep native providers and person-purpose MCP connections unchanged. No browser automation belongs in normal operation. Defer localhost relays, internal Grok APIs, marketplace distribution and Paperclip-connected third-party tools. Completion of a Paperclip work session does not assert remote Grok termination.
 
 ## Candidate and release contract
 
@@ -23,7 +56,7 @@ Use `.agents/skills/create-external-bot-integration/SKILL.md` and its release, R
 | Stop | Revoke Paperclip work authority and future dispatch; account for managed Runner cleanup; remote Grok activity remains unknown | “Stop Paperclip work” and “Open Grok”; no claim of global Bot termination |
 | Economics | Recorded budgets gate admission; Grok usage/spend unknown; managed Runner cost separate | Never report zero Grok cost or promise control over its billing |
 | Distribution | Experimental private connection on authenticated HTTPS instances and Cloud | Localhost relays, internal Grok APIs and public marketplace distribution remain deferred |
-| Qualification bounds | One active Bot assignment; short synthetic tasks; no paid soak; bounded attempts and explicit resource ownership | Start with at most six principal task cases and twenty webhook invocations; inspect ambiguity before another send; pause to review any additional spend or scope |
+| Qualification scope | One active Bot assignment, synthetic data, explicit resource ownership and inspection before repeating uncertain delivery | No arbitrary call, case-count or spending cap. Run the coverage needed for the agreed production finish line; preserve normal governance and cleanup. |
 
 ## Architecture decision
 
@@ -53,7 +86,7 @@ Use current lease-renewal and durable waiting paths. Distinguish pairing-code, a
 | P5 — review candidate | Focused auth/protocol/Runner/UI tests, full required checks, maps/token/Storybook checks and PR review green on one frozen candidate; compatible packaged Runner artifact | Codex; PR template, exact head/checks and immutable artifact digest |
 | P6 — deployed acceptance | Selected staging tenant serves candidate app, ingress and ordinary configured managed Runner image; fresh onboarding and both work directions pass without chat nudges or manual repair; cleanup accounted for | Codex; actual qualification Bot campaign, screenshots/private evidence, run/document/artifact links and provider deletion receipts |
 
-The next critical gate is the remainder of P1. Scoped staging prerequisites, a temporary agent grant, the new Bot and its webhook-only qualification routine were explicitly approved. The temporary shared Dot gateway is client interoperability evidence only; it is not a production Grok provider or a passed Runner acceptance test. Keep the endpoint/data alive while the user/Bot tests it, and announce any intentional shutdown with resumption instructions.
+At this historical point, the next critical gate was the remainder of P1. Scoped staging prerequisites, a temporary agent grant, the new Bot and its webhook-only qualification routine were explicitly approved. The temporary shared Dot gateway is client interoperability evidence only; it is not a production Grok provider or a passed Runner acceptance test. Keep the endpoint/data alive while the user/Bot tests it, and announce any intentional shutdown with resumption instructions.
 
 ## Acceptance campaign
 
@@ -76,7 +109,7 @@ Before review-ready handoff run `pnpm -r typecheck`, `pnpm test:run`, `pnpm buil
 
 Inspect current private Cloud runbooks and serving versions. Reuse existing tenant `/mcp/runner` routing first; change ingress only for a demonstrated missing route/auth behavior. Keep private Cloud source and qualification secrets out of public plans/PRs. Record the app image, ingress SHA, Runner digest, configured managed environment and resource receipts. A local binary override is not proof of the shipped managed image.
 
-Production ready means one reviewed candidate, required checks green, the named staging deployment and shipped Runner verified, the ordinary C01/C02/C03 journeys witnessed with the approved qualification Bot, required recovery/capability cases passed, and all resources released or intentionally retained with an owner and resume path. Report review-ready, merged, staged and canary-verified independently. Fleet-default enablement and a production-wide rollout require their own explicit authorization.
+Production ready means one reviewed candidate, required checks green, the named staging deployment and shipped Runner verified, the ordinary C01/C02/C03 journeys witnessed with the approved qualification Bot, required recovery/capability cases passed, and all resources released or intentionally retained with an owner and resume path. Report review-ready, merged, staged and canary-verified independently. The user later selected the production opt-in release goal above. It authorizes the reviewed release and policy delivery after staging acceptance; globally enabling Grok by default remains outside scope.
 
 ## Provider sources checked October 13
 
@@ -119,7 +152,7 @@ The existing Dot readiness contract requires its authenticated MCP Events callba
 | Continued authorization | Capabilities call succeeded after the initial 15-minute token lifetime without a new consent step | Supports client renewal; token endpoint/rotation receipt not independently inspected |
 | Revocation | Paperclip revoked the temporary connection; real stale inbox attempt returned authentication-required and no data | Current connection boundary only; no task mutation/reassignment test yet |
 | Reconnect | Fresh one-use invitation and consent for the same agent; real read returned a replacement binding and empty inbox | Existing plugin reused; old binding revoked; operator-driven test |
-| Routine wake | Vendor-confirmed desktop row-click regression; Bot-generated Webhook URL navigation link opened the panel. One guarded invocation returned HTTP 200 and the exact nonce reply | Operator workaround required; chat acknowledgement is not a persisted authenticated nonce receipt in Paperclip. One of twenty permitted webhook calls used |
+| Routine wake | Vendor-confirmed desktop row-click regression; Bot-generated Webhook URL navigation link opened the panel. One guarded invocation returned HTTP 200 and the exact nonce reply | Operator workaround required; chat acknowledgement is not a persisted authenticated nonce receipt in Paperclip. One invocation observed under the historical cap, which the user later removed |
 | Current source checks | Local authenticated MCP challenge, Rust task → document/file → finalization, proactive intake/deduplication, and renewed-session recovery tests pass. Repository typecheck, build, token gates, maps and Storybook build pass | Source candidate is not deployed; complete final suite and candidate-bound real managed acceptance remain required |
 
 Do not promote the temporary shared Dot connection to ready or substitute its event subscription with an unverified Grok webhook. The remaining P1 gate is the candidate’s durable authenticated challenge acknowledgement through the actual Grok client. Assigned work, idle intake, restart and managed cleanup still require real deployed acceptance. Local tests use scripted clients and synthetic storage; they do not count as provider acceptance.
@@ -156,3 +189,69 @@ The supporting Cloud ingress candidate passes typecheck, routing smoke and its f
 The next review corrections apply the native deliverable catalog's current work-mode policy to upload-ticket issuance and use. Confirmed rejected deliveries have an explicit operator retry; each retry retains the prior receipt, reserves one idempotent new intent and rechecks binding, grant, routine revision and work-session authority. Unknown or accepted delivery remains single-send. Thread Stop uses the selected run and its agent. Recovery locks all of the agent's current and retired bindings before routine rows. Historical Copilot v17 inputs remain decodable while new launch admission stays pinned to v18.
 
 The focused rendered UI regressions pass (144 tests), as do OpenAPI route coverage (21 tests) and Runner contract/integrity/history checks (82 tests). The current server fixture attempt could not initialize PostgreSQL because the host exhausted its shared-memory slots; no server-test pass is inferred from that attempt. Clean-worker CI must execute the file-policy, rejected-feedback and lock-order regressions before hand-off.
+
+
+## October 14 setup qualification follow-up
+
+The merged candidate passed source checks and was deployed to the approved staging
+workspace. The natural Grok picker and Save & exit recovery were observed there.
+The actual Grok desktop client reused its custom MCP plugin and opened the shared
+agent authorization flow with its registered Cursor client identity.
+
+Setup stopped before granting access: the masked pairing field lacked a Copy
+button, and the pending authorization action still named Dot. Add an explicit
+Copy code control through the shared clipboard helper, keep the code masked and
+out of setup prompts, and use a provider-neutral approval action. Preserve the
+fixed company, agent, authorizing person and permissions preview. Requalify the
+rendered copy and authorization path on the deployed follow-up candidate before
+running work cases. This is not yet evidence of an authenticated candidate reply
+or a completed managed Runner journey.
+
+
+## October 14 — live file-completion correction
+
+The deployed real Grok client completed agent OAuth, renewed its rotating refresh
+token, acknowledged a readiness challenge, accepted an ordinary assignment, and
+asked a two-choice question. The human selected setup simplicity. Two continuation
+sends received HTTP 400. Explicit inspection, recovery and re-verification let the
+same task continue without a Grok chat work nudge.
+
+The Bot saved a 421-word comparison document and a CSV with three rows. Canonical
+completion rejected the file because the authenticated upload did not persist the
+verified native publication receipt. The real managed run later exited unexpectedly;
+its precise cause remains under investigation. All three managed leases have
+successful cleanup receipts. These observations are failed acceptance evidence,
+not a passed release campaign. Private records retain task, run, assignment,
+OAuth lifecycle, dispatch, lease, artifact and completion-feedback references.
+
+The follow-up records a server-owned external publication receipt in the same
+transaction as a verified file upload. Completion checks the receipt against the
+actual upload, assignment and exact stored metadata. Personal uploads do not gain
+agent authority. The real Rust regression now requests a file and must pass the
+normal semantic finish and finalization paths with that file's evidence. Deployed
+requalification, proactive work, actual controller restart and active-session stop
+remain required before the release contract is complete.
+
+The deployed Stop action also rejected the lingering assignment after the managed
+run had failed. The follow-up permits a fence for that exact terminal run's active
+assignment, while stale Stop calls cannot touch successor work. Known remote
+Runner lease/reconnect failures retain a closed diagnostic code; raw stderr and
+transport credentials stay out of that error. Qualification access was revoked
+while the correction is reviewed. No successful active-session Stop or restart
+qualification is inferred from this cleanup.
+
+The upload/document overlap regression uses the real admitted Rust Grok work
+session, native document authority, and authenticated HTTP upload. With the
+original run-before-task upload order, the upload returned 503. With the shared
+task-before-run order, both writes and their durable receipts committed, and
+normal file completion passed. This is protocol evidence; it does not replace
+the remaining real-client acceptance gates.
+
+A second overlap regression uses an actual admitted Rust Grok session and holds
+the upload's storage response while disconnect runs. The former assignment-first
+order prevented disconnect from completing. Preliminary upload access now stays
+read-only for agent sessions; publication acquires the grant before retaining
+assignment authority. Disconnect completes while storage is pending, and the
+late upload returns 403 with no attachment or publication receipt. Person write
+checks remain in place. The full repository command was interrupted when this
+new review finding arrived; its partial output is not a passing test result.

@@ -170,6 +170,15 @@ and launcher preparation, run output initialization, workspace validation,
 runtime services, instruction files, and runtime selection. Database and HTTP
 instrumentation can attach child spans during each awaited operation.
 
+Execution configuration also records separate phases for mentioned skills,
+GitHub identity selection, secret resolution, managed AI runtime preparation,
+skill inventory, connector assignments, connector skill preparation and delivery,
+connection instructions, and agent identity. Their names are
+`heartbeat.prepare.configuration_<step>`, using the closed names in
+`server/src/services/execution-preparation-timing.ts`. These intervals are inside
+`execution_configuration`; do not add them to its duration. They remain available
+when a later setup step fails before the provider lifecycle trace starts.
+
 Each phase starts a new root trace and links to the active trigger span when
 one exists. An unsampled HTTP request must not suppress diagnostics for the
 background run it starts. Root traces still follow the operator's configured
@@ -185,6 +194,52 @@ traces; the provider lifecycle trace is created later and can have a different
 trace ID. Without an endpoint, tracing remains a no-op. These spans add no
 first-party Telemetry events or database run-log writes.
 
+Workspace preparation also records `heartbeat.prepare.workspace_<step>` spans
+for source resolution, provisioning policy, base validation, source access,
+provisioning, retained source access, workspace record creation and updates,
+task binding, operation binding, configuration records, repository admission,
+project repositories, and recovery-root reservation. These intervals are inside
+`heartbeat.prepare.workspace`. Repeated bindings or updates have separate spans.
+Do not add these intervals to the containing workspace duration. They use the
+same run hash and contain no workspace paths, commands, or returned records.
+
+The `paperclip.native-controller` tracer records separate
+`native.controller.<phase>` root spans around GitHub access setup, wake binding,
+backend construction, connector assignments, assigned MCP discovery, tool
+authority, companion selection and Runner binary resolution. It also records
+GitHub shutdown, coordinator release, instruction checkpoints and collection,
+and warm-session release. These intervals can occur between the existing native
+preparation, execution and settlement spans. They are controller work, not model
+turn time, and carry only the existing run hash. Nested phases overlap their
+containing backend or lifecycle intervals; do not add both durations.
+
+All preparation timing uses the endpoint gate, even when another library has
+registered a tracer provider. Tracer lookup, callback, status or ending failures
+cannot repeat work or replace its result or error. Automatic database children
+are not guaranteed: an aggregate workspace trace can contain just one span.
+If a process exits before an operation settles, its open span may not be exported.
+
+With an endpoint, `paperclip.controller-startup` records independent
+`controller.startup.<phase>` root spans for tool reviews, gateway sessions,
+delivery-worker readiness, accounting, plugin-worker readiness, native recovery,
+hot-restart adoption, orphan reaping, scheduled retries, queued runs, and goal
+recovery. These spans have no custom attributes. Each ends when its awaited
+phase settles, including failures. They separate controller readiness from
+provider startup; they are not agent-run durations. A disabled endpoint takes
+the direct work path without a tracer lookup or additional log messages.
+Tracing failures cannot repeat recovery or replace its result or error.
+
+Native recovery and orphan reaping each run a native finalization
+reconciliation pass; the periodic recovery loop runs it on every scheduler tick.
+With an endpoint, a pass that takes at least one second records, after it ends,
+a `controller.native_reconciliation` root span from `paperclip.native-reconciliation`
+with one child span per phase: `legacy_workspace_exports`,
+`obsolete_policy_reviews`, `automatic_completion_reviews`, `candidate_scan` and
+`candidates`. The pass span carries `paperclip.native_reconciliation.scoped` and,
+once known, `paperclip.native_reconciliation.candidates` (a count). A failed
+pass marks the pass span and the phase that was running with an error status.
+Faster passes record nothing.
+
 ## Native Runner Trace Spans
 
 Paperclip Runner task runs emit a single foldable OpenTelemetry trace. This is
@@ -194,6 +249,12 @@ ends before outer workspace persistence. The heartbeat-owned local run-log
 `task.run.measured` records terminal elapsed time including durable copyback;
 every other native span carries a real OpenTelemetry parent context rather than
 only a descriptive `parentName` field.
+
+The native lifecycle root uses the operator's root sampling policy. It links
+to a valid active trigger trace without inheriting its sampling decision.
+An unsampled HTTP request therefore cannot suppress an otherwise sampled
+background run. An operator who disables root sampling still gets no spans.
+Without an OTLP endpoint, tracing remains silent and does not export data.
 
 The run link in Honeycomb matches both `task.provider_session` for native runs and `task.run` for legacy adapters. It retains the exact hashed run-ID and service filters and groups by trace ID. The URL builder uses Honeycomb’s supported `in` operator for the two root names; see the [query specification](https://github.com/honeycombio/honeycomb-mcp#query-specification-for-run_query). This changes only the query link. The operator endpoint gate and span attribute allowlist remain unchanged.
 
@@ -458,15 +519,71 @@ below.
 
 ### Run failure context
 
-Terminal run failures also carry the run and task IDs, adapter, error code,
-run status, and redacted error message. Their fingerprint is the error code
-and adapter. These fields are passed directly to that event's capture call.
+Run failure reporting requires a separate operator choice in addition to the
+backend Sentry DSN and the audited SDK. Set `PAPERCLIP_SENTRY_RUN_FAILURES` to:
+
+| Value | Reports |
+| --- | --- |
+| `off` (default) | No run failure events. Ordinary server exception reporting still uses the backend DSN. |
+| `unexpected` | Failed and timed-out runs, plus unexpected started cancellations, with the existing configuration, quota, and external connection filters described below. |
+| `all` | Every failed or timed-out run, including the known configuration, quota, and external connection failures. Unexpected started cancellations also report. |
+
+Missing, blank, or unrecognized values keep run reporting off. Expected operator
+stops, shutdown interruptions, successful runs, and queued work do not report in
+either enabled mode. The mode does not change run status, retries, recovery,
+Telemetry, or OpenTelemetry export. It is process-wide, so an operator can enable
+it on one staging instance without enabling it on other deployments. Restart the
+server after changing deployment environment variables.
+
+**Upgrade:** A backend DSN alone previously enabled run failure reports. Set
+`PAPERCLIP_SENTRY_RUN_FAILURES=unexpected` to preserve that reporting policy.
+Use `all` to investigate every failed run in a selected deployment.
+
+Terminal run failures carry the company, agent, run and optional task IDs,
+adapter, error code, run status, and redacted error message. Company-scoped runs
+without a task also report. The `event_kind=run_failure` tag identifies these
+events. Their fingerprint contains the error code and adapter, followed by the
+setup/execute phase and original failure code when available. IDs, release,
+model, and error text do not split groups. These fields are passed directly to
+that event's capture call.
 They do not change the ambient Sentry scope, whose isolation is unavailable
 without an OpenTelemetry context manager. Later, unrelated exceptions must
 not inherit a previous run's identity or fingerprint.
 
+The versioned `paperclip` context supplies company and agent IDs and relative
+API paths for the saved run, events, log, and optional task. A valid HTTP(S)
+origin in `PAPERCLIP_PUBLIC_URL` also supplies absolute run, events, and log URLs.
+Values with credentials, query parameters, fragments, or a path are omitted.
+The event never includes an API key or an access token. These references grant
+no access. A bot must authenticate to the correct instance and pass its existing
+company, run-output, and private-task access checks.
+
+The bot should use the exact run ID to read `GET /api/heartbeat-runs/{runId}`,
+`GET /api/heartbeat-runs/{runId}/events`, and
+`GET /api/heartbeat-runs/{runId}/log`. These retain the saved result, run context,
+and available output. Prefer the saved provider configuration over the agent's
+current settings. The Sentry execution context includes the saved native
+provider kind and model, start/finish timestamps, and original failure code when
+available. Tool-name collision errors identify the conflicting tool names and
+connection bindings without serializing tool schemas or provider metadata.
+Gateway reason codes survive exception projection. All diagnostic text still
+passes through the existing secret redaction and size limits.
+
+Use the Sentry group to combine repeated investigations, and the instance and
+run ID to identify each occurrence. Automated retries or proposed code fixes
+must use normal Paperclip authority and approval checks. Receiving an event
+does not authorize a bot to replay a run. This change provides the reporting
+contract; it does not install a bot or configure Sentry alerts.
+
+Reporting remains asynchronous and best effort. Shutdown drains pending report
+work before the SDK flushes. There is no durable delivery queue or receipt from
+Sentry, so a crash or network outage can lose events. `all` selects failures; it
+does not promise delivery or export complete transcripts. Detailed output stays
+in the instance behind the existing authenticated APIs, with its normal retention.
+
 Known missing-secret configuration blockers are kept in the task's run log,
 blocked state, and owner recovery action, without a Sentry run-failure event.
+The exclusions in this section apply to `unexpected` mode only.
 This requires a failed `configuration_incomplete` run in the preparing stage,
 a setup-phase report, explicit proof that provider work did not start, and a
 nonempty list of recognized missing or inactive secret bindings. Process exit
@@ -519,6 +636,14 @@ whether remote work may have been accepted.
   remain visible to the run owner. Unknown protocol/parser errors, missing run
   identifiers, untyped terminal failures, and timeouts after accepted work remain
   reportable. Stream/poll errors retain their existing retry and logging behavior.
+
+A Codex ACP model capacity failure also stays local. The Codex ACP classifier
+must match a typed `service` terminal failure that reports the model at capacity
+or the server overloaded. It records `codex_transient_upstream` with the
+`transient_upstream` family, and the bounded transient retry owns recovery. The
+report must come after setup and carry no signal. Other `service` failures,
+untyped capacity text, and Codex CLI transient upstream failures remain reportable.
+The run keeps its failed state and its terminal diagnostic.
 
 Expected pre-provider waits for a shared project workspace, a credential rotation
 lock, or an exhausted AI connection pool carry a server-owned expected
@@ -657,6 +782,35 @@ provider failure, or deployment. The last-output age can include system output.
 at detection; it does not claim that a retry was queued or succeeded. This data
 contains no process IDs, task text, paths, or credentials and changes no recovery
 or ownership decisions.
+
+When a native session fails because close could not prove durable runner
+suspension (`provider_transport_failed: runner did not durably suspend before
+checkpoint`), `run_execution` records which barrier was unproven:
+`closeRunnerSuspended`, `closeProviderDrained`, `closeSuspendCommandStatus`
+(a runner command status, or `not_queued`), `closeRunnerLifecycle` (`ready`,
+`suspended`, `closed`, `recoverable_failure`, or `unobserved`),
+`closeRunnerIdentityMatches`, `closeProviderState` (`settled`, `unsettled`,
+`unreadable`, or `not_local`), `closeProviderPendingEventCount`,
+`closeProviderTurnActive`, `closeSemanticResultPersistenceFailed`, and the counts
+`closeSemanticToolsPending`, `closeSemanticToolDeliveriesOpen`, and
+`closeSemanticResultFailures`. Fields absent from the runner's settlement are
+omitted. Tool call, operation, command and event identities, input digests and
+provider turn IDs stay in the instance run log. The report reads the caught error
+only for these labels; its text and stack are not copied, because they bypass the
+executor's identity redaction. These observations do not change close, quarantine
+or recovery behavior.
+
+Remote runner reattachment failures also record `remoteRunnerRecoveryStage`
+and `remoteRunnerRecoveryReason` from the saved run. When reattachment fails
+before the coordinator saves its result, the report reads the same labels from
+the caught recovery error instead. These fields contain
+closed labels for marker reads and process verification. They distinguish
+missing or unsafe markers, invalid or missing fingerprints, changed or
+unavailable process identity, and failed or timed-out probes. Paths, PIDs,
+nonces, command lines and transport output are excluded. The existing
+`runner_remote_process_identity_unavailable` error message and native failure
+classification remain unchanged. The coordinator also saves these labels in
+its failure detail and recovery evidence. A later failure clears stale labels.
 
 ACP turns record `acpLastEventAgeMs`, `acpObservedEventCount`,
 `acpPendingToolCount`, and `acpToolInventoryComplete` at finalization, before

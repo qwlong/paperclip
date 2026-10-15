@@ -6,6 +6,7 @@
  * `getAdapterDisplay()`.
  */
 import type { ComponentType } from "react";
+import { agentHarnessType } from "@paperclipai/shared";
 import {
   Bot,
   Code,
@@ -206,6 +207,14 @@ export function getAdapterDisplay(type: string): AdapterDisplayInfo {
     description: suffix ? `External ${suffix} adapter` : "External adapter",
     icon: Cpu,
   };
+}
+
+export function agentDisplayAdapterType(agent: { adapterType: string; adapterConfig: Record<string, unknown> }): string {
+  if (agent.adapterType !== "paperclip_runner") return agent.adapterType;
+  if (agent.adapterConfig.provider === "openai_dot" || agent.adapterConfig.provider === "grok_bot") {
+    return agent.adapterConfig.provider;
+  }
+  return agentHarnessType(agent.adapterType, agent.adapterConfig) === "codex_local" ? "codex_local" : agent.adapterType;
 }
 
 export function isKnownAdapterType(type: string): boolean {

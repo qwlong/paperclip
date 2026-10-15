@@ -3,8 +3,8 @@ import { randomUUID } from "node:crypto";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { expect, it, vi } from "vitest";
-import { RunnerdDotDriver, type RunnerdDotDriverOptions } from "./runnerd-dot-driver.js";
+import { describe, expect, it, vi } from "vitest";
+import { RunnerdDotDriver, externalRunnerExitMessage, type RunnerdDotDriverOptions } from "./runnerd-dot-driver.js";
 import { describeRunnerdNativeSessionBackend } from "../../backends/codex-native-backend.js";
 import { createNativeSessionBackend } from "../../backends/native-backend-factory.js";
 import * as controlPlane from "../../control-plane/durable-prp-control-plane.js";
@@ -120,7 +120,8 @@ it.each([
     } else {
       handle!.child.kill("SIGTERM");
       await handle!.completion;
-      await expect(session.read!()).rejects.toThrow("dot_runner_process_exited_recovery_required");
+      await expect(session.read!()).rejects.toThrow(
+        /^dot_runner_process_exited_recovery_required: code=\S+ signal=\S+ disconnectedMs=(?:none|\d+)$/);
     }
   } finally {
     commandSpy.mockRestore(); spawnSpy.mockRestore();
@@ -220,4 +221,24 @@ it("rejects a mismatched Grok driver before any provider state is attached", asy
   const input = execution("/synthetic/pinned-instructions", "grok_bot");
   expect(() => parseNativeExecutionInput({ ...input, session: { ...input.session, driverKind: "openai_dot_mcp" } })).toThrow();
   expect(() => parseNativeExecutionInput({ ...input, provider: { ...input.provider, kind: "unsupported_bot" } })).toThrow();
+});
+
+describe("external Runner failure diagnostics", () => {
+  it.each([
+    ["active connection lease expired; durable state is preserved", "lease_expired_requires_bootstrap"],
+    ["runner_remote_process_exited lifecycle=running recoverableFailure=transport_reconnect_grace_exceeded", "transport_reconnect_grace_exceeded"],
+    ["transport reconnect deadline elapsed; durable state is preserved", "transport_reconnect_deadline_exceeded"],
+  ])("preserves the bounded failure reason from %s", (stderr, reason) => {
+    expect(externalRunnerExitMessage({ code: null, signal: null, stdout: "", stderr }))
+      .toContain(`reason=${reason}`);
+  });
+  it("does not disclose raw diagnostics or transport credentials", () => {
+    const stderr = "Bearer qualification-secret https://private.example/path?ticket=qualification-secret UNKNOWN_REASON";
+    expect(externalRunnerExitMessage({ code: null, signal: null, stdout: "", stderr }))
+      .toBe("dot_runner_process_exited_recovery_required: code=null signal=null");
+    const recognized = externalRunnerExitMessage({ code: null, signal: null, stdout: "", stderr: `connection lease expired ${stderr}` });
+    expect(recognized).toContain("reason=lease_expired_requires_bootstrap");
+    expect(recognized).not.toContain("qualification-secret");
+    expect(recognized).not.toContain("private.example");
+  });
 });

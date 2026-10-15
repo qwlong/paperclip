@@ -5,7 +5,7 @@ import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
-import { agents, folders, companySkillSources, companies, companySkills, companySkillVersions, companySkillRepositorySnapshots, createDb } from '@paperclipai/db';
+import { agents, folders, companySkillSources, companySkillSourceEntries, companies, companySkills, companySkillVersions, companySkillRepositorySnapshots, createDb } from '@paperclipai/db';
 import { eq, sql } from 'drizzle-orm';
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from './helpers/embedded-postgres.js';
 import { unprocessable } from '../errors.js';
@@ -60,6 +60,56 @@ describe.skipIf(!support.supported)('skill source persistence', () => {
     const refreshed = await service.refresh(companyId, repaired.id, context);
     expect(refreshed.source.trackingRef).toBe('HEAD');
     expect(refreshed.source.entries[0]?.skillId).toBe(created.source.entries[0]?.skillId);
+  });
+  it('validates the selected branch and retains installed content until a successful refresh', async () => {
+    const isolatedCompany = randomUUID();
+    await db.insert(companies).values({ id: isolatedCompany, name: 'Selected branch', issuePrefix: 'SBR' });
+    const service = skillSourceService(db);
+    const created = await service.create(isolatedCompany, { repositoryUrl: 'https://github.com/acme/skills', trackingRef: 'main', commitSha: sha, selectedPaths: ['deep/one/SKILL.md'], excludedFolders: ['elsewhere'] }, context);
+    const versions = await db.select().from(companySkillVersions).where(eq(companySkillVersions.companyId, isolatedCompany));
+    const read = vi.fn(githubFixture(initial));
+    const repaired = await service.settings(isolatedCompany, created.source.id, { revision: created.source.revision, trackingRef: 'feature/New' }, { ...context, read: () => read });
+    expect(read).toHaveBeenCalledWith('/repos/acme/skills/commits/feature%2FNew');
+    expect(repaired.trackingRef).toBe('feature/New');
+    expect(repaired.entries).toEqual(created.source.entries);
+    expect(repaired.excludedFolders).toEqual(['elsewhere']);
+    expect(repaired.lastScanCommit).toBe(created.source.lastScanCommit);
+    await expect(service.settings(isolatedCompany, created.source.id, { revision: created.source.revision, automaticUpdates: false }, context))
+      .rejects.toMatchObject({ status: 409, details: { code: 'skill_source_settings_changed' } });
+    expect(await db.select().from(companySkillVersions).where(eq(companySkillVersions.companyId, isolatedCompany))).toEqual(versions);
+    const changed = githubFixture({ 'deep/one/SKILL.md': md('new branch version') }, {}, 'f'.repeat(40));
+    await service.refresh(isolatedCompany, repaired.id, { ...context, read: () => changed });
+    const skillId = repaired.entries.find(entry => entry.skillId)!.skillId!;
+    const current = await companySkillService(db).getById(isolatedCompany, skillId);
+    expect(current!.sourceRef).toBe('f'.repeat(40));
+    expect(current!.currentVersionId).not.toBe(versions[0]!.id);
+    expect(await companySkillService(db).getVersion(isolatedCompany, skillId, versions[0]!.id)).not.toBeNull();
+  });
+  it('rejects an unavailable selected branch without changing the source or recording a successful audit', async () => {
+    const isolatedCompany = randomUUID();
+    await db.insert(companies).values({ id: isolatedCompany, name: 'Unavailable branch', issuePrefix: 'UBR' });
+    const service = skillSourceService(db);
+    const created = await service.create(isolatedCompany, { repositoryUrl: 'https://github.com/acme/skills', trackingRef: 'main', commitSha: sha, selectedPaths: ['deep/one/SKILL.md'] }, context);
+    const original = githubFixture(initial), audit = vi.fn();
+    const read = async (request: string) => {
+      if (request.endsWith('/commits/feature%2Fmissing')) throw unprocessable('Unavailable branch.', { code: 'skill_source_ref_unavailable' });
+      if (request.endsWith('/commits/..')) return { id: 42, default_branch: 'main' };
+      return original(request);
+    };
+    for (const trackingRef of ['feature/missing', '..']) await expect(service.settings(isolatedCompany, created.source.id, { revision: created.source.revision, trackingRef }, { ...context, audit, read: () => read })).rejects.toMatchObject({ details: { code: 'skill_source_ref_unavailable' } });
+    expect(await service.detail(isolatedCompany, created.source.id)).toEqual(created.source);
+    expect(audit).not.toHaveBeenCalled();
+  });
+  it('requires source edit authorization before reading branches and uses only the requested connection', async () => {
+    const service = skillSourceService(db);
+    const created = await service.create(companyId, { repositoryUrl: 'https://github.com/acme/skills', trackingRef: 'branch-list', commitSha: sha, selectedPaths: [] }, context);
+    const read = vi.fn(async (request: string) => request === '/repos/acme/skills' ? { id: 42, default_branch: 'main' } : [{ name: 'main' }]);
+    const connection = randomUUID(), choose = vi.fn(() => read);
+    const result = await service.branches(companyId, created.source.id, { connectionId: connection }, { ...context, read: choose });
+    expect(result.defaultBranch).toBe('main'); expect(choose).toHaveBeenCalledWith(connection);
+    read.mockClear();
+    await expect(service.branches(companyId, created.source.id, {}, { ...context, read: choose, authorize: async () => { throw unprocessable('Editing denied.'); } })).rejects.toThrow('Editing denied');
+    expect(read).not.toHaveBeenCalled();
   });
   it('checks a new commit with an unchanged tree without downloading or replacing versions', async () => {
     const originalFiles = files, originalCommit = commit;
@@ -545,7 +595,7 @@ describe.skipIf(!support.supported)('skill source persistence', () => {
     await expect(fs.stat(path.join(runtime.source, '.paperclip-repository/shared/tools'))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
-  it.each([false, true])('retains installed repository dependencies after an oversized refresh (scheduled: %s)', async scheduled => {
+  it.each([false, true])('updates bounded dependencies after repository growth and retains versions when dependencies cannot fit (scheduled: %s)', async scheduled => {
     const temporaryCompany = randomUUID();
     await db.insert(companies).values({ id: temporaryCompany, name: 'Repository fallback', issuePrefix: 'FBK' });
     let repoFiles = {
@@ -573,14 +623,22 @@ describe.skipIf(!support.supported)('skill source persistence', () => {
       head = 'f'.repeat(40);
       repoFiles = { ...repoFiles, 'shared/guide.md': 'New shared instructions',
         ...Object.fromEntries(Array.from({ length: 62 }, (_, i) => [`generated/${i}.bin`, 'x'])) };
+      const refreshed = await service.refresh(temporaryCompany, installed.source.id, localContext, undefined, undefined, { checkCommit: scheduled });
+      expect(refreshed.source.packageMode).toBe('repository');
+      expect(refreshed.updated.map(skill => skill.id)).toContain(main.id);
+      expect((await library.readFile(temporaryCompany, main.id, '.paperclip-repository/shared/guide.md'))?.content).toBe('New shared instructions');
+      expect(await library.getVersion(temporaryCompany, main.id, versions[0]!.id)).not.toBeNull();
+      const updatedVersions = await library.listVersions(temporaryCompany, main.id);
+      head = 'e'.repeat(40);
+      repoFiles['shared/guide.md'] = 'x'.repeat(1024 * 1024 + 1);
       await expect(service.refresh(temporaryCompany, installed.source.id, localContext, undefined, undefined, { checkCommit: scheduled }))
         .rejects.toThrow('Installed repository skills and their dependencies were kept');
       const retained = await service.detail(temporaryCompany, installed.source.id);
       expect(retained.packageMode).toBe('repository');
-      expect(retained.lastScanCommit).toBe(sha);
+      expect(retained.lastScanCommit).toBe('f'.repeat(40));
       expect(retained.lastError).toContain('dependencies were kept');
-      expect(await library.listVersions(temporaryCompany, main.id)).toEqual(versions);
-      expect((await library.readFile(temporaryCompany, main.id, '.paperclip-repository/shared/guide.md'))?.content).toBe('Working shared instructions');
+      expect(await library.listVersions(temporaryCompany, main.id)).toEqual(updatedVersions);
+      expect((await library.readFile(temporaryCompany, main.id, '.paperclip-repository/shared/guide.md'))?.content).toBe('New shared instructions');
       expect((await library.readFile(temporaryCompany, main.id, '.paperclip-repository/skills/helper/SKILL.md'))?.content).toBe(md('helper'));
       repoFiles = { 'skills/main/SKILL.md': repoFiles['skills/main/SKILL.md'], 'skills/helper/SKILL.md': md('helper'), 'shared/guide.md': 'New shared instructions' };
       await service.refresh(temporaryCompany, installed.source.id, localContext);
@@ -589,6 +647,31 @@ describe.skipIf(!support.supported)('skill source persistence', () => {
     } finally {
       await deleteCompany(db, temporaryCompany);
     }
+  });
+
+  it('imports an explicitly selected skill with missing references and repairs cached dependency failures at an unchanged commit', async () => {
+    const temporaryCompany = randomUUID();
+    await db.insert(companies).values({ id: temporaryCompany, name: 'Warning import', issuePrefix: 'WRN' });
+    const read = githubFixture({ 'skills/test-audit/SKILL.md': md('test-audit') + '\nRead [optional](references/unavailable.md).' });
+    const localContext = { ...context, read: () => read };
+    try {
+      const service = skillSourceService(db);
+      const imported = await service.create(temporaryCompany, { repositoryUrl: 'https://github.com/acme/skills',
+        selectedPaths: ['skills/test-audit/SKILL.md'] }, localContext);
+      expect(imported.imported).toHaveLength(1);
+      expect(imported.warnings.join(' ')).toContain('references/unavailable.md');
+      const skillId = imported.imported[0]!.id;
+      await db.update(companySkillSourceEntries).set({ error: 'This skill depends on files that its imported package cannot provide. Its dependencies could not be preserved.' })
+        .where(eq(companySkillSourceEntries.sourceId, imported.source.id));
+      const open = vi.spyOn(read, 'openSnapshot');
+      const repaired = await service.refresh(temporaryCompany, imported.source.id, localContext, undefined, undefined, { checkCommit: true });
+      expect(open).toHaveBeenCalledOnce();
+      expect(repaired.source.entries[0]).toMatchObject({ skillId, error: null });
+      expect(repaired.source.entries[0]!.inspection?.references).toHaveLength(1);
+      open.mockClear();
+      await service.refresh(temporaryCompany, imported.source.id, localContext, undefined, undefined, { checkCommit: true });
+      expect(open).not.toHaveBeenCalled();
+    } finally { await deleteCompany(db, temporaryCompany); }
   });
 
   it('cascades repository snapshots and referencing versions when the owning company is deleted', async () => {

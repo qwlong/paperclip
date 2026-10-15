@@ -19,7 +19,17 @@ export function assertHarnessTestPassed(result: AdapterEnvironmentTestResult) {
   const authenticationFailed = result.checks.some(check =>
     check.code === ADAPTER_AUTH_MISSING_CHECK_CODE || /_hello_probe_auth_required$/.test(check.code));
   const incomplete = !verified && (result.status === "warn" || result.checks.some(check => check.code.includes("hello_probe")));
-  if (result.status === "fail" || authenticationFailed || incomplete) throw Object.assign(new Error("The harness test failed"), { code: "harness_test_failed" });
+  if (result.status === "fail" || authenticationFailed || incomplete) {
+    const has = (suffix: string) => result.checks.some(check => check.code.endsWith(suffix));
+    const code = authenticationFailed ? "harness_auth_failed"
+      : has("_hello_probe_model_unavailable") || has("_model_invalid") ? "harness_model_unavailable"
+      : has("_command_unresolvable") ? "harness_command_unavailable"
+      : has("_cwd_invalid") ? "harness_cwd_invalid"
+      : has("_hello_probe_timed_out") ? "harness_probe_timed_out"
+      : has("_hello_probe_unexpected_output") ? "harness_probe_unexpected_output"
+      : "harness_test_failed";
+    throw Object.assign(new Error("The harness test failed"), { code });
+  }
 }
 
 export function agentHarnessVerificationService(db: Db, manager: PluginWorkerManager) {

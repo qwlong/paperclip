@@ -5,7 +5,7 @@ import { hoistModuleGraph } from "./helpers/hoist-module-graph.js";
 
 const mockCaptureRunIdentity = vi.hoisted(() => vi.fn());
 
-const mockSkillSourceService = vi.hoisted(() => ({ sourceForSkill: vi.fn(), importFromUrl: vi.fn(), discover: vi.fn() }));
+const mockSkillSourceService = vi.hoisted(() => ({ sourceForSkill: vi.fn(), importFromUrl: vi.fn(), discover: vi.fn(), branches: vi.fn() }));
 
 const mockAgentService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -1344,6 +1344,17 @@ describe("company skill mutation permissions", () => {
     }
   });
 
+  it('lists authorized source branches with a validated connection override', async () => {
+    const app = createApp({ type: 'board', userId: 'member', companyIds: ['company-1'], source: 'session' });
+    const connectionId = '00000000-0000-4000-8000-000000000042';
+    const data = { defaultBranch: 'master', branches: [{ name: 'master', isDefault: true }], truncated: false };
+    mockSkillSourceService.branches.mockResolvedValue(data);
+    const path = '/api/companies/company-1/skill-sources/source-id/branches';
+    expect((await request(app).get(path).query({ connectionId }).expect(200)).body).toEqual(data);
+    expect(mockSkillSourceService.branches).toHaveBeenCalledWith('company-1', 'source-id', { connectionId }, expect.objectContaining({ read: expect.any(Function) }), expect.any(AbortSignal));
+    await request(app).get(path).query({ connectionId: 'invalid' }).expect(400);
+  });
+
   it("rejects cross-company source reads and mutations for board users and agents", async () => {
     for (const actor of [
       { type: "board", userId: "member", companyIds: ["company-1"], isInstanceAdmin: true, source: "session" },
@@ -1352,7 +1363,7 @@ describe("company skill mutation permissions", () => {
       const app = createApp(actor);
       const base = "/api/companies/company-2/skill-sources";
       const responses = await Promise.all([
-        request(app).get(base), request(app).get(`${base}/repositories`), request(app).get(`${base}/source-id`),
+        request(app).get(base), request(app).get(`${base}/repositories`), request(app).get(`${base}/source-id`), request(app).get(`${base}/source-id/branches`),
         request(app).post(`${base}/discover`).send({ repositoryUrl: "https://github.com/acme/skills" }),
         request(app).post(`${base}/discover`).set('Accept', 'application/x-ndjson').send({ repositoryUrl: "https://github.com/acme/skills" }),
         request(app).post(`${base}/preview`).send({ repositoryUrl: "https://github.com/acme/skills", commitSha: "a".repeat(40), skillPath: "SKILL.md", filePath: "SKILL.md" }),

@@ -84,6 +84,14 @@ remaining operations before qualifying the whole capability.
 Gaps: Scoped sessions remain agent/run-bound. MCP requires its existing protocol
 client; named gateways and gateway-token management retain board permissions.
 
+Discovery collapses identical descriptors with the same gateway name across
+providers, including native assigned-tool startup and fresh searches. Conflicting
+definitions remain an error. Distinct names and the normal invocation grants,
+approvals and revocation checks remain independent. Regression coverage lives in
+[gateway tests](../../server/src/__tests__/tool-gateway.test.ts) and
+[assigned-tool tests](../../server/src/services/native-runtime/assigned-mcp-tools.test.ts);
+these fixtures do not certify a live external-client journey.
+
 ## `tokens`
 
 Review: `baseline`.

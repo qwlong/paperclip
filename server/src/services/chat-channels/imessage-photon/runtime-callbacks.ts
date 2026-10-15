@@ -6,7 +6,7 @@ import { and, eq, inArray, sql } from "drizzle-orm";
 import { chatConversations, chatEndpoints, heartbeatRuns, toolConnections } from "@paperclipai/db";
 import type { ChatSdkRuntimeCallbacks } from "../../chat-sdk-runtime.js";
 import type { Db } from "@paperclipai/db";
-import type { RuntimeContext, EndpointRow, EndpointRecord } from "../runtime-types.js";
+import type { RuntimeContext, EndpointRow, EndpointRecord, LiveInboundMessage } from "../runtime-types.js";
 import type { createChatReceiverOwnership } from "../runtime/ownership.js";
 import type { createChatMessageLifecycle } from "../inbound/lifecycle.js";
 type PhotonRuntimeOptions = {
@@ -42,4 +42,22 @@ export function createPhotonRuntimeCallbacks(db: Db, options: PhotonRuntimeOptio
       await writePhotonCheckpoint(new PhotonState({ companyId: companyId, endpointId: endpointId }, createChatSdkStatePersistence(tx as unknown as Db)), lineId, sequence);
     })
   };
+}
+
+export const PHOTON_MESSAGE_INGRESS_ONLY = true;
+
+export function discardPhotonInboundMessages(
+  liveInboundMessages: Map<string, LiveInboundMessage>,
+  getCurrentRuntime: () => RuntimeContext["endpointRuntime"] | null,
+): void {
+  for (const [deliveryId, live] of liveInboundMessages) {
+    if (live.runtimeContext?.endpointRuntime === getCurrentRuntime() && live.thread.id.startsWith("imessage-photon:")) liveInboundMessages.delete(deliveryId);
+  }
+}
+
+export function photonRuntimeStatusMayAdvance(
+  initial: Pick<EndpointRow, "status">,
+  latest: Pick<EndpointRow, "status">,
+): boolean {
+  return initial.status === "attention" && ["active", "verifying"].includes(latest.status);
 }

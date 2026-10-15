@@ -140,7 +140,7 @@ const support = await getEmbeddedPostgresTestSupport();
       const work = worker(createLifecycleDriver(db, {} as never).runHost);
       await work.process(agent.id);
       expect(probe).toHaveBeenCalled();
-      expect(await current(agent.id)).toMatchObject({ lifecycleState: "verifying", lifecycleError: "The lifecycle step failed. Retry the operation." });
+      expect(await current(agent.id)).toMatchObject({ lifecycleState: "verifying", lifecycleError: expect.stringContaining("Execution configuration check failed. Authentication failed.") });
     } finally { probe.mockRestore(); }
   });
 
