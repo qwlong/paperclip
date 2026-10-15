@@ -31,7 +31,7 @@ async function readProcessGroupMemberPids(processGroupId: number) {
 /** Start times of the group's live members; members that exit mid-read are skipped. */
 export async function readProcessGroupMemberStartedAt(processGroupId: number) {
   const starts = await Promise.all((await readProcessGroupMemberPids(processGroupId))
-    .map(pid => readProcessStartedAt(pid).then(startedAt => new Date(startedAt), () => null)));
+    .map(pid => readProcessStartedAt(pid).then(startedAt => startedAt ? new Date(startedAt) : null, () => null)));
   return starts.filter((startedAt): startedAt is Date => startedAt !== null && !Number.isNaN(startedAt.getTime()));
 }
 
