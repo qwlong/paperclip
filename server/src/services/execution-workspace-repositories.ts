@@ -633,7 +633,7 @@ export function executionWorkspaceRepositoryService(db: Db) {
       if (!currentDecision.allowed) throw forbidden("Task workspace modification is not allowed");
       if (input.actor.type === "agent" && !["standard", "skill_test"].includes(issue.workMode)) throw forbidden("Repository preparation is unavailable in Ask or Plan mode");
       if (!issue.executionWorkspaceId) throw conflict("The task has no admitted workspace yet. Start it once before preparing a repository.");
-      if (!(await canActorReadExecutionWorkspace(db, input.actor, issue.executionWorkspaceId))) throw notFound("Execution workspace not found");
+      if (!(await canActorReadExecutionWorkspace(tx, input.actor, issue.executionWorkspaceId))) throw notFound("Execution workspace not found");
       const [workspace] = await tx.select().from(executionWorkspaces).where(and(eq(executionWorkspaces.id, issue.executionWorkspaceId), eq(executionWorkspaces.companyId, input.companyId), taskWorkspaceSelectableCondition())).for("no key update");
       if (!workspace) throw conflict("Execution workspace is unavailable");
       await assertTaskWorkspaceAccess(tx, input.actor, input.companyId, workspace.id, { write: true, issueId: input.issueId });
