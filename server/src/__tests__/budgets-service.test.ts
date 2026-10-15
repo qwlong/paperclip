@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -234,24 +234,38 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
     }
   });
 
-  describe("admission while another writer holds the company accounting lock", () => {
+  describe("while another writer holds the company accounting lock", () => {
+    // Resolves "blocked" once any session waits on the holder's lock, so the
+    // verdict does not depend on how fast the machine is.
     async function withCompanyLocked<T>(companyId: string, check: () => Promise<T>) {
       let release!: () => void;
       const held = new Promise<void>((resolve) => { release = resolve; });
-      let locked!: () => void;
-      const ready = new Promise<void>((resolve) => { locked = resolve; });
+      let locked!: (pid: number) => void;
+      const ready = new Promise<number>((resolve) => { locked = resolve; });
       const holder = db.transaction(async (tx) => {
         await tx.select({ id: companies.id }).from(companies).where(eq(companies.id, companyId)).for("no key update");
-        locked();
+        const [{ pid }] = await tx.execute<{ pid: number }>(sql`select pg_backend_pid() as pid`);
+        locked(pid);
         await held;
       });
-      await ready;
+      const holderPid = await ready;
+      let settled = false;
+      const result = check().finally(() => { settled = true; });
+      const blocked = (async () => {
+        while (!settled) {
+          const [{ waiting }] = await db.execute<{ waiting: number }>(
+            sql`select count(*)::int as waiting from pg_stat_activity where ${holderPid} = any(pg_blocking_pids(pid))`);
+          if (waiting > 0) return "blocked" as const;
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        return result;
+      })();
       try {
-        const timeout = new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 1_000));
-        return await Promise.race([check(), timeout]);
+        return await Promise.race([result, blocked]);
       } finally {
         release();
         await holder;
+        await result.catch(() => undefined);
       }
     }
 
@@ -280,6 +294,81 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
       const service = budgetService(db);
 
       expect(await withCompanyLocked(companyId, () => service.getInvocationBlock(companyId, agentId))).toBe("blocked");
+    });
+
+    async function createAgentPolicy(companyId: string, agentId: string) {
+      const [policy] = await db.insert(budgetPolicies)
+        .values({ companyId, scopeType: "agent", scopeId: agentId, windowKind: "lifetime", amount: 100 }).returning();
+      return policy!;
+    }
+
+    it("reconciliation skips the lock when every policy is settled", async () => {
+      const { companyId, agentId } = await createBudgetFixture();
+      await createAgentPolicy(companyId, agentId);
+      const service = budgetService(db);
+
+      expect(await withCompanyLocked(companyId, () => service.reconcilePolicies())).toBeUndefined();
+    });
+
+    async function openIncident(companyId: string, agentId: string, policyId: string, thresholdType: "hard" | "soft") {
+      await db.insert(budgetIncidents).values({
+        companyId, policyId, scopeType: "agent", scopeId: agentId, metric: "billed_cents", windowKind: "lifetime",
+        windowStart: new Date(0), windowEnd: new Date(), thresholdType, amountLimit: 100, amountObserved: "90", status: "open",
+      });
+    }
+
+    it("reconciliation leaves a still-warranted soft incident alone without the lock", async () => {
+      const { companyId, agentId } = await createBudgetFixture();
+      const policy = await createAgentPolicy(companyId, agentId);
+      await insertCostEvent({ companyId, agentId, costCents: 90 });
+      await openIncident(companyId, agentId, policy.id, "soft");
+      const service = budgetService(db);
+
+      expect(await withCompanyLocked(companyId, () => service.reconcilePolicies())).toBeUndefined();
+      expect(await db.select({ status: budgetIncidents.status }).from(budgetIncidents)).toEqual([{ status: "open" }]);
+    });
+
+    const incidentStates = async () =>
+      (await db.select().from(budgetIncidents)).map(({ thresholdType, status }) => `${thresholdType}:${status}`).sort();
+    const companyPause = async (companyId: string) =>
+      (await db.select({ pauseReason: companies.pauseReason }).from(companies).where(eq(companies.id, companyId)))[0]!.pauseReason;
+
+    it.each([
+      {
+        label: "a policy is exceeded",
+        arrange: async (companyId: string, agentId: string) => { await insertCostEvent({ companyId, agentId, costCents: 150 }); },
+        outcome: async () => expect(await incidentStates()).toContain("hard:open"),
+      },
+      {
+        label: "a hard incident is no longer warranted",
+        arrange: async (companyId: string, agentId: string, policyId: string) => {
+          // Above the warn line, so only the hard-incident rule makes the scope dirty.
+          await insertCostEvent({ companyId, agentId, costCents: 90 });
+          await openIncident(companyId, agentId, policyId, "hard");
+        },
+        outcome: async () => expect(await incidentStates()).toEqual(["hard:resolved"]),
+      },
+      {
+        label: "a soft incident is no longer warranted",
+        arrange: (companyId: string, agentId: string, policyId: string) => openIncident(companyId, agentId, policyId, "soft"),
+        outcome: async () => expect(await incidentStates()).toEqual(["soft:resolved"]),
+      },
+      {
+        label: "the company is paused for a budget it is back under",
+        arrange: async (companyId: string) => {
+          await db.insert(budgetPolicies).values({ companyId, scopeType: "company", scopeId: companyId, windowKind: "lifetime", amount: 100 });
+          await db.update(companies).set({ status: "paused", pauseReason: "budget", pausedAt: new Date() }).where(eq(companies.id, companyId));
+        },
+        outcome: async (_agentId: string, companyId: string) => expect(await companyPause(companyId)).toBeNull(),
+      },
+    ])("reconciliation takes the lock and applies the change when $label", async ({ arrange, outcome }) => {
+      const { companyId, agentId } = await createBudgetFixture();
+      const policy = await createAgentPolicy(companyId, agentId);
+      await arrange(companyId, agentId, policy.id);
+      const service = budgetService(db);
+
+      expect(await withCompanyLocked(companyId, () => service.reconcilePolicies())).toBe("blocked");
+      await outcome(agentId, companyId);
     });
   });
 
