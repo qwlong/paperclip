@@ -316,6 +316,23 @@ export function isWorkspaceSyncConflictFailure(
   );
 }
 
+/**
+ * A run can end non-zero only because Paperclip stopped background processes the
+ * agent left running after its terminal result. The agent reported no error, so
+ * that run must not take the agent out of rotation.
+ */
+export function isTerminalResultCleanupFailure(result: {
+  errorMessage?: string | null;
+  timedOut?: boolean;
+  resultJson?: Record<string, unknown> | null;
+}): boolean {
+  if (result.errorMessage || result.timedOut) return false;
+  const evidence = result.resultJson?.unmanagedBackgroundTask;
+  if (!evidence || typeof evidence !== "object" || Array.isArray(evidence)) return false;
+  const record = evidence as Record<string, unknown>;
+  return record.stopped === true && record.terminalResultSeen === true;
+}
+
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
@@ -1026,7 +1043,8 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         ((finalizedRun
           ? readHeartbeatRunErrorFamily(finalizedRun) === "provider_quota"
           : runErrorCode === "provider_quota") ||
-          isWorkspaceSyncConflictFailure(adapterResult.errorMessage)),
+          isWorkspaceSyncConflictFailure(adapterResult.errorMessage) ||
+          isTerminalResultCleanupFailure(adapterResult)),
       wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
     });
   }
