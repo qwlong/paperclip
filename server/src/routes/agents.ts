@@ -6014,14 +6014,42 @@ export function agentRoutes(
     res.status(202).json(run);
   };
 
-  router.post("/agents/:id/wakeup", validate(wakeAgentSchema), async (req, res) => {
+  // A wake body field the route does not read would be dropped silently and
+  // start a run outside the issue the caller meant, so reject it instead.
+  const rejectUnreadWakeFields = (readFields: readonly string[]) => {
+    const read = new Set(readFields);
+    return (req: Request, _res: Response, next: NextFunction) => {
+      const body: unknown = req.body;
+      const unread = body && typeof body === "object" && !Array.isArray(body)
+        ? Object.keys(body).filter((field) => !read.has(field))
+        : [];
+      if (unread.length > 0) {
+        throw badRequest(
+          `Unknown wake request field(s): ${unread.join(", ")}. Issue scope goes under "payload", for example {"payload":{"issueId":"<issue id>"}}.`,
+          { unknownFields: unread },
+        );
+      }
+      next();
+    };
+  };
+  const HEARTBEAT_INVOKE_FIELDS = [
+    "reason",
+    "payload",
+    "idempotencyKey",
+    "forceFreshSession",
+    "triggerDetail",
+    "debug",
+    "failedRunId",
+  ] as const;
+
+  router.post("/agents/:id/wakeup", rejectUnreadWakeFields(Object.keys(wakeAgentSchema.shape)), validate(wakeAgentSchema), async (req, res) => {
     await handleWakeupRoute(req, res, {
       source: req.body.source,
       skippedResponse: (agent, payload) => buildSkippedWakeupResponse(agent, payload),
     });
   });
 
-  router.post("/agents/:id/heartbeat/invoke", async (req, res) => {
+  router.post("/agents/:id/heartbeat/invoke", rejectUnreadWakeFields(HEARTBEAT_INVOKE_FIELDS), async (req, res) => {
     // Legacy endpoint. Hardcodes `source: "on_demand"` (the prior behavior
     // before the wakeup/invoke convergence). Reads scope fields directly off
     // the body without `validate(wakeAgentSchema)` because callers — including
@@ -6055,14 +6083,7 @@ export function agentRoutes(
       return;
     }
 
-    const body = (req.body ?? {}) as Partial<{
-      reason: unknown;
-      payload: unknown;
-      idempotencyKey: unknown;
-      forceFreshSession: unknown;
-      triggerDetail: unknown;
-      debug: unknown;
-    }>;
+    const body = (req.body ?? {}) as Partial<Record<(typeof HEARTBEAT_INVOKE_FIELDS)[number], unknown>>;
     const contextSnapshot: Record<string, unknown> = {
       triggeredBy: req.actor.type,
       originIdentityContextId: req.actor.identityContextId ?? null,

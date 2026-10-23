@@ -981,6 +981,49 @@ describe("agent live run routes", () => {
     });
   });
 
+  describe("wake request bodies with fields the route does not read", () => {
+    const misplacedScopeBodies = [
+      { issueId: "issue-1" },
+      { taskId: "issue-1" },
+      { issue_id: "issue-1" },
+      { contextIssueId: "issue-1" },
+      { reason: "continue", issueId: "issue-1" },
+      { reason: "continue", payload: { issueId: "issue-1" }, extra: true },
+    ];
+    it.each(
+      ["wakeup", "heartbeat/invoke"].flatMap((endpoint) =>
+        misplacedScopeBodies.map((body) => [endpoint, body] as const),
+      ),
+    )("%s rejects %j instead of starting an unscoped run", async (endpoint, body) => {
+      const res = await requestApp(await createApp(), (baseUrl) =>
+        request(baseUrl)
+          .post(`/api/agents/${routeAgentId}/${endpoint}?companyId=company-1`)
+          .send(body),
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(400);
+      expect(res.body.error).toContain('{"payload":{"issueId":');
+      for (const key of Object.keys(body).filter((key) => key !== "reason" && key !== "payload")) {
+        expect(res.body.error).toContain(key);
+      }
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    });
+
+    it.each(["wakeup", "heartbeat/invoke"])("%s still accepts the issue scope under payload", async (endpoint) => {
+      const res = await requestApp(await createApp(), (baseUrl) =>
+        request(baseUrl)
+          .post(`/api/agents/${routeAgentId}/${endpoint}?companyId=company-1`)
+          .send({ reason: "continue", payload: { issueId: "issue-1" } }),
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(202);
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        routeAgentId,
+        expect.objectContaining({ payload: expect.objectContaining({ issueId: "issue-1" }) }),
+      );
+    });
+  });
+
   it.each(["wakeup", "heartbeat/invoke"])("lets an operator start an existing agent via %s without creating agents", async (endpoint) => {
     mockAccessService.decide.mockImplementation(async ({ action }) => ({
       allowed: action === "agent:wake", explanation: "Missing permission: agents:create",
