@@ -11,6 +11,7 @@ import {
   isClaudeUnknownSessionError,
   isClaudeImageProcessingError,
   isClaudeModelNotFoundError,
+  hasClaudePromptResult,
 } from "./parse.js";
 
 describe("detectClaudeLoginRequired", () => {
@@ -732,5 +733,51 @@ describe("interrupted Claude accounting", () => {
     expect(parsed.usage).toEqual({ inputTokens: 35, cachedInputTokens: 40, outputTokens: 9 });
     expect(parsed.usageBasis).toBe("per_run");
     expect(parsed.costUsd).toBeNull();
+  });
+});
+
+describe("hasClaudePromptResult", () => {
+  const line = (value: Record<string, unknown>) => JSON.stringify(value);
+  const promptResult = line({ type: "result", subtype: "success", is_error: false, num_turns: 12, result: "Committed D4." });
+  // A resumed session reports a background shell the previous process left behind,
+  // before it has read this run's prompt: zero turns, nothing answered.
+  const staleNotification = line({
+    type: "result", subtype: "success", is_error: false, num_turns: 0, result: "",
+    total_cost_usd: 58.37, origin: { kind: "task-notification" },
+  });
+  const notificationVariants = [
+    { kind: "task-notification" },
+    { kind: "task-notification", producer: "session-task" },
+    { kind: "task-notification", producer: "session-task", runId: "0mvkmhszd-f78723db" },
+  ];
+  const init = line({ type: "system", subtype: "init", session_id: "s1" });
+
+  it.each(notificationVariants)("does not count a background task notification as the answer (%o)", (origin) => {
+    expect(hasClaudePromptResult([init, line({ type: "result", subtype: "success", num_turns: 0, origin })].join("\n"))).toBe(false);
+  });
+
+  it.each([
+    ["the prompt result alone", [init, promptResult]],
+    ["a stale notification, then the prompt result", [init, staleNotification, promptResult]],
+    ["the prompt result, then a late notification", [init, promptResult, staleNotification]],
+    ["a result with an origin it does not know", [init, line({ type: "result", subtype: "success", origin: { kind: "something-new" } })]],
+    ["an error result", [init, line({ type: "result", subtype: "error_during_execution", is_error: true })]],
+  ])("sees the answer in %s", (_name, lines) => {
+    expect(hasClaudePromptResult(lines.join("\n"))).toBe(true);
+  });
+
+  it.each([
+    ["no output", ""],
+    ["only the stale notification", [init, staleNotification].join("\n")],
+    ["assistant text and a cut-off line", [init, line({ type: "assistant", message: { content: [] } }), '{"type":"res'].join("\n")],
+  ])("sees no answer in %s", (_name, stdout) => {
+    expect(hasClaudePromptResult(stdout)).toBe(false);
+  });
+
+  it("still keeps the last result for accounting, notifications included", () => {
+    // Notifications after the answer carry cumulative cost; dropping them would undercount.
+    const late = line({ type: "result", subtype: "success", num_turns: 1, total_cost_usd: 0.39, origin: { kind: "task-notification" } });
+    const parsed = parseClaudeStreamJson([init, line({ type: "result", subtype: "success", total_cost_usd: 0.37 }), late].join("\n"));
+    expect(parsed.costUsd).toBeCloseTo(0.39);
   });
 });
