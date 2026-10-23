@@ -846,6 +846,8 @@ export interface WakeupOptions {
   idempotencyKey?: string | null;
   requestedByActorType?: "user" | "agent" | "system";
   requestedByActorId?: string | null;
+  /** Run whose authenticated agent token sent this wake; never copied from caller payloads. */
+  requestedByRunId?: string | null;
   contextSnapshot?: Record<string, unknown>;
   issueStateGuard?: {
     statuses: string[];

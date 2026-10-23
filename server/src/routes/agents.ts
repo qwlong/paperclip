@@ -5953,6 +5953,7 @@ export function agentRoutes(
       idempotencyKey: req.body.idempotencyKey ?? null,
       requestedByActorType: req.actor.type === "agent" ? "agent" : "user",
       requestedByActorId: req.actor.type === "agent" ? req.actor.agentId ?? null : req.actor.userId ?? null,
+      requestedByRunId: req.actor.type === "agent" ? req.actor.runId ?? null : null,
       contextSnapshot: {
         ...retryConversationContext,
         // Only the selected server-owned run can carry review authority into
@@ -6107,6 +6108,7 @@ export function agentRoutes(
       triggerDetail: typeof body.triggerDetail === "string" ? body.triggerDetail as "manual" | "system" | "ping" | "callback" : "manual",
       requestedByActorType: req.actor.type === "agent" ? "agent" : "user",
       requestedByActorId: req.actor.type === "agent" ? req.actor.agentId ?? null : req.actor.userId ?? null,
+      requestedByRunId: req.actor.type === "agent" ? req.actor.runId ?? null : null,
       contextSnapshot,
     };
     if (typeof body.reason === "string" && body.reason.length > 0) {

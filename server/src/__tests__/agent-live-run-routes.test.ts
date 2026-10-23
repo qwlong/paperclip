@@ -946,6 +946,7 @@ describe("agent live run routes", () => {
       },
       requestedByActorType: "user",
       requestedByActorId: "local-board",
+      requestedByRunId: null,
       contextSnapshot: {
         triggeredBy: "board",
         actorId: "local-board",
@@ -972,6 +973,7 @@ describe("agent live run routes", () => {
       triggerDetail: "manual",
       requestedByActorType: "user",
       requestedByActorId: "local-board",
+      requestedByRunId: null,
       contextSnapshot: {
         triggeredBy: "board",
         actorId: "local-board",
@@ -1022,6 +1024,35 @@ describe("agent live run routes", () => {
         expect.objectContaining({ payload: expect.objectContaining({ issueId: "issue-1" }) }),
       );
     });
+  });
+
+  it.each(["wakeup", "heartbeat/invoke"])("%s names the sending run from the agent token, not from the body", async (endpoint) => {
+    const tokenRunId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const res = await requestApp(await createApp(undefined, {
+      type: "agent", agentId: routeAgentId, companyId: "company-1", runId: tokenRunId, source: "agent_jwt",
+    }), (baseUrl) =>
+      request(baseUrl)
+        .post(`/api/agents/${routeAgentId}/${endpoint}?companyId=company-1`)
+        .send({ reason: "continue", payload: { issueId: "issue-1", requestedByRunId: "forged-run" } }),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(202);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      routeAgentId,
+      expect.objectContaining({ requestedByRunId: tokenRunId }),
+    );
+  });
+
+  it.each(["wakeup", "heartbeat/invoke"])("%s sent by an operator names no sending run", async (endpoint) => {
+    const res = await requestApp(await createApp(undefined, {
+      type: "board", userId: "operator", source: "session", companyIds: ["company-1"], runId: "operator-header-run",
+    }), (baseUrl) => request(baseUrl).post(`/api/agents/${routeAgentId}/${endpoint}`).send({}));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(202);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      routeAgentId,
+      expect.objectContaining({ requestedByRunId: null }),
+    );
   });
 
   it.each(["wakeup", "heartbeat/invoke"])("lets an operator start an existing agent via %s without creating agents", async (endpoint) => {
