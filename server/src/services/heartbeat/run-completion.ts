@@ -476,6 +476,42 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
               "adapter_failed")
             : null;
 
+    async function persistSessionState(finalizedRun: typeof heartbeatRuns.$inferSelect) {
+      await updateRuntimeState(
+        agent,
+        finalizedRun,
+        adapterResult,
+        { legacySessionId: nextSessionState.legacySessionId },
+        normalizedUsage,
+      );
+      if (!taskKey) return;
+      if (
+        adapterResult.clearSession ||
+        (!nextSessionState.params && !nextSessionState.displayId)
+      ) {
+        await clearTaskSessions(agent.companyId, agent.id, {
+          taskKey,
+          adapterType: agent.adapterType,
+          expectedRunId: finalizedRun.id,
+        });
+      } else {
+        await upsertTaskSession({
+          companyId: agent.companyId,
+          agentId: agent.id,
+          adapterType: agent.adapterType,
+          taskKey,
+          sessionParamsJson: attachPaperclipSessionMetadataToSessionParams(
+            nextSessionState.params,
+            configuredModel,
+            sessionConfigMetadata,
+          ),
+          sessionDisplayId: nextSessionState.displayId,
+          lastRunId: finalizedRun.id,
+          lastError: runErrorMessage,
+        });
+      }
+    }
+
     let logSummary: {
       bytes: number | null;
       sha256?: string | null;
@@ -729,6 +765,9 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         );
       }
       const livenessRun = finalizedRun;
+      // Releasing the issue below can start a successor run for the same task
+      // at once, and it resumes whatever session is stored when it starts.
+      await persistSessionState(livenessRun);
       await refreshContinuationSummaryForRun(livenessRun, agent);
       const skipRunIssueComment =
         parseObject(livenessRun.contextSnapshot).skipIssueComment === true;
@@ -997,46 +1036,6 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         }
       }
     }
-
-    if (finalizedRun) {
-      await updateRuntimeState(
-        agent,
-        finalizedRun,
-        adapterResult,
-        {
-          legacySessionId: nextSessionState.legacySessionId,
-        },
-        normalizedUsage,
-      );
-      if (taskKey) {
-        if (
-          adapterResult.clearSession ||
-          (!nextSessionState.params && !nextSessionState.displayId)
-        ) {
-          await clearTaskSessions(agent.companyId, agent.id, {
-            taskKey,
-            adapterType: agent.adapterType,
-            expectedRunId: finalizedRun.id,
-          });
-        } else {
-          await upsertTaskSession({
-            companyId: agent.companyId,
-            agentId: agent.id,
-            adapterType: agent.adapterType,
-            taskKey,
-            sessionParamsJson:
-              attachPaperclipSessionMetadataToSessionParams(
-                nextSessionState.params,
-                configuredModel,
-                sessionConfigMetadata,
-              ),
-            sessionDisplayId: nextSessionState.displayId,
-            lastRunId: finalizedRun.id,
-            lastError: runErrorMessage,
-          });
-        }
-      }
-    }
     await finalizeAgentStatus(agent.id, outcome, runErrorMessage, {
       keepIdleOnFailure:
         outcome === "failed" &&
@@ -1194,40 +1193,6 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       });
       const livenessRun =
         (await classifyAndPersistRunLiveness(failedRun)) ?? failedRun;
-      try {
-        await completeSkillTestRunForHeartbeatOutcome({
-          run: livenessRun,
-          issueId,
-          issueWorkMode: issueRef?.workMode ?? null,
-          outcome: "failed",
-          error: message,
-        });
-      } catch (err) {
-        logger.warn(
-          { err, runId: livenessRun.id, issueId },
-          "failed to complete skill test run after heartbeat adapter failure",
-        );
-      }
-      await refreshContinuationSummaryForRun(livenessRun, agent);
-      if (
-        !isWorkspaceValidationFailedRun(livenessRun) &&
-        !isConfigurationIncompleteFailedRun(livenessRun)
-      ) {
-        await finalizeIssueCommentPolicy(livenessRun, agent);
-      }
-      await scheduleInteractionContinuationInfrastructureRetryIfEligible(
-        livenessRun,
-        agent,
-      );
-      await releaseIssueExecutionAndPromote(livenessRun, {
-        // Native recovery owns the original heartbeat run through
-        // exhaustion. Once its durable coordinator has classified a
-        // terminal failure, generic issue recovery must not create a
-        // replacement retryOfRunId chain for the same provider work.
-        suppressImmediateRecovery: nativeTerminalFailureCode !== null,
-      });
-      await handleIssueReviewPathDisposition(livenessRun);
-
       await updateRuntimeState(
         agent,
         livenessRun,
@@ -1268,6 +1233,39 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           lastError: message,
         });
       }
+      try {
+        await completeSkillTestRunForHeartbeatOutcome({
+          run: livenessRun,
+          issueId,
+          issueWorkMode: issueRef?.workMode ?? null,
+          outcome: "failed",
+          error: message,
+        });
+      } catch (err) {
+        logger.warn(
+          { err, runId: livenessRun.id, issueId },
+          "failed to complete skill test run after heartbeat adapter failure",
+        );
+      }
+      await refreshContinuationSummaryForRun(livenessRun, agent);
+      if (
+        !isWorkspaceValidationFailedRun(livenessRun) &&
+        !isConfigurationIncompleteFailedRun(livenessRun)
+      ) {
+        await finalizeIssueCommentPolicy(livenessRun, agent);
+      }
+      await scheduleInteractionContinuationInfrastructureRetryIfEligible(
+        livenessRun,
+        agent,
+      );
+      await releaseIssueExecutionAndPromote(livenessRun, {
+        // Native recovery owns the original heartbeat run through
+        // exhaustion. Once its durable coordinator has classified a
+        // terminal failure, generic issue recovery must not create a
+        // replacement retryOfRunId chain for the same provider work.
+        suppressImmediateRecovery: nativeTerminalFailureCode !== null,
+      });
+      await handleIssueReviewPathDisposition(livenessRun);
     }
 
     await finalizeAgentStatus(agent.id, "failed", message, {

@@ -275,6 +275,36 @@ describe.skipIf(!support.supported)("heartbeat run completion boundary", () => {
     expect(f.deps.upsertTaskSession).not.toHaveBeenCalled();
   });
 
+  it.each([
+    { name: "a succeeded run", operation: "completeRun", result: {} },
+    { name: "a failed run", operation: "completeRun", result: { signal: "SIGTERM" } },
+    { name: "a timed-out run", operation: "completeRun", result: { timedOut: true } },
+    { name: "a session reset", operation: "completeRun", result: { clearSession: true } },
+    { name: "an adapter failure", operation: "failRun", result: {} },
+  ] as const)("saves the task session before releasing the issue to a successor ($name)", async ({ operation, result }) => {
+    const f = await fixture();
+    const readTaskSession = async () => {
+      const row = await f.deps.getTaskSession(f.agent.companyId, f.agent.id, f.agent.adapterType, "completion-task");
+      return row ? { sessionDisplayId: row.sessionDisplayId, lastRunId: row.lastRunId } : null;
+    };
+    const [predecessor] = await db.insert(heartbeatRuns).values({ companyId: f.run.companyId, agentId: f.agent.id, status: "succeeded", runtimeMode: "legacy" }).returning();
+    await f.deps.upsertTaskSession({ companyId: f.agent.companyId, agentId: f.agent.id, adapterType: f.agent.adapterType, taskKey: "completion-task",
+      sessionParamsJson: { sessionId: "predecessor-session" }, sessionDisplayId: "predecessor-session", lastRunId: predecessor.id, lastError: null });
+    let seenBySuccessor: Awaited<ReturnType<typeof readTaskSession>> | undefined;
+    f.deps.releaseIssueExecutionAndPromote.mockImplementation(async () => { seenBySuccessor = await readTaskSession(); });
+    Object.assign(f.input.adapterResult, result);
+    const failure = f.failure(new Error("adapter crashed"));
+    failure.goalCheckpointSession.current = { params: { sessionId: "checkpoint" }, displayId: "checkpoint" };
+
+    if (operation === "completeRun") await f.completion.completeRun(f.input);
+    else await f.completion.failRun(failure);
+
+    const saved = await readTaskSession();
+    expect(saved).not.toEqual({ sessionDisplayId: "predecessor-session", lastRunId: predecessor.id });
+    expect(f.deps.releaseIssueExecutionAndPromote).toHaveBeenCalledOnce();
+    expect(seenBySuccessor).toEqual(saved);
+  });
+
   it("redacts execution failures, retains restore evidence and resumes the latest checkpoint", async () => {
     const f = await fixture();
     const failure = f.failure(new Error("private-identity-material crashed"));
