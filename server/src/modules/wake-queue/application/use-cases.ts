@@ -770,6 +770,8 @@ export type AdmitWakeBehindIssueExecutionInput = {
   payload: Record<string, unknown> | null;
   requestedByActorType: string | null;
   requestedByActorId: string | null;
+  /** Run whose agent token sent this wake, when an agent sent it. */
+  requestedByRunId?: string | null;
   idempotencyKey: string | null;
 };
 
@@ -803,10 +805,13 @@ export function createAdmitWakeBehindIssueExecution(deps: {
       agentNameKey: input.agentNameKey,
     });
 
+    // A run that wakes its own agent for its own issue is asking for the next
+    // run, which can only start after this one ends.
+    const sentByActiveRun = input.requestedByRunId === input.activeExecutionRun.id;
     // A manual click establishes a fresh execution identity. Even a matching
     // requester can have a different originating identity on an exact retry.
     const shouldDeferFollowupWake =
-      Boolean(manualUserWakeActorId) || deps.helpers.shouldDeferFollowupWakeForSameIssue({
+      Boolean(manualUserWakeActorId) || sentByActiveRun || deps.helpers.shouldDeferFollowupWakeForSameIssue({
         activeRunStatus: input.activeExecutionRun.status,
         isSameExecutionAgent,
         wakeCommentId: input.wakeCommentId,

@@ -451,6 +451,82 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
     expect(runs[0]?.id).toBe(runId);
   });
 
+  it.each([
+    { sender: "the running execution run itself", sentByActiveRun: true, expected: "deferred" },
+    { sender: "another run of the same agent", sentByActiveRun: false, expected: "coalesced" },
+  ])("a same-issue wake sent by $sender is $expected", async ({ sentByActiveRun, expected }) => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const heartbeat = heartbeatService(db);
+
+    await db.insert(companies).values(wakeCompanyRow(companyId, issuePrefix));
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Builder",
+      role: "engineer",
+      status: "running",
+      adapterType: "process",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "on_demand",
+      triggerDetail: "manual",
+      status: "running",
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+    });
+    runningProcesses.set(runId, { child: {} as never, graceSec: 0, processGroupId: null });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Keep building",
+      status: "in_progress",
+      priority: "medium",
+      responsibleUserId: "responsible-user",
+      assigneeAgentId: agentId,
+      executionRunId: runId,
+      executionAgentNameKey: "builder",
+      executionLockedAt: new Date(),
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+
+    const wakeRun = await heartbeat.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      reason: "next step: part 3",
+      payload: { issueId },
+      contextSnapshot: { triggeredBy: "agent", actorId: agentId },
+      requestedByActorType: "agent",
+      requestedByActorId: agentId,
+      requestedByRunId: sentByActiveRun ? runId : randomUUID(),
+    });
+
+    const wakes = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs.map((run) => run.id)).toEqual([runId]);
+    expect(wakes).toHaveLength(1);
+    if (expected === "deferred") {
+      expect(wakeRun).toBeNull();
+      expect(wakes[0]).toMatchObject({ status: "deferred_issue_execution", runId: null });
+      expect(wakes[0]?.payload).toMatchObject({ issueId });
+    } else {
+      expect(wakeRun?.id).toBe(runId);
+      expect(wakes[0]).toMatchObject({ status: "coalesced", runId });
+    }
+  });
+
   it("defers recovery hand-back wakes until the resolving run exits", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();

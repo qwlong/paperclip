@@ -3730,6 +3730,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 payload,
                 requestedByActorType: opts.requestedByActorType ?? null,
                 requestedByActorId: opts.requestedByActorId ?? null,
+                requestedByRunId: opts.requestedByRunId ?? null,
                 idempotencyKey: opts.idempotencyKey ?? null,
               },
             );
