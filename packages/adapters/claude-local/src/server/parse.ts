@@ -327,6 +327,18 @@ export function isClaudeModelNotFoundError(input: {
   return messages.some((message) => CLAUDE_MODEL_NOT_FOUND_RE.test(message));
 }
 
+/**
+ * Whether Claude has answered this invocation's prompt. A background task
+ * notification also emits a `result` event, and on resume it can arrive before
+ * the prompt is read, so only a result without that origin ends the run.
+ */
+export function hasClaudePromptResult(stdout: string): boolean {
+  return stdout.split(/\r?\n/).some((line) => {
+    const event = parseJson(line.trim());
+    return event?.type === "result" && parseObject(event.origin).kind !== "task-notification";
+  });
+}
+
 export function isClaudeMaxTurnsResult(parsed: Record<string, unknown> | null | undefined): boolean {
   if (!parsed) return false;
 

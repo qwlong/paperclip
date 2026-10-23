@@ -133,6 +133,16 @@ describe("claude_local run error code", () => {
     expect(result.errorCode).toBeNull();
   });
 
+  it("does not end the run on a background task notification that arrives before the answer", async () => {
+    runAdapterExecutionTargetProcess.mockResolvedValue(processResult({}));
+    await run();
+
+    const { hasTerminalResult } = runAdapterExecutionTargetProcess.mock.calls[0]![4].terminalResultCleanup;
+    const staleNotification = event({ type: "result", subtype: "success", num_turns: 0, result: "", origin: { kind: "task-notification" } });
+    expect(hasTerminalResult({ stdout: successResult, stderr: "" })).toBe(true);
+    expect(hasTerminalResult({ stdout: staleNotification, stderr: "" })).toBe(false);
+  });
+
   it("keeps a real login failure ahead of a stopped background task", async () => {
     runAdapterExecutionTargetProcess.mockResolvedValue(
       processResult({

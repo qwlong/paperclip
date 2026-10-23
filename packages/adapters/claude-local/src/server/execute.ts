@@ -71,6 +71,7 @@ import {
   detectClaudeLoginRequired,
   extractClaudeRetryNotBefore,
   isClaudeMaxTurnsResult,
+  hasClaudePromptResult,
   isClaudeProviderQuotaError,
   isClaudeRefusalResult,
   isClaudeTransientUpstreamError,
@@ -1051,7 +1052,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       settleRunDisposition: paperclipBridge?.settleRunDisposition,
       terminalResultCleanup: {
         graceMs: terminalResultCleanupGraceMs,
-        hasTerminalResult: ({ stdout }) => parseClaudeStreamJson(stdout).resultJson !== null,
+        hasTerminalResult: ({ stdout }) => hasClaudePromptResult(stdout),
       },
       localProcessSandbox,
     });
