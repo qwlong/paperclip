@@ -55,6 +55,12 @@ import { execute } from "./execute.js";
 
 type SpawnOptions = { stdin?: string; env: Record<string, string> };
 
+// stdin is stream-json: a usage-baseline control request, then the user message.
+function userMessageContent(stdin: string): string {
+  const user = stdin.split("\n").filter(Boolean).map((line) => JSON.parse(line)).find((record) => record.type === "user");
+  return user.message.content;
+}
+
 function spawnOptions(callIndex = 0): SpawnOptions {
   const call = runAdapterExecutionTargetProcess.mock.calls[callIndex] as unknown as unknown[];
   return call[4] as SpawnOptions;
@@ -144,7 +150,7 @@ describe("claude_local stableFreshSessionPrompt", () => {
 
     const wakeFile = env.PAPERCLIP_WAKE_PROMPT_FILE;
     expect(wakeFile).toBe(path.join(scratchDir, "paperclip-wake-prompt-run-stable-1.md"));
-    expect(await readFile(wakeFile, "utf8")).toBe(originalStdin);
+    expect(await readFile(wakeFile, "utf8")).toBe(userMessageContent(originalStdin));
   });
 
   it("keeps the fixed prompt byte-identical across runs with different wake payloads", async () => {
