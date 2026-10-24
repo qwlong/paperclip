@@ -87,6 +87,7 @@ import {
   resolveSharedClaudeConfigDir,
   writePaperclipClaudeMcpConfig,
 } from "./claude-config.js";
+import { readClaudeSessionCostBaseline } from "./session-cost-baseline.js";
 import {
   claudeCliVersionAtLeast,
   claudeCommandLooksLike,
@@ -1030,7 +1031,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       });
     }
 
-    const consumeAccounting = createClaudeStreamParser();
+    const costBaseline = resumeSessionId && !executionTargetIsRemote
+      ? await readClaudeSessionCostBaseline({ configDir: resolveSharedClaudeConfigDir(attemptEnv), sessionId: resumeSessionId })
+      : null;
+    if (resumeSessionId && !costBaseline) {
+      await onLog(
+        "stdout",
+        `[paperclip] Could not read the saved cost state of resumed Claude session "${resumeSessionId}"; this run's usage may include earlier runs of the session.\n`,
+      );
+    }
+    const consumeAccounting = createClaudeStreamParser({ costBaseline });
     const accountingLog = createUsageCheckpointLog(onLog, ctx.onUsage, stdout => {
       const parsed = consumeAccounting(stdout);
       return { usage: parsed.usage ?? undefined, usageBasis: "per_run", costUsd: parsed.costUsd,
@@ -1058,7 +1068,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     });
     await accountingLog.flush();
 
-    const parsedStream = parseClaudeStreamJson(proc.stdout);
+    const parsedStream = parseClaudeStreamJson(proc.stdout, { costBaseline });
     const parsed = parsedStream.resultJson ?? parseJson(proc.stdout);
     return { proc, parsedStream, parsed };
   };

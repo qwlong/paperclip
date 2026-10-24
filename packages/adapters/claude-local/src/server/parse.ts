@@ -6,6 +6,7 @@ import {
   parseObject,
   parseJson,
 } from "@paperclipai/adapter-utils/server-utils";
+import { subtractClaudeSessionCostBaseline, type ClaudeSessionCostBaseline } from "./session-cost-baseline.js";
 
 // The login-prompt markers. The Claude CLI prints these words when it asks the
 // user to log in. The detector matches them only against text the CLI wrote
@@ -67,12 +68,17 @@ export function claudeModelReceipts(modelUsage: unknown) {
   return receipts.every((part) => part !== null) ? receipts : undefined;
 }
 
-export function parseClaudeStreamJson(stdout: string) {
-  return createClaudeStreamParser()(stdout);
+export type ClaudeStreamParserOptions = {
+  /** The cost state a resumed session starts from; see `readClaudeSessionCostBaseline`. */
+  costBaseline?: ClaudeSessionCostBaseline | null;
+};
+
+export function parseClaudeStreamJson(stdout: string, options: ClaudeStreamParserOptions = {}) {
+  return createClaudeStreamParser(options)(stdout);
 }
 
 /** Consume complete JSONL records once, retaining protocol accounting state. */
-export function createClaudeStreamParser() {
+export function createClaudeStreamParser({ costBaseline = null }: ClaudeStreamParserOptions = {}) {
   let sessionId: string | null = null;
   let model = "";
   let finalResult: Record<string, unknown> | null = null;
@@ -125,7 +131,7 @@ export function createClaudeStreamParser() {
       }
 
       if (type === "result") {
-        finalResult = event;
+        finalResult = costBaseline ? subtractClaudeSessionCostBaseline(event, costBaseline) : event;
         sessionId = asString(event.session_id, sessionId ?? "") || sessionId;
       }
     }
@@ -158,8 +164,8 @@ export function createClaudeStreamParser() {
       model,
       costUsd,
       usage,
-      // modelUsage covers exactly this CLI invocation, so mark it per-run to
-      // keep the server from applying its session-cumulative delta heuristic.
+      // With the resumed session's baseline subtracted, modelUsage covers
+      // exactly this CLI invocation, so the server must not delta it again.
       usageBasis: "per_run" as const,
       summary,
       resultJson: finalResult,
