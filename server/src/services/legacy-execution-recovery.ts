@@ -2,8 +2,6 @@ import { hasRequiredWorkspaceRecovery, preserveWorkspaceRestoreRecoveryMetadata,
 import { hasUnrestoredRemoteWorkspace, preserveLegacyWorkspaceRestoreSources, type LegacyWorkspaceRestoreSource } from "./legacy-workspace-restore-recovery.js";
 import { isPreDispatchReviewWaitVerified } from "./pre-dispatch-review-wait.js";
 import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
-import { normalizeMaxTurnStopReason } from "./heartbeat-stop-metadata.js";
-import { claimedAdapterType, hasConversationContinuationPolicy } from "./conversation-continuation.js";
 import { randomUUID } from "node:crypto";
 import { and, desc, eq, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
 import { environmentLeases, heartbeatRuns, issueRecoveryActions, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
@@ -13,48 +11,12 @@ import { executionFailureRetryCount } from "./execution-recovery-attempt.js";
 import { logActivity } from "./activity-log.js";
 import { isSupersededConversationRun } from "./agent-conversations.js";
 import { issueService } from "./issues.js";
+import { isLegacyBootstrapStopCandidate, legacyExecutionNeedsReconciliation } from "./legacy-execution-outcome.js";
+
+export { isLegacyBootstrapStopCandidate, legacyExecutionNeedsReconciliation };
 
 type Run = typeof heartbeatRuns.$inferSelect;
 export const LEGACY_RECOVERY_CAUSE = "legacy_execution_requires_reconciliation";
-
-/** Error families describe availability, not whether earlier actions happened. */
-export function legacyExecutionNeedsReconciliation(
-  run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, "scheduledRetryAttempt" | "scheduledRetryReason" | "contextSnapshot">>,
-): boolean {
-  if (
-    run.runtimeMode === "native" ||
-    !["failed", "timed_out", "interrupted", "cancelled"].includes(run.status)
-  )
-    return false;
-  // A fresh model turn cannot repair or verify unrestored files.
-  if (run.resultJson?.workspaceRestoreFailure === "restore_unsafe_archive" || hasRequiredWorkspaceRecovery(run.resultJson)) return true;
-  // A fresh conversation turn lets the agent decide what remains. The retry
-  // scheduler, not an action-outcome hold, owns the automatic attempt limit.
-  if (hasConversationContinuationPolicy(run.resultJson)) return false;
-  // Productive turn-budget continuation is not a failed provider session.
-  if (normalizeMaxTurnStopReason(run.resultJson?.stopReason) ?? normalizeMaxTurnStopReason(run.errorCode)) return false;
-  const evidence = run.resultJson?.executionRecovery as
-    Record<string, unknown> | undefined;
-  if (run.status === "cancelled" && evidence?.kind === "interrupted"
-      && evidence.providerStopped === true && evidence.sessionPreserved === true
-      && evidence.actionOutcomes === "settled"
-      && (run.resultJson?.executionCancellation as Record<string, unknown> | undefined)?.state === "acknowledged") return false;
-  // Waiting for a subscription or workspace precedes provider execution. It is
-  // a resource wait, not a failed provider attempt or permission to replay work.
-  if (run.status === "cancelled" && (run.errorCode === "ai_connection_busy" || run.errorCode === "ai_connection_pool_exhausted") &&
-      evidence?.kind === "ai_connection_wait" && evidence.providerWorkStarted === false) return false;
-  if (run.status === "cancelled" && run.errorCode === "workspace_busy" &&
-      evidence?.kind === "workspace_wait" && evidence.providerWorkStarted === false) return false;
-  // Setup owns the bounded retry budget for temporary workspace scans. Its
-  // exhaustion needs workspace repair, not reconciliation of provider actions
-  // that the bootstrap evidence proves never started. Keep unknown outcomes held.
-  if ((run.errorCode === "workspace_git_scan_timeout" || run.errorCode === "workspace_git_scan_saturated") &&
-      evidence?.kind === "bootstrap" && evidence.providerWorkStarted === false) return false;
-  if (executionFailureRetryCount(run) >= 2) return true;
-  return !(
-    evidence?.kind === "bootstrap" && evidence.providerWorkStarted === false
-  );
-}
 
 /** Review-wait receipts are only exempt after retained execution evidence agrees.
  * The synchronous classifier stays conservative for callers without a DB proof. */
@@ -248,9 +210,9 @@ export async function terminalizeLegacyExecution(input: {
 }
 
 /** Called only by the exact executor's finally block after preparation/cleanup
- * settles. A shutdown can win the terminal-status race before the setup catch
- * records that no provider started. Retire only that mistaken recovery hold. */
-export async function settleInterruptedNativeBootstrap(
+ * settles. A shutdown or Stop can win the terminal-status race before the
+ * executor knows that no provider started. Retire only that mistaken recovery hold. */
+export async function settleLegacyBootstrapStop(
   db: Db, input: { run: Run; providerDispatchStarted: boolean },
 ): Promise<Run | null> {
   if (input.providerDispatchStarted) return null;
@@ -259,10 +221,8 @@ export async function settleInterruptedNativeBootstrap(
   return db.transaction(async tx => {
     const [task] = await tx.select().from(issues).where(and(eq(issues.id, issueId), eq(issues.companyId, input.run.companyId))).for("update");
     const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, input.run.id), eq(heartbeatRuns.companyId, input.run.companyId))).for("update");
-    if (!task || !run || run.runtimeMode !== "legacy" || run.runtimeModeResolvedAt ||
+    if (!task || !run || !isLegacyBootstrapStopCandidate(run) ||
         run.contextSnapshot?.issueId !== task.id ||
-        run.status !== "interrupted" || run.errorCode !== "server_shutdown_interrupted" ||
-        claimedAdapterType(run) !== "paperclip_runner" || run.processPid || run.processGroupId ||
         hasWorkspaceRestoreFailure(run.resultJson) || executionFailureRetryCount(run) >= 2) return null;
     const [native] = await tx.select({ id: nativeRunFinalizations.runId }).from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, run.id)).limit(1);
     const [lease] = await tx.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
@@ -297,7 +257,7 @@ export async function settleInterruptedNativeBootstrap(
       executionRecovery: { kind: "bootstrap", providerWorkStarted: false, preparationSettledAt: now.toISOString() },
     }, updatedAt: now }).where(eq(heartbeatRuns.id, run.id)).returning();
     const resolved = holds.length ? await tx.update(issueRecoveryActions).set({ status: "resolved", outcome: "false_positive",
-      resolutionNote: "The interrupted executor finished preparation and cleanup without starting a provider.",
+      resolutionNote: "The stopped executor finished preparation and cleanup without starting a provider.",
       resolvedAt: now, updatedAt: now,
       // An automatic disposition may already have resolved the incident but
       // left replay blocked. Preserve its history while correcting that verdict.
