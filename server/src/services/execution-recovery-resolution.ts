@@ -2,7 +2,7 @@ import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
 import { randomUUID } from "node:crypto";
 import { canonicalExecutionUuid } from "./execution-identity.js";
 import { conversationRecoveryActionPredicate, getConversationOwnershipBlocker } from "./conversation-continuation.js";
-import { isLegacyBootstrapStopCandidate } from "./legacy-execution-recovery.js";
+import { isLegacyBootstrapStopCandidate } from "./legacy-execution-outcome.js";
 import { persistActivity } from "./activity-log.js";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { logger } from "../middleware/logger.js";
