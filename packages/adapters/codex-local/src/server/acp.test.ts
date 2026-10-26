@@ -1376,6 +1376,24 @@ describe("codex_local ACP lane", () => {
     });
   });
 
+  it("does not classify an ACP task summary as an auth-refresh failure", async () => {
+    const root = await makeTempRoot("paperclip-codex-acp-summary-auth-");
+    const execute = createCodexAcpExecutor({
+      createRuntime: (options: FakeRuntimeOptions) => new FakeRuntime(
+        options,
+        [{ type: "text_delta", text: "The application rejects 401 for the old Bearer credential.", stream: "output", tag: "agent_message_chunk" }],
+        { status: "failed", error: { message: "The worker stopped" } } as unknown as FakeRuntimeTurnResult,
+      ) as never,
+    });
+
+    const result = await execute(buildContext(root));
+
+    expect(result.exitCode).toBe(1);
+    expect(result.summary).toContain("401");
+    expect(result.errorCode).not.toBe("refresh_token_invalidated");
+    expect(result.errorFamily).not.toBe("refresh_token_invalidated");
+  });
+
   it("classifies ACP refresh-token auth failures", async () => {
     const root = await makeTempRoot("paperclip-codex-acp-refresh-token-");
     const execute = createCodexAcpExecutor({
