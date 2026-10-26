@@ -235,6 +235,9 @@ export class ChatControlRecoveryUnresolvedError extends Error {
 const RUNNING_ISSUE_WAKE_REASONS_REQUIRING_FOLLOWUP = new Set([
   CHAT_COMPLETION_WAKE_REASON,
   "approval_approved",
+  "decision_decided",
+  "decision_expired",
+  "decision_cancelled",
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
   "issue_recovery_action_restored",
 ]);
