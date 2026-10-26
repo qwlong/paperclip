@@ -247,10 +247,22 @@ export async function terminalizeLegacyExecution(input: {
   });
 }
 
+/** A terminal legacy run that its executor may still prove stopped before any
+ * provider work: a shutdown during paperclip_runner bootstrap, or a Stop or
+ * queued-message interrupt that cancelled the run before its adapter ran. */
+export function isLegacyBootstrapStopCandidate(
+  run: Pick<Run, "runtimeMode" | "runtimeModeResolvedAt" | "status" | "errorCode" | "processPid" | "processGroupId" | "runnerProfileJson">,
+): boolean {
+  if (run.runtimeMode !== "legacy" || run.processPid || run.processGroupId) return false;
+  if (run.status === "cancelled") return true;
+  return run.status === "interrupted" && run.errorCode === "server_shutdown_interrupted" &&
+    !run.runtimeModeResolvedAt && claimedAdapterType(run) === "paperclip_runner";
+}
+
 /** Called only by the exact executor's finally block after preparation/cleanup
- * settles. A shutdown can win the terminal-status race before the setup catch
- * records that no provider started. Retire only that mistaken recovery hold. */
-export async function settleInterruptedNativeBootstrap(
+ * settles. A shutdown or Stop can win the terminal-status race before the
+ * executor knows that no provider started. Retire only that mistaken recovery hold. */
+export async function settleLegacyBootstrapStop(
   db: Db, input: { run: Run; providerDispatchStarted: boolean },
 ): Promise<Run | null> {
   if (input.providerDispatchStarted) return null;
@@ -259,10 +271,8 @@ export async function settleInterruptedNativeBootstrap(
   return db.transaction(async tx => {
     const [task] = await tx.select().from(issues).where(and(eq(issues.id, issueId), eq(issues.companyId, input.run.companyId))).for("update");
     const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, input.run.id), eq(heartbeatRuns.companyId, input.run.companyId))).for("update");
-    if (!task || !run || run.runtimeMode !== "legacy" || run.runtimeModeResolvedAt ||
+    if (!task || !run || !isLegacyBootstrapStopCandidate(run) ||
         run.contextSnapshot?.issueId !== task.id ||
-        run.status !== "interrupted" || run.errorCode !== "server_shutdown_interrupted" ||
-        claimedAdapterType(run) !== "paperclip_runner" || run.processPid || run.processGroupId ||
         hasWorkspaceRestoreFailure(run.resultJson) || executionFailureRetryCount(run) >= 2) return null;
     const [native] = await tx.select({ id: nativeRunFinalizations.runId }).from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, run.id)).limit(1);
     const [lease] = await tx.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
@@ -297,7 +307,7 @@ export async function settleInterruptedNativeBootstrap(
       executionRecovery: { kind: "bootstrap", providerWorkStarted: false, preparationSettledAt: now.toISOString() },
     }, updatedAt: now }).where(eq(heartbeatRuns.id, run.id)).returning();
     const resolved = holds.length ? await tx.update(issueRecoveryActions).set({ status: "resolved", outcome: "false_positive",
-      resolutionNote: "The interrupted executor finished preparation and cleanup without starting a provider.",
+      resolutionNote: "The stopped executor finished preparation and cleanup without starting a provider.",
       resolvedAt: now, updatedAt: now,
       // An automatic disposition may already have resolved the incident but
       // left replay blocked. Preserve its history while correcting that verdict.

@@ -262,7 +262,8 @@ import {
 } from "./conversation-continuation.js";
 
 import {
-  settleInterruptedNativeBootstrap,
+  isLegacyBootstrapStopCandidate,
+  settleLegacyBootstrapStop,
 } from "./legacy-execution-recovery.js";
 import {
   adapterExecutionControls,
@@ -3832,8 +3833,8 @@ export function heartbeatService(
             });
           }
         }
-        if (latestRun?.status === "interrupted" && latestRun.errorCode === "server_shutdown_interrupted") {
-          latestRun = await settleInterruptedNativeBootstrap(db, { run: latestRun,
+        if (latestRun && isLegacyBootstrapStopCandidate(latestRun)) {
+          latestRun = await settleLegacyBootstrapStop(db, { run: latestRun,
             providerDispatchStarted: legacyAdapterEntered || nativeDispatchStarted || nativeOwnershipHeld,
           }) ?? latestRun;
         }

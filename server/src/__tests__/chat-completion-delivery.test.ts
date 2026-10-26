@@ -6,7 +6,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
 import { agents, agentWakeupRequests, chatCompletionDeliveries as deliveries, chatTaskHandoffs as handoffs,
   companies, createDb, documents, environmentLeases, heartbeatRuns, issueComments, issueRecoveryActions, issues } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
-import { settleInterruptedNativeBootstrap, terminalizeLegacyExecution } from "../services/legacy-execution-recovery.js";
+import { settleLegacyBootstrapStop, terminalizeLegacyExecution } from "../services/legacy-execution-recovery.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { settleUnrecoverableExecutions } from "../services/execution-recovery-resolution.js";
 import { executeIssuePostCommitActions, type IssuePostCommitAction, issueService } from "../services/issues.js";
@@ -225,7 +225,7 @@ const support = await getEmbeddedPostgresTestSupport();
       await settleUnrecoverableExecutions(db);
       expect(await issueService(db).getById(f.sourceId)).toMatchObject({ status: "blocked" });
     }
-    const settled = await settleInterruptedNativeBootstrap(db, { run, providerDispatchStarted: false });
+    const settled = await settleLegacyBootstrapStop(db, { run, providerDispatchStarted: false });
     expect(settled?.resultJson?.executionRecovery).toMatchObject({ kind: "bootstrap", providerWorkStarted: false });
     expect(await getExecutionBlocker(db, f.companyId, f.sourceId)).toBeNull();
     expect(await issueService(db).getById(f.sourceId)).toMatchObject({ status: "in_progress" });
@@ -249,7 +249,7 @@ const support = await getEmbeddedPostgresTestSupport();
       await issueService(db).update(f.sourceId, { assigneeAgentId: null });
     }
     if (kind === "other-execution") await db.update(issues).set({ executionRunId: f.runId }).where(eq(issues.id, f.sourceId));
-    expect(await settleInterruptedNativeBootstrap(db, { run, providerDispatchStarted: false })).not.toBeNull();
+    expect(await settleLegacyBootstrapStop(db, { run, providerDispatchStarted: false })).not.toBeNull();
     expect(await issueService(db).getById(f.sourceId)).toMatchObject({ status: "blocked" });
   });
   it.each(["provider-entered", "runtime-selected", "other-adapter", "restore-unsafe", "active-lease", "cleanup-failed", "retry-exhausted"])("retains an interrupted bootstrap hold for %s", async kind => {
@@ -261,7 +261,7 @@ const support = await getEmbeddedPostgresTestSupport();
     if (kind === "active-lease" || kind === "cleanup-failed") await db.insert(environmentLeases).values({ companyId: f.companyId, heartbeatRunId: run.id,
       ...(kind === "cleanup-failed" ? { status: "released", releasedAt: new Date(), cleanupStatus: "failed" } : {}),
     });
-    expect(await settleInterruptedNativeBootstrap(db, { run, providerDispatchStarted: kind === "provider-entered" })).toBeNull();
+    expect(await settleLegacyBootstrapStop(db, { run, providerDispatchStarted: kind === "provider-entered" })).toBeNull();
     expect(await getExecutionBlocker(db, f.companyId, f.sourceId)).not.toBeNull();
   });
   it("delivers Done tasks after an ownership-only status version change", async () => {

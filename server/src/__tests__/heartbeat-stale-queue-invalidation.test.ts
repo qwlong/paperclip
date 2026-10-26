@@ -5,7 +5,9 @@ import {
   agents,
   agentWakeupRequests,
   agentRuntimeState,
+  authUsers,
   companies,
+  companyMemberships,
   costEvents,
   createDb,
   documentRevisions,
@@ -33,6 +35,8 @@ import {
 import { runningProcesses } from "../adapters/index.ts";
 import { recoveryService } from "../services/recovery/service.ts";
 import { withQueuedCommentIdsInWakePayload } from "../services/issue-queued-comment-queue.ts";
+import { getExecutionBlocker } from "../services/execution-blocker.ts";
+import { settleUnrecoverableExecutions } from "../services/execution-recovery-resolution.ts";
 
 const mockAdapterExecute = vi.hoisted(() =>
   vi.fn(async () => ({
@@ -814,6 +818,137 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       expect(countExecuteCallsForRun(runId)).toBe(0);
     },
   );
+
+  it.each([false, true])("delivers a queued message whose interrupt stopped the run before its adapter started (sweep first=%s)", async sweepFirst => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    await db.update(agents).set({ adapterType: "claude_local" }).where(eq(agents.id, agentId));
+    await db.insert(authUsers).values({
+      id: "responsible-user", name: "Responsible user", email: "prestart-interrupt@example.test",
+      createdAt: new Date(), updatedAt: new Date(),
+    }).onConflictDoNothing();
+    await db.insert(companyMemberships).values({
+      companyId, principalType: "user", principalId: "responsible-user", status: "active", membershipRole: "member",
+    });
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Interaction resolved, then a comment interrupts the continuation",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+    });
+    const { runId } = await seedQueuedRun({
+      companyId,
+      agentId,
+      issueId,
+      wakeReason: "issue_commented",
+      invocationSource: "automation",
+      contextExtras: {
+        interactionId: randomUUID(),
+        interactionKind: "connection_intent",
+        interactionStatus: "accepted",
+        interactionResolvedAt: "2026-10-26T02:49:59.000Z",
+        mutation: "interaction",
+        source: "connection_intent.resolved",
+      },
+    });
+    let commentId: string | null = null;
+    let queueId: string | null = null;
+    beforeContinuationDispatchCheck = async () => {
+      const [comment] = await db.insert(issueComments).values({
+        companyId, issueId, authorUserId: "responsible-user", body: "These all feel weak",
+      }).returning();
+      const [wake] = await db.insert(agentWakeupRequests).values({
+        companyId, agentId, source: "automation", reason: "issue_commented", status: "deferred_issue_execution",
+        requestedByActorType: "user", requestedByActorId: "responsible-user",
+        payload: {
+          issueId, commentId: comment!.id,
+          queuedCommentInterrupt: { actorId: "responsible-user", requestedAt: new Date().toISOString() },
+          _paperclipWakeContext: { issueId, wakeReason: "issue_commented", wakeCommentIds: [comment!.id] },
+        },
+      }).returning();
+      commentId = comment!.id;
+      queueId = wake!.id;
+      await heartbeat.cancelRun(runId, "Interrupted to send queued messages", {
+        errorCode: "operator_interrupted",
+        suppressImmediateRecovery: true,
+        resultJson: {
+          operatorInterrupted: true, interruptionSource: "issue_comment_interrupt",
+          interruptedIssueId: issueId, queuedCommentInterruptQueueId: wake!.id,
+        },
+      });
+      await heartbeat.resumeQueuedCommentInterrupt(companyId, wake!.id, { retryCleanup: true });
+      // The recovery sweep can block the task before this executor unwinds.
+      if (sweepFirst) {
+        await settleUnrecoverableExecutions(db);
+        const [held] = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, issueId));
+        expect(held!.status).toBe("blocked");
+      }
+    };
+
+    await heartbeat.resumeQueuedRuns();
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+    if (!sweepFirst) await settleUnrecoverableExecutions(db);
+
+    expect(queueId).not.toBeNull();
+    expect(countExecuteCallsForRun(runId)).toBe(0);
+    expect(await heartbeat.getRun(runId)).toMatchObject({ status: "cancelled", processPid: null });
+    expect(await getExecutionBlocker(db, companyId, issueId)).toBeNull();
+    const [task] = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, issueId));
+    expect(task!.status).not.toBe("blocked");
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, queueId!));
+    expect(wake!.runId).toBeTruthy();
+    expect(wake!.runId).not.toBe(runId);
+    expect((await heartbeat.getRun(wake!.runId!))!.contextSnapshot?.wakeCommentIds).toEqual([commentId]);
+    expect(countExecuteCallsForRun(wake!.runId!)).toBe(1);
+  });
+
+  it("restores the task a recovery sweep blocked after an operator stopped the run before its adapter started", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    await db.update(agents).set({ adapterType: "claude_local" }).where(eq(agents.id, agentId));
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Operator stops a continuation during preparation",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+    });
+    const { runId } = await seedQueuedRun({
+      companyId,
+      agentId,
+      issueId,
+      wakeReason: "issue_commented",
+      invocationSource: "automation",
+      contextExtras: {
+        interactionId: randomUUID(),
+        interactionKind: "connection_intent",
+        interactionStatus: "accepted",
+        interactionResolvedAt: "2026-10-26T02:49:59.000Z",
+        mutation: "interaction",
+        source: "connection_intent.resolved",
+      },
+    });
+    beforeContinuationDispatchCheck = async () => {
+      await heartbeat.cancelRun(runId, "Cancelled by a board operator", {
+        resultJson: { cancelledByActorType: "user", cancelledByUserId: "responsible-user" },
+      });
+      await settleUnrecoverableExecutions(db);
+      const [held] = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, issueId));
+      expect(held!.status).toBe("blocked");
+    };
+
+    await heartbeat.resumeQueuedRuns();
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+
+    expect(countExecuteCallsForRun(runId)).toBe(0);
+    expect(await heartbeat.getRun(runId)).toMatchObject({ status: "cancelled", processPid: null });
+    expect(await getExecutionBlocker(db, companyId, issueId)).toBeNull();
+    const [task] = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, issueId));
+    expect(task!.status).toBe("in_progress");
+  });
 
   it("rejects ownership changes immediately before the final continuation handoff", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
