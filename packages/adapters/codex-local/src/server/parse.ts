@@ -147,9 +147,14 @@ function buildCodexErrorHaystack(input: {
   stderr?: string | null;
   errorMessage?: string | null;
 }): string {
+  const stdout = input.stdout ?? "";
+  const parsed = parseCodexJsonl(stdout);
+  const stdoutError = parsed.sawProtocolEvent || /^[\s]*[\[{]/m.test(stdout)
+    ? parsed.errorMessage ?? ""
+    : stdout;
   return [
     input.errorMessage ?? "",
-    input.stdout ?? "",
+    stdoutError,
     input.stderr ?? "",
   ]
     .join("\n")

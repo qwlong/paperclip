@@ -312,7 +312,7 @@ function withCodexAuthRefreshFailureClassification(result: AdapterExecutionResul
   const resultJson = parseObject(result.resultJson);
   const stopReason = asString(resultJson.stopReason, "");
   const authFailure = classifyCodexAuthRefreshFailure({
-    errorMessage: [result.errorMessage ?? "", result.summary ?? "", stopReason]
+    errorMessage: [result.errorMessage ?? "", stopReason]
       .map((line) => line.trim())
       .filter(Boolean)
       .join("\n"),

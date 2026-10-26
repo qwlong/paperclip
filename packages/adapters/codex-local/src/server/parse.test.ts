@@ -162,6 +162,43 @@ describe("isCodexHarnessCrash", () => {
 });
 
 describe("classifyCodexAuthRefreshFailure", () => {
+  it.each(["agent_message", "command_execution", "mcp_tool_call"])("does not classify auth text inside a %s item", (type) => {
+    const stdout = JSON.stringify({ type: "item.completed", item: { type, text: "OAuth failed: refresh_token_invalidated", aggregated_output: "401 applies to the current Bearer identity" } });
+    expect(classifyCodexAuthRefreshFailure({ stdout })).toBeNull();
+  });
+
+  it("keeps a real terminal capacity failure out of auth repair when task output discusses 401 Bearer handling", () => {
+    const stdout = [
+      JSON.stringify({ type: "item.completed", item: { type: "command_execution", aggregated_output: "401 applies to the actual Bearer identity" } }),
+      JSON.stringify({ type: "error", message: "Selected model is at capacity. Please try a different model." }),
+      JSON.stringify({ type: "turn.failed", error: { message: "Selected model is at capacity. Please try a different model." } }),
+    ].join("\n");
+    expect(classifyCodexAuthRefreshFailure({ stdout })).toBeNull();
+    expect(isCodexProviderQuotaError({ stdout })).toBe(true);
+  });
+
+  it.each(["error", "turn.failed"])("preserves genuine provider auth from %s", (type) => {
+    const message = "OAuth failed: refresh token has expired";
+    const stdout = JSON.stringify(type === "error" ? { type, message } : { type, error: { message } });
+    expect(classifyCodexAuthRefreshFailure({ stdout })).toBe("refresh_token_expired");
+  });
+
+  it("does not treat incomplete JSON item content as a startup auth diagnostic", () => {
+    expect(classifyCodexAuthRefreshFailure({ stdout: '{"type":"item.completed","item":{"text":"OAuth failed: invalid_grant' })).toBeNull();
+  });
+
+  it("does not scan continuation lines of incomplete JSON as raw startup diagnostics", () => {
+    const stdout = '{\n  "type": "item.completed",\n  "item": {\n    "text": "OAuth failed: refresh_token_invalidated"';
+    expect(classifyCodexAuthRefreshFailure({ stdout })).toBeNull();
+  });
+
+  it("keeps task-only quota, reset clocks, and transient text out of provider recovery", () => {
+    const stdout = JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "You've hit your usage limit for GPT-5. Switch to another model now, or try again at 4:30 PM. We are experiencing high demand and temporary errors." } });
+    expect(isCodexProviderQuotaError({ stdout })).toBe(false);
+    expect(extractCodexRetryNotBefore({ stdout })).toBeNull();
+    expect(isCodexTransientUpstreamError({ stdout })).toBe(false);
+  });
+
   it("classifies explicit refresh-token failure messages", () => {
     expect(classifyCodexAuthRefreshFailure({ errorMessage: "provider error: refresh_token_reused" })).toBe(
       "refresh_token_reused",
