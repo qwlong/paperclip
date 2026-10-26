@@ -33,6 +33,7 @@ import {
 } from "@paperclipai/db";
 import { runningProcesses } from "../adapters/index.js";
 import { heartbeatService } from "../services/heartbeat.ts";
+import { createDecisionWakeOriginAgent } from "../services/decision-wakeup.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
 import { isRetiredExternalChatQuestionSource, questionResponseDeliveryService } from "../services/question-response-delivery.js";
 import { SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY } from "../services/recovery/index.ts";
@@ -345,6 +346,99 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
     }
     return wake as Record<string, unknown>;
   }
+
+  it.each(
+    (["decided", "expired", "cancelled"] as const).flatMap((outcome) =>
+      [false, true].map((completeIssue) => ({ outcome, completeIssue })),
+    ),
+  )("delivers decision continuation $outcome after the active run (completed issue: $completeIssue)", async ({ outcome, completeIssue }) => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const decisionId = randomUUID();
+    const gateway = await createControlledGatewayServer(async (turn) => {
+      const runId = String(gateway.getAgentPayloads()[turn - 1]?.idempotencyKey ?? "");
+      expect(runId).not.toBe("");
+      await db.insert(issueComments).values({
+        companyId, issueId, authorAgentId: agentId, createdByRunId: runId,
+        body: "Decision handoff recorded.",
+      });
+      if (turn === 2) {
+        await db.update(issues).set({ status: "done", completedAt: new Date() }).where(eq(issues.id, issueId));
+      }
+    });
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const heartbeat = heartbeatService(db);
+
+    try {
+      await db.insert(companies).values(wakeCompanyRow(companyId, issuePrefix));
+      await grantFixtureWorkspaceAccess(companyId, ["responsible-user"]);
+      await db.insert(agents).values(wakeGatewayAgentRow(agentId, companyId, "Review Agent", gateway));
+      await db.insert(issues).values(wakeIssueRow(issueId, companyId, "Review a decision", agentId, issuePrefix));
+
+      const firstRun = await heartbeat.wakeup(agentId, {
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        payload: { issueId },
+        requestedByActorType: "user",
+        requestedByActorId: "responsible-user",
+      });
+      expect(firstRun).not.toBeNull();
+      await waitFor(() => gateway.getAgentPayloads().length === 1);
+      await db.update(issues).set({
+        status: "in_review",
+        monitorNextCheckAt: new Date(Date.now() + 86_400_000),
+        monitorNotes: "Recheck the pending decision",
+        monitorScheduledBy: agentId,
+      }).where(eq(issues.id, issueId));
+
+      const wakeOrigin = createDecisionWakeOriginAgent((id, options) => heartbeat.wakeup(id, options));
+      await expect(wakeOrigin({ companyId, agentId, issueId, decisionId, outcome })).resolves.toBeNull();
+      const deferred = await selectDeferredWakeForAgent(companyId, agentId);
+      expect(deferred).toMatchObject({
+        status: "deferred_issue_execution",
+        runId: null,
+        payload: {
+          issueId,
+          decisionId,
+          outcome,
+          _paperclipWakeContext: { wakeReason: `decision_${outcome}` },
+        },
+      });
+      const active = await heartbeat.getRun(firstRun!.id);
+      expect(active?.status).toBe("running");
+      expect(active?.contextSnapshot?.wakeReason).toBe("issue_assigned");
+      expect(gateway.getAgentPayloads()).toHaveLength(1);
+
+      if (completeIssue) {
+        await db.update(issues).set({ status: "done", completedAt: new Date() }).where(eq(issues.id, issueId));
+      }
+      gateway.releaseFirstWait();
+      await waitFor(async () => {
+        const row = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, deferred!.id)).then((rows) => rows[0]);
+        return completeIssue ? row?.status === "cancelled" : row?.status === "completed";
+      }, 90_000);
+
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+      expect(runs.find((run) => run.id === firstRun!.id)?.status).toBe("succeeded");
+      expect(runs).toHaveLength(completeIssue ? 1 : 2);
+      expect(gateway.getAgentPayloads()).toHaveLength(completeIssue ? 1 : 2);
+      if (!completeIssue) {
+        const next = runs.find((run) => run.id !== firstRun!.id);
+        expect(next).toMatchObject({
+          status: "succeeded",
+          contextSnapshot: { issueId, wakeReason: `decision_${outcome}` },
+        });
+        const nextWake = await readGatewayWakePayload(gateway.getAgentPayloads()[1]!);
+        expect(nextWake).toMatchObject({ reason: `decision_${outcome}` });
+      }
+    } finally {
+      gateway.releaseFirstWait();
+      await heartbeat.drainActiveRunExecutions();
+      await gateway.close();
+    }
+  }, 120_000);
 
   it("defers approval-approved wakes for a running issue so the assignee resumes after the run", async () => {
     const companyId = randomUUID();
