@@ -964,6 +964,94 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     });
   });
 
+  describe("an agent closing a task with a pending human decision", () => {
+    async function seedAgentTaskWithCard(input: {
+      kind: "request_confirmation" | "ask_user_questions";
+      cardStatus?: "pending" | "accepted" | "cancelled";
+      humanCommentAfterCard?: boolean;
+    }) {
+      const companyId = await seedAssignableAgentCompany();
+      const agentId = randomUUID();
+      await db.insert(agents).values(agentRow(companyId, { id: agentId, name: "Closer" }));
+      const issue = await svc.create(companyId, {
+        title: "Close after asking", status: "in_progress", priority: "medium", assigneeAgentId: agentId,
+      });
+      const createdAt = new Date(Date.now() - 60_000);
+      const [card] = await db.insert(issueThreadInteractions).values({
+        companyId, issueId: issue.id, kind: input.kind, status: input.cardStatus ?? "pending",
+        continuationPolicy: "wake_assignee", createdByAgentId: agentId, createdAt,
+        payload: input.kind === "request_confirmation"
+          ? { version: 1, prompt: "Ship it?" }
+          : {
+            version: 1,
+            questions: [{ id: "q", prompt: "Pick one", selectionMode: "single", options: [{ id: "a", label: "A" }] }],
+          } as never,
+      }).returning();
+      if (input.humanCommentAfterCard) {
+        await db.insert(issueComments).values({
+          companyId, issueId: issue.id, body: "Do something else instead", authorUserId: "local-board",
+          createdAt: new Date(createdAt.getTime() + 1_000),
+        });
+      }
+      return { issue, agentId, cardId: card!.id };
+    }
+
+    async function cardStatus(cardId: string) {
+      const [row] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, cardId));
+      return row?.status;
+    }
+
+    it.each([
+      ["request_confirmation", "done"],
+      ["request_confirmation", "cancelled"],
+      ["ask_user_questions", "done"],
+      ["ask_user_questions", "cancelled"],
+    ] as const)("rejects a %s card being voided by %s and keeps both unchanged", async (kind, status) => {
+      const { issue, agentId, cardId } = await seedAgentTaskWithCard({ kind });
+
+      await expect(svc.update(issue.id, { status, actorAgentId: agentId })).rejects.toMatchObject({
+        status: 409,
+        details: { code: "pending_human_decision", interactionIds: [cardId] },
+      });
+
+      expect(await cardStatus(cardId)).toBe("pending");
+      expect((await svc.getById(issue.id))?.status).toBe("in_progress");
+    });
+
+    it("lets the agent yield in_review while the card waits", async () => {
+      const { issue, agentId, cardId } = await seedAgentTaskWithCard({ kind: "request_confirmation" });
+
+      await expect(svc.update(issue.id, { status: "in_review", actorAgentId: agentId }))
+        .resolves.toMatchObject({ status: "in_review" });
+      expect(await cardStatus(cardId)).toBe("pending");
+    });
+
+    it.each(["accepted", "cancelled"] as const)("lets the agent close once the card is %s", async (resolved) => {
+      const { issue, agentId } = await seedAgentTaskWithCard({ kind: "request_confirmation", cardStatus: resolved });
+
+      await expect(svc.update(issue.id, { status: "done", actorAgentId: agentId }))
+        .resolves.toMatchObject({ status: "done" });
+    });
+
+    it("lets the agent close over a question a later human message already superseded", async () => {
+      const { issue, agentId, cardId } = await seedAgentTaskWithCard({
+        kind: "ask_user_questions", humanCommentAfterCard: true,
+      });
+
+      await expect(svc.update(issue.id, { status: "done", actorAgentId: agentId }))
+        .resolves.toMatchObject({ status: "done" });
+      expect(await cardStatus(cardId)).toBe("pending");
+    });
+
+    it("lets a board user close and expire the card as before", async () => {
+      const { issue, cardId } = await seedAgentTaskWithCard({ kind: "request_confirmation" });
+
+      await expect(svc.update(issue.id, { status: "done", actorUserId: "local-board" }))
+        .resolves.toMatchObject({ status: "done" });
+      expect(await cardStatus(cardId)).toBe("expired");
+    });
+  });
+
   it("expires superseded interactions when human comments are added through the service", async () => {
     const companyId = await seedAssignableAgentCompany();
     const issue = await svc.create(companyId, {

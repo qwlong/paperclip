@@ -16,6 +16,7 @@ import { externalConversationStateSql, nonIdleSlackIssueCondition, resumeSlackCo
 import { documentService } from "./documents.js";
 import { parseTaskSearch, taskSearchCtes, taskSearchScore } from "./task-search.js";
 import { createdFromIssueCondition } from "./issue-creation-origin.js";
+import { activeIssueInteractionCondition } from "./issue-question-context.js";
 import { executionProjectionsForRuns } from "./execution-projection.js";
 import type { ExecutionProjection } from "@paperclipai/shared";
 import { Buffer } from "node:buffer";
@@ -11251,6 +11252,22 @@ export function issueService(db: Db) {
         if (actorAgentId && patch.status === "done") {
           const [review] = await tx.select({ id: toolActionRequests.id }).from(toolActionRequests).where(and(eq(toolActionRequests.companyId, existing.companyId), eq(toolActionRequests.issueId, id), inArray(toolActionRequests.status, ["pending", "approved", "executing"]))).limit(1);
           if (review) throw conflict("This task is waiting for a connection review. Finish unrelated work, then yield in_review without retrying the governed call.", { code: "tool_review_pending", actionRequestId: review.id });
+        }
+        if (actorAgentId && (patch.status === "done" || patch.status === "cancelled")) {
+          // Closing expires every active card as issue_closed, which nobody decided.
+          // The row lock above serializes this with card creation on the task.
+          const pendingCards = await tx.select({ id: issueThreadInteractions.id }).from(issueThreadInteractions).where(and(
+            eq(issueThreadInteractions.companyId, existing.companyId),
+            eq(issueThreadInteractions.issueId, id),
+            eq(issueThreadInteractions.status, "pending"),
+            activeIssueInteractionCondition(),
+          ));
+          if (pendingCards.length > 0) {
+            throw conflict("This task has a pending decision card. Yield in_review and wait for the answer, or withdraw the card if it no longer applies, then close.", {
+              code: "pending_human_decision",
+              interactionIds: pendingCards.map((card: { id: string }) => card.id),
+            });
+          }
         }
 
         const [previousLabelsByIssueId, previousRelationSummaries] = await Promise.all([
