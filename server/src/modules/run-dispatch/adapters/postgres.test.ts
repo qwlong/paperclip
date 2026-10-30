@@ -14,6 +14,7 @@ import {
   issueDocuments,
   issueRelations,
   issueRecoveryActions,
+  issueThreadInteractions,
   issueTreeHolds,
   issues,
 } from "@paperclipai/db";
@@ -764,6 +765,58 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       },
       15_000,
     );
+
+    describe("wake for the addressee of an interaction", () => {
+      async function seedAddresseeWake(input: {
+        interactionStatus: string;
+        addressedToRunAgent: boolean;
+        onOtherIssue?: boolean;
+        wakeReason?: string;
+      }) {
+        const { companyId, agentId } = await seedCompanyAndAgent();
+        const ownerAgentId = randomUUID();
+        await seedAgent({ id: ownerAgentId, companyId, name: "GrowthOwner" });
+        const issueId = randomUUID();
+        await seedIssue({ companyId, issueId, status: "in_review", assigneeAgentId: ownerAgentId });
+        const otherIssueId = randomUUID();
+        await seedIssue({ companyId, issueId: otherIssueId, status: "in_review", assigneeAgentId: ownerAgentId });
+        await db.insert(issueThreadInteractions).values({
+          companyId,
+          issueId: input.onOtherIssue ? otherIssueId : issueId,
+          kind: "ask_user_questions",
+          status: input.interactionStatus,
+          createdByAgentId: ownerAgentId,
+          addresseeAgentId: input.addressedToRunAgent ? agentId : ownerAgentId,
+          payload: { version: 1, questions: [] },
+        });
+        const runId = await seedRun({
+          companyId,
+          agentId,
+          contextSnapshot: { issueId, taskId: issueId, wakeReason: input.wakeReason ?? "interaction_pending" },
+        });
+        return createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({
+          runId,
+          companyId,
+          expectedStatus: "queued",
+          now: new Date(),
+        });
+      }
+
+      it("lets the addressee of a pending interaction run on an issue someone else owns", async () => {
+        expect(await seedAddresseeWake({ interactionStatus: "pending", addressedToRunAgent: true }))
+          .toEqual({ outcome: "not_stale" });
+      });
+
+      it.each([
+        { label: "answered before the run started", interactionStatus: "answered", addressedToRunAgent: true },
+        { label: "addressed to another agent", interactionStatus: "pending", addressedToRunAgent: false },
+        { label: "pending on another issue", interactionStatus: "pending", addressedToRunAgent: true, onOtherIssue: true },
+        { label: "not an interaction wake", interactionStatus: "pending", addressedToRunAgent: true, wakeReason: "issue_assigned" },
+      ])("cancels the non-owner when the interaction is $label", async ({ label: _label, ...input }) => {
+        expect(await seedAddresseeWake(input))
+          .toMatchObject({ outcome: "cancelled", errorCode: "issue_assignee_changed" });
+      });
+    });
 
     it("maps a review-parking continuation summary into a stale queued-run decision", async () => {
       const { companyId, agentId } = await seedCompanyAndAgent();

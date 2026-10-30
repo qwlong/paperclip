@@ -427,6 +427,47 @@ describe("decideQueuedRunStaleness", () => {
     expect(decideQueuedRunStaleness(facts, NOW)).toEqual({ stale: false });
   });
 
+  describe("addressee of a pending interaction", () => {
+    const addresseeFacts = (): QueuedRunFacts => ({
+      ...baseStalenessFacts(),
+      issueAssigneeAgentId: "agent-2",
+      issueStatus: "in_review",
+      wakeReason: "interaction_pending",
+      reviewParticipant: {
+        isInReview: true,
+        hasParticipant: true,
+        participantIsAgent: true,
+        participantAgentId: "agent-3",
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: "agent-3" },
+      },
+    });
+
+    it("runs on an issue it neither owns nor reviews", () => {
+      expect(decideQueuedRunStaleness({ ...addresseeFacts(), isPendingInteractionAddressee: true }, NOW))
+        .toEqual({ stale: false });
+    });
+
+    it("is cancelled like any other non-owner once nothing is pending for it", () => {
+      expect(decideQueuedRunStaleness({ ...addresseeFacts(), isPendingInteractionAddressee: false }, NOW))
+        .toMatchObject({ stale: true, errorCode: "issue_assignee_changed" });
+    });
+
+    it("still passes the review-participant check when it owns the issue", () => {
+      expect(decideQueuedRunStaleness({
+        ...addresseeFacts(), issueAssigneeAgentId: "agent-1", isPendingInteractionAddressee: true,
+      }, NOW)).toEqual({ stale: false });
+      expect(decideQueuedRunStaleness({
+        ...addresseeFacts(), issueAssigneeAgentId: "agent-1", isPendingInteractionAddressee: false,
+      }, NOW)).toMatchObject({ stale: true, errorCode: "issue_review_participant_changed" });
+    });
+
+    it("does not reopen a terminal issue", () => {
+      expect(decideQueuedRunStaleness({ ...addresseeFacts(), issueStatus: "done", isPendingInteractionAddressee: true }, NOW))
+        .toMatchObject({ stale: true, errorCode: "issue_terminal_status" });
+    });
+  });
+
   it("allows resume intent to bypass a terminal status", () => {
     const facts: QueuedRunFacts = {
       ...baseStalenessFacts(),
