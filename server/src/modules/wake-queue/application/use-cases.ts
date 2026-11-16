@@ -1,4 +1,9 @@
-import { enrichPromotedWakeContext } from "../domain/context.js";
+import {
+  enrichPromotedWakeContext,
+  hasScopeFrozenBehindOpenGate,
+  withoutScopeOfOpenGates,
+} from "../domain/context.js";
+import type { InteractionScopeGates } from "../domain/context.js";
 import {
   decideQueuedCommentAction,
   decideReleaseRecovery,
@@ -773,6 +778,8 @@ export type AdmitWakeBehindIssueExecutionInput = {
   /** Run whose agent token sent this wake, when an agent sent it. */
   requestedByRunId?: string | null;
   idempotencyKey: string | null;
+  /** Gate state read when this wake was admitted. */
+  scopeGates: InteractionScopeGates;
 };
 
 export type { AdmitWakeBehindIssueExecutionResult };
@@ -842,8 +849,11 @@ export function createAdmitWakeBehindIssueExecution(deps: {
     // Each resolved card has its own immutable decision and continuation. Never
     // merge it with comments or another card, in either arrival order.
     const interactionReceipt = Boolean(input.contextSnapshot.interactionId || input.payload?.interactionId);
+    const activeContext = parseObject(input.activeExecutionRun.contextSnapshot);
+    // A run frozen to interaction scope cannot do the work this wake now allows.
+    const activeScopeNarrowerThanWake = hasScopeFrozenBehindOpenGate(activeContext, input.scopeGates);
     const decision = decideWakeAdmission({
-      allowRunCoalescing: interactionReceipt || parseObject(input.activeExecutionRun.contextSnapshot).interactionId
+      allowRunCoalescing: interactionReceipt || activeContext.interactionId || activeScopeNarrowerThanWake
         ? false : input.allowRunCoalescing,
       sameDurableActor,
       isSameExecutionAgent,
@@ -903,12 +913,15 @@ export function createAdmitWakeBehindIssueExecution(deps: {
           });
 
     if (existingDeferred && !existingDeferred.payload?.interactionId && !existingDeferred.deferredContext.interactionId) {
-      const mergedDeferredContext = deps.helpers.mergeCoalescedContextSnapshot(
-        existingDeferred.deferredContext,
-        input.contextSnapshot,
-        {
-          preserveExistingInteractionContinuation: true,
-        },
+      const mergedDeferredContext = withoutScopeOfOpenGates(
+        deps.helpers.mergeCoalescedContextSnapshot(
+          existingDeferred.deferredContext,
+          input.contextSnapshot,
+          {
+            preserveExistingInteractionContinuation: true,
+          },
+        ),
+        input.scopeGates,
       );
       const mergedPayload = {
         ...existingDeferred.payload,

@@ -65,6 +65,44 @@ function mergeWakeCommentIds(...values: Array<unknown>): string[] {
   return merged;
 }
 
+/**
+ * Gates that, while closed, admit an issue wake only as a bounded interaction
+ * run whose narrowed scope is frozen into its context snapshot.
+ */
+export type InteractionScopeGates = {
+  dependenciesBlocked: boolean;
+  treeHoldActive: boolean;
+};
+
+const DEPENDENCY_BLOCKED_SCOPE_KEYS = [
+  "dependencyBlockedInteraction",
+  "unresolvedBlockerIssueIds",
+  "unresolvedBlockerCount",
+  "unresolvedBlockerSummaries",
+] as const;
+const TREE_HOLD_SCOPE_KEYS = ["treeHoldInteraction", "activeTreeHold"] as const;
+
+/** True when the context was frozen behind a gate that is now open. */
+export function hasScopeFrozenBehindOpenGate(
+  contextSnapshot: Record<string, unknown>,
+  gates: InteractionScopeGates,
+): boolean {
+  return (
+    (contextSnapshot.dependencyBlockedInteraction === true && !gates.dependenciesBlocked) ||
+    (contextSnapshot.treeHoldInteraction === true && !gates.treeHoldActive)
+  );
+}
+
+export function withoutScopeOfOpenGates(
+  contextSnapshot: Record<string, unknown>,
+  gates: InteractionScopeGates,
+): Record<string, unknown> {
+  const next = { ...contextSnapshot };
+  if (!gates.dependenciesBlocked) for (const key of DEPENDENCY_BLOCKED_SCOPE_KEYS) delete next[key];
+  if (!gates.treeHoldActive) for (const key of TREE_HOLD_SCOPE_KEYS) delete next[key];
+  return next;
+}
+
 export function hasInteractionContinuationWakeContext(contextSnapshot: Record<string, unknown>): boolean {
   return INTERACTION_CONTINUATION_CONTEXT_KEYS.some((key) => readNonEmptyString(contextSnapshot[key]));
 }

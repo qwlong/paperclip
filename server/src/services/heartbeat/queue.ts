@@ -2601,11 +2601,13 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       return null;
     }
 
+    let treeHoldActive = false;
     if (issueId) {
       const activePauseHold = await treeControlSvc.getActivePauseHoldGate(
         agent.companyId,
         issueId,
       );
+      treeHoldActive = Boolean(activePauseHold);
       if (activePauseHold) {
         const treeHoldInteractionWake =
           await isVerifiedIssueTreeControlInteractionWake(db, {
@@ -3735,6 +3737,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 requestedByActorId: opts.requestedByActorId ?? null,
                 requestedByRunId: opts.requestedByRunId ?? null,
                 idempotencyKey: opts.idempotencyKey ?? null,
+                scopeGates: {
+                  dependenciesBlocked: dependencyReadiness?.isDependencyReady === false,
+                  treeHoldActive,
+                },
               },
             );
 
