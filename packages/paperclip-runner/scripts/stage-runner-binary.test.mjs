@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
-import { copyFile, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -110,7 +110,7 @@ async function withOwnedChildren(root, action) {
 
 test("atomically publishes while the previous executable is running", { skip: process.platform === "win32", timeout: 15_000 }, async () => {
   const root = await mkdtemp(path.join(tmpdir(), "runnerd-stage-test-"));
-  const destination = path.join(root, "paperclip-runnerd");
+  const destination = path.join(root, "sleep");
   await withOwnedChildren(root, async start => {
     await stageRunnerBinary("/bin/sleep", destination);
     const previous = await stat(destination);
@@ -122,7 +122,7 @@ test("atomically publishes while the previous executable is running", { skip: pr
     assert.equal(published.mode & 0o777, 0o755);
     assert.equal(old.child.exitCode, null);
     assert.equal(old.child.signalCode, null);
-    assert.deepEqual(await readdir(root), ["paperclip-runnerd"]);
+    assert.deepEqual(await readdir(root), ["sleep"]);
     const next = start(destination, ["0"]);
     await next.spawned; await next.closed;
     assert.equal(next.child.exitCode, 0);
@@ -138,13 +138,13 @@ test("a source rebuild selects fresh dev bytes while preserving release binaries
   const built = path.join(packageRoot, "runner", "target", "release", "paperclip-runnerd");
   await withOwnedChildren(root, async start => {
     const copyHostFixture = async (input, output) => {
-      await copyFile(input, output);
-      if (process.platform === "darwin") {
-        const slices = execFileSync("/usr/bin/lipo", ["-archs", input], { encoding: "utf8" }).trim().split(/\s+/);
-        const architecture = slices.find(value => process.arch === "arm64" ? value.startsWith("arm64") : value === "x86_64");
-        assert.ok(architecture);
-        if (slices.length > 1) execFileSync("/usr/bin/lipo", [input, "-thin", architecture, "-output", output]);
-      }
+      const fixtureSource = `${output}.c`;
+      const body = input.endsWith("sleep")
+        ? "#include <stdlib.h>\n#include <unistd.h>\nint main(int argc, char **argv) { return argc > 1 ? sleep(atoi(argv[1])) : 0; }\n"
+        : "#include <stdio.h>\nint main(void) { puts(\"rebuilt\"); return 0; }\n";
+      await writeFile(fixtureSource, body);
+      try { execFileSync("cc", [fixtureSource, "-o", output]); }
+      finally { await rm(fixtureSource); }
     };
     await mkdir(path.dirname(source), { recursive: true });
     await writeFile(source, "fn main() {}\n");
