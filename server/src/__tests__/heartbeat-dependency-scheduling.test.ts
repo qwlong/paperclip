@@ -33,9 +33,10 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { runningProcesses } from "../adapters/index.ts";
+import type { AdapterExecutionContext } from "../adapters/types.ts";
 
 const mockAdapterExecute = vi.hoisted(() =>
-  vi.fn(async () => ({
+  vi.fn(async (_ctx: AdapterExecutionContext) => ({
     exitCode: 0,
     signal: null,
     timedOut: false,
@@ -901,6 +902,18 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       holdId = hold.id;
     }
 
+    async function recordDelivery(ctx: AdapterExecutionContext) {
+      await db.insert(issueComments).values({
+        companyId, issueId: sourceIssueId, authorType: "agent", authorAgentId: agentId,
+        createdByRunId: ctx.runId, body: "Fixture run delivered its result.",
+      });
+    }
+    mockAdapterExecute.mockImplementation(async (ctx) => {
+      await recordDelivery(ctx);
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, sourceIssueId));
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "Work delivered.", provider: "test", model: "test-model" };
+    });
+
     let finishBusyRun = () => {};
     if (options.queued) {
       const busyIssueId = randomUUID();
@@ -925,8 +938,9 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     let finishInteractionRun!: () => void;
     const interactionRunCanFinish = new Promise<void>((resolve) => { finishInteractionRun = resolve; });
     onTestFinished(() => finishInteractionRun());
-    mockAdapterExecute.mockImplementationOnce(async () => {
+    mockAdapterExecute.mockImplementationOnce(async (ctx) => {
       await interactionRunCanFinish;
+      await recordDelivery(ctx);
       return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "Answered the comment.", provider: "test", model: "test-model" };
     });
 
@@ -1022,8 +1036,7 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       expect(followUp?.contextSnapshot).not.toHaveProperty(scopeKey);
       const [original] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.interactionRunId));
       expect(original.contextSnapshot).toHaveProperty(scopeKey, true);
-      const adapterContexts = (mockAdapterExecute.mock.calls as unknown as Array<[{ context: Record<string, unknown> }]>)
-        .map(([call]) => call.context);
+      const adapterContexts = mockAdapterExecute.mock.calls.map(([call]) => call.context);
       expect(adapterContexts).toContainEqual(expect.objectContaining({ issueId: seeded.sourceIssueId, wakeReason: readyReason }));
       expect(adapterContexts.find((context) => context.wakeReason === readyReason)).not.toHaveProperty(scopeKey);
     },
@@ -1113,7 +1126,15 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     onTestFinished(() => finishBusyRun());
     mockAdapterExecute.mockImplementationOnce(async () => {
       await busyRunCanFinish;
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, busyIssueId));
       return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "Busy run.", provider: "test", model: "test-model" };
+    });
+    mockAdapterExecute.mockImplementationOnce(async (ctx) => {
+      await db.insert(issueComments).values({
+        companyId, issueId: heldIssueId, authorType: "agent", authorAgentId: agentId,
+        createdByRunId: ctx.runId, body: "Answered the question while the hold remains active.",
+      });
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "Question answered.", provider: "test", model: "test-model" };
     });
     const busyRun = await heartbeat.wakeup(agentId, {
       source: "assignment", triggerDetail: "system", reason: "issue_assigned",

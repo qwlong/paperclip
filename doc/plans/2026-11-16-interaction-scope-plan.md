@@ -25,9 +25,10 @@ policy and pending-context normalization; existing release dispatch owns success
   the heartbeat-to-admission wiring with the integration cases.
 - [x] Review the complete diff and run focused static checks. Document the scope
   contract in `doc/execution-semantics.md`.
-- [ ] Inspect process residue, commit only named files, push the feature branch to
-  `fork`, and open a PR using the repository template. Leave merge/deployment to
-  the reviewer.
+- [x] Inspect process residue and prepare named-file commits, excluding the
+  pre-existing lockfile modification.
+- [ ] Push the feature branch to `fork` and open a PR using the repository
+  template once GitHub access is available. Leave merge/deployment to the reviewer.
 
 Review focus: gate truth comes from admission, scope stays frozen on live runs,
 partial readiness is not authorization, pending comments survive normalization,
@@ -52,3 +53,8 @@ introduced. Full-repository test/build runs are excluded on this production host
   changed-file diagnostics. Missing runner declarations and the host-resolved
   OpenTelemetry dependency prevent a clean server typecheck in this checkout.
   No full-repository build or test suite was run.
+- Fixture settlement: record per-run deliveries and finish full-scope fixture work
+  to avoid spawning unrelated recovery work during teardown. The 22 heartbeat
+  tests pass after this adjustment; all nine new scenarios pass separately with
+  zero execution-setup errors. The remaining four late setup errors in the full
+  file also reproduce on the unmodified parent (13 tests pass, four setup logs).
