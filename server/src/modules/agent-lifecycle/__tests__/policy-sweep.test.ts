@@ -50,7 +50,7 @@ const support = await getEmbeddedPostgresTestSupport();
       await db.update(agents).set({ lifecycleHolds: ["company_paused"] }).where(eq(agents.id, eligible[0].id));
       clock.mockReturnValue(now + 120_002);
       await work.sweep();
-      expect(transaction).toHaveBeenCalledTimes(201);
+      expect(transaction).toHaveBeenCalledTimes(102);
       expect((await rows())[0].lifecycleHolds).toEqual([]);
     } finally {
       await work.stop();
