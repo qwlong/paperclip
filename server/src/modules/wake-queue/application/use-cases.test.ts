@@ -795,6 +795,7 @@ function admissionInput(
     requestedByActorType: "user",
     requestedByActorId: "user-1",
     idempotencyKey: null,
+    scopeGates: { dependenciesBlocked: false, treeHoldActive: false },
     ...overrides,
   };
 }
@@ -1181,6 +1182,155 @@ describe("admitWakeBehindIssueExecution", () => {
     expect(writer.insertNewDeferredWake).toHaveBeenCalledTimes(1);
     expect(writer.coalesceIntoActiveExecutionRun).not.toHaveBeenCalled();
     expect(writer.mergeIntoExistingDeferredWake).not.toHaveBeenCalled();
+  });
+
+  describe("a wake that grants full execution scope is never absorbed by a run whose scope was frozen narrower", () => {
+    const DEPENDENCY_BLOCKED_SCOPE = {
+      dependencyBlockedInteraction: true,
+      unresolvedBlockerIssueIds: ["blocker-1"],
+      unresolvedBlockerCount: 1,
+      unresolvedBlockerSummaries: [{ id: "blocker-1" }],
+    };
+    const TREE_HOLD_SCOPE = {
+      treeHoldInteraction: true,
+      activeTreeHold: { holdId: "hold-1", interaction: true },
+    };
+    const gates = [
+      {
+        gate: "dependency-blocked interaction",
+        frozenScope: DEPENDENCY_BLOCKED_SCOPE,
+        lifted: { dependenciesBlocked: false, treeHoldActive: false },
+        stillClosed: { dependenciesBlocked: true, treeHoldActive: false },
+        stillClosedWakeContext: { wakeReason: "issue_commented", ...DEPENDENCY_BLOCKED_SCOPE },
+      },
+      {
+        gate: "tree-hold interaction",
+        frozenScope: TREE_HOLD_SCOPE,
+        lifted: { dependenciesBlocked: false, treeHoldActive: false },
+        stillClosed: { dependenciesBlocked: false, treeHoldActive: true },
+        stillClosedWakeContext: { wakeReason: "issue_commented", ...TREE_HOLD_SCOPE },
+      },
+    ] as const;
+
+    it.each(gates.flatMap((g) => (["running", "queued"] as const).map((status) => ({ ...g, status }))))(
+      "queues a follow-up instead of coalescing into a $status $gate run once the gate has lifted",
+      async ({ frozenScope, lifted, status }) => {
+        const writer = createFakeAdmissionWriter();
+        const reader = createFakeAdmissionReader();
+        const admit = createAdmitWakeBehindIssueExecution({ reader, writer, helpers: createFakeAdmissionHelpers() });
+        const contextSnapshot = { wakeReason: "issue_children_completed", completedChildIssueId: "blocker-1" };
+
+        const result = await admit(SCOPE, admissionInput({
+          activeExecutionRun: { ...ACTIVE_EXECUTION_RUN, status, contextSnapshot: { taskKey: "issue-1", ...frozenScope } },
+          contextSnapshot,
+          scopeGates: lifted,
+        }));
+
+        expect(result).toEqual({ kind: "deferred" });
+        expect(writer.coalesceIntoActiveExecutionRun).not.toHaveBeenCalled();
+        expect(writer.insertNewDeferredWake).toHaveBeenCalledExactlyOnceWith(SCOPE, expect.objectContaining({
+          payload: { issueId: "issue-1", _paperclipWakeContext: contextSnapshot },
+        }));
+      },
+    );
+
+    it.each(gates)(
+      "still coalesces into a $gate run while the gate stays closed",
+      async ({ frozenScope, stillClosed, stillClosedWakeContext }) => {
+        const writer = createFakeAdmissionWriter();
+        const admit = createAdmitWakeBehindIssueExecution({
+          reader: createFakeAdmissionReader(), writer, helpers: createFakeAdmissionHelpers(),
+        });
+
+        const result = await admit(SCOPE, admissionInput({
+          activeExecutionRun: { ...ACTIVE_EXECUTION_RUN, status: "queued", contextSnapshot: { taskKey: "issue-1", ...frozenScope } },
+          contextSnapshot: stillClosedWakeContext,
+          scopeGates: stillClosed,
+        }));
+
+        expect(result).toEqual({ kind: "coalesced", run: { id: "merged-run-1" } });
+        expect(writer.insertNewDeferredWake).not.toHaveBeenCalled();
+      },
+    );
+
+    it("still coalesces a dependency wake that does not make the issue ready into a dependency-blocked run", async () => {
+      const writer = createFakeAdmissionWriter();
+      const admit = createAdmitWakeBehindIssueExecution({
+        reader: createFakeAdmissionReader(), writer, helpers: createFakeAdmissionHelpers(),
+      });
+
+      const result = await admit(SCOPE, admissionInput({
+        activeExecutionRun: { ...ACTIVE_EXECUTION_RUN, contextSnapshot: { taskKey: "issue-1", ...DEPENDENCY_BLOCKED_SCOPE } },
+        contextSnapshot: { wakeReason: "issue_children_completed", completedChildIssueId: "blocker-2" },
+        scopeGates: { dependenciesBlocked: true, treeHoldActive: false },
+      }));
+
+      expect(result).toEqual({ kind: "coalesced", run: { id: "merged-run-1" } });
+    });
+
+    it.each([
+      { wake: "an interaction wake under a closed gate", contextSnapshot: { wakeReason: "issue_commented", ...DEPENDENCY_BLOCKED_SCOPE }, scopeGates: { dependenciesBlocked: true, treeHoldActive: false } },
+      { wake: "a full-scope wake", contextSnapshot: { wakeReason: "issue_commented" }, scopeGates: { dependenciesBlocked: false, treeHoldActive: false } },
+    ])("keeps coalescing $wake into a normal execution run", async ({ contextSnapshot, scopeGates }) => {
+      const writer = createFakeAdmissionWriter();
+      const admit = createAdmitWakeBehindIssueExecution({
+        reader: createFakeAdmissionReader(), writer, helpers: createFakeAdmissionHelpers(),
+      });
+
+      const result = await admit(SCOPE, admissionInput({ contextSnapshot, scopeGates }));
+
+      expect(result).toEqual({ kind: "coalesced", run: { id: "merged-run-1" } });
+    });
+
+    it.each(gates)(
+      "lifts the frozen $gate scope from an existing deferred wake when a full-scope wake merges into it",
+      async ({ frozenScope, lifted }) => {
+        const writer = createFakeAdmissionWriter();
+        const reader = createFakeAdmissionReader({
+          isSameExecutionAgent: vi.fn(async () => false),
+          findExistingDeferredWake: vi.fn(async () => ({
+            id: "deferred-comment",
+            payload: { issueId: "issue-1" },
+            deferredContext: { wakeReason: "issue_commented", wakeCommentId: "comment-2", ...frozenScope },
+            coalescedCount: 0,
+          })),
+        });
+        const admit = createAdmitWakeBehindIssueExecution({ reader, writer, helpers: createFakeAdmissionHelpers() });
+
+        await admit(SCOPE, admissionInput({
+          contextSnapshot: { wakeReason: "issue_children_completed", completedChildIssueId: "blocker-1" },
+          scopeGates: lifted,
+        }));
+
+        const merged = vi.mocked(writer.mergeIntoExistingDeferredWake).mock.calls[0]?.[1].mergedPayload
+          ._paperclipWakeContext as Record<string, unknown>;
+        expect(merged).toMatchObject({ wakeReason: "issue_children_completed", wakeCommentId: "comment-2" });
+        for (const key of Object.keys(frozenScope)) expect(merged).not.toHaveProperty(key);
+      },
+    );
+
+    it.each(gates)(
+      "keeps the frozen $gate scope on an existing deferred wake while the gate stays closed",
+      async ({ frozenScope, stillClosed, stillClosedWakeContext }) => {
+        const writer = createFakeAdmissionWriter();
+        const reader = createFakeAdmissionReader({
+          isSameExecutionAgent: vi.fn(async () => false),
+          findExistingDeferredWake: vi.fn(async () => ({
+            id: "deferred-comment",
+            payload: { issueId: "issue-1" },
+            deferredContext: { wakeReason: "issue_commented", ...frozenScope },
+            coalescedCount: 0,
+          })),
+        });
+        const admit = createAdmitWakeBehindIssueExecution({ reader, writer, helpers: createFakeAdmissionHelpers() });
+
+        await admit(SCOPE, admissionInput({ contextSnapshot: stillClosedWakeContext, scopeGates: stillClosed }));
+
+        const merged = vi.mocked(writer.mergeIntoExistingDeferredWake).mock.calls[0]?.[1].mergedPayload
+          ._paperclipWakeContext as Record<string, unknown>;
+        expect(merged).toMatchObject(frozenScope);
+      },
+    );
   });
 
   it("proceeds, and never reads for an existing deferred wake, when the zombie-run filter leaves no live coalesce target", async () => {

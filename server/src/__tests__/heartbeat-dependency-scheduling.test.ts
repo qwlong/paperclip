@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, inArray, sql } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, onTestFinished, vi } from "vitest";
 import {
   costEvents,
   activityLog,
@@ -852,6 +852,214 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       .update(heartbeatRuns)
       .set({ status: "succeeded", finishedAt: new Date(), updatedAt: new Date() })
       .where(eq(heartbeatRuns.id, activeRunId));
+  });
+
+  async function seedInteractionScopedIssue(gate: "dependency" | "treeHold", options: { blockerCount?: number } = {}) {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const sourceIssueId = randomUUID();
+    const blockerIssueIds = Array.from({ length: options.blockerCount ?? 1 }, () => randomUUID());
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `R${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "responsible-user", status: "active", membershipRole: "member" });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: sourceIssueId, companyId, title: "Source", status: gate === "dependency" ? "blocked" : "todo", priority: "medium",
+      assigneeAgentId: agentId, responsibleUserId: "responsible-user",
+    });
+    let holdId: string | null = null;
+    if (gate === "dependency") {
+      await db.insert(issues).values(blockerIssueIds.map((id) => ({
+        id, companyId, title: "Review", status: "in_progress", priority: "medium", responsibleUserId: "responsible-user",
+      })));
+      await db.insert(issueRelations).values(blockerIssueIds.map((id) => ({
+        companyId, issueId: id, relatedIssueId: sourceIssueId, type: "blocks",
+      })));
+    } else {
+      const [hold] = await db.insert(issueTreeHolds).values({
+        companyId, rootIssueId: sourceIssueId, mode: "pause", status: "active", reason: "hold", releasePolicy: { strategy: "manual" },
+      }).returning();
+      holdId = hold.id;
+    }
+
+    let finishInteractionRun!: () => void;
+    const interactionRunCanFinish = new Promise<void>((resolve) => { finishInteractionRun = resolve; });
+    onTestFinished(() => finishInteractionRun());
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await interactionRunCanFinish;
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "Answered the comment.", provider: "test", model: "test-model" };
+    });
+
+    const commentId = randomUUID();
+    await db.insert(issueComments).values({
+      id: commentId, companyId, issueId: sourceIssueId, authorType: "user", authorUserId: "responsible-user", body: "Review verdict.",
+    });
+    const interactionRun = await heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_commented",
+      payload: { issueId: sourceIssueId, commentId },
+      requestedByActorType: "user",
+      requestedByActorId: "responsible-user",
+      contextSnapshot: {
+        issueId: sourceIssueId, commentId, wakeCommentId: commentId, wakeReason: "issue_commented", source: "issue.comment",
+      },
+    });
+    expect(interactionRun).not.toBeNull();
+    expect(await waitForCondition(async () => {
+      const run = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, interactionRun!.id)).then((rows) => rows[0]);
+      return run?.status === "running";
+    })).toBe(true);
+    const interactionContext = await db.select({ contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, interactionRun!.id)).then((rows) => rows[0]?.contextSnapshot);
+    expect(interactionContext).toMatchObject(
+      gate === "dependency" ? { dependencyBlockedInteraction: true } : { treeHoldInteraction: true },
+    );
+
+    return { agentId, sourceIssueId, blockerIssueIds, holdId, interactionRunId: interactionRun!.id, finishInteractionRun };
+  }
+
+  it.each([
+    { gate: "dependency" as const, scopeKey: "dependencyBlockedInteraction", readyReason: "issue_children_completed" },
+    { gate: "treeHold" as const, scopeKey: "treeHoldInteraction", readyReason: "issue_tree_resumed" },
+  ])(
+    "a wake that grants full execution scope is never absorbed by a $scopeKey run; the owner gets a normal execution round",
+    async ({ gate, scopeKey, readyReason }) => {
+      const seeded = await seedInteractionScopedIssue(gate);
+
+      if (gate === "dependency") {
+        await db.update(issues).set({ status: "done", updatedAt: new Date() }).where(eq(issues.id, seeded.blockerIssueIds[0]!));
+      } else {
+        await db.update(issueTreeHolds).set({ status: "released", releasedAt: new Date(), updatedAt: new Date() })
+          .where(eq(issueTreeHolds.id, seeded.holdId!));
+      }
+      const readyIdempotencyKey = `${readyReason}:${seeded.sourceIssueId}`;
+      await heartbeat.wakeup(seeded.agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: readyReason,
+        payload: { issueId: seeded.sourceIssueId, completedChildIssueId: seeded.blockerIssueIds[0] },
+        idempotencyKey: readyIdempotencyKey,
+        contextSnapshot: { issueId: seeded.sourceIssueId, wakeReason: readyReason },
+      });
+
+      const readyWake = await db.select({ status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
+        .from(agentWakeupRequests).where(eq(agentWakeupRequests.idempotencyKey, readyIdempotencyKey));
+      seeded.finishInteractionRun();
+      expect(readyWake).toEqual([{ status: "deferred_issue_execution", runId: null }]);
+
+      const followUpRun = async () => db.select().from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.agentId, seeded.agentId),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${seeded.sourceIssueId}`,
+          sql`${heartbeatRuns.id} <> ${seeded.interactionRunId}`,
+        ))
+        .then((rows) => rows[0] ?? null);
+      expect(await waitForCondition(async () => (await followUpRun())?.status === "succeeded", 10_000)).toBe(true);
+      const followUp = await followUpRun();
+      expect(followUp?.contextSnapshot).toMatchObject({ wakeReason: readyReason });
+      expect(followUp?.contextSnapshot).not.toHaveProperty(scopeKey);
+    },
+  );
+
+  it("still coalesces a dependency wake into the dependency-blocked interaction run while other blockers stay unresolved", async () => {
+    const seeded = await seedInteractionScopedIssue("dependency", { blockerCount: 2 });
+
+    await db.update(issues).set({ status: "done", updatedAt: new Date() }).where(eq(issues.id, seeded.blockerIssueIds[0]!));
+    const partialIdempotencyKey = `issue_children_completed:${seeded.sourceIssueId}:${seeded.blockerIssueIds[0]}`;
+    await heartbeat.wakeup(seeded.agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_children_completed",
+      payload: { issueId: seeded.sourceIssueId, completedChildIssueId: seeded.blockerIssueIds[0] },
+      idempotencyKey: partialIdempotencyKey,
+      contextSnapshot: { issueId: seeded.sourceIssueId, wakeReason: "issue_children_completed" },
+    });
+
+    const partialWake = await db.select({ status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
+      .from(agentWakeupRequests).where(eq(agentWakeupRequests.idempotencyKey, partialIdempotencyKey));
+    seeded.finishInteractionRun();
+    expect(partialWake).toEqual([{ status: "coalesced", runId: seeded.interactionRunId }]);
+  });
+
+  it("still coalesces a second comment into a queued tree-hold interaction run while the hold stays active", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const busyIssueId = randomUUID();
+    const heldIssueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `Q${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "responsible-user", status: "active", membershipRole: "member" });
+    await db.insert(agents).values({
+      id: agentId, companyId, name: "CodexCoder", role: "engineer", status: "active", adapterType: "codex_local", adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } }, permissions: {},
+    });
+    await db.insert(issues).values([
+      { id: busyIssueId, companyId, title: "Busy", status: "todo", priority: "medium", assigneeAgentId: agentId, responsibleUserId: "responsible-user" },
+      { id: heldIssueId, companyId, title: "Held", status: "todo", priority: "medium", assigneeAgentId: agentId, responsibleUserId: "responsible-user" },
+    ]);
+    await db.insert(issueTreeHolds).values({
+      companyId, rootIssueId: heldIssueId, mode: "pause", status: "active", reason: "hold", releasePolicy: { strategy: "manual" },
+    });
+
+    let finishBusyRun!: () => void;
+    const busyRunCanFinish = new Promise<void>((resolve) => { finishBusyRun = resolve; });
+    onTestFinished(() => finishBusyRun());
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await busyRunCanFinish;
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "Busy run.", provider: "test", model: "test-model" };
+    });
+    const busyRun = await heartbeat.wakeup(agentId, {
+      source: "assignment", triggerDetail: "system", reason: "issue_assigned",
+      payload: { issueId: busyIssueId }, contextSnapshot: { issueId: busyIssueId, wakeReason: "issue_assigned" },
+    });
+    expect(await waitForCondition(async () => {
+      const run = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, busyRun!.id)).then((rows) => rows[0]);
+      return run?.status === "running";
+    })).toBe(true);
+
+    const commentWake = async (idempotencyKey: string) => {
+      const commentId = randomUUID();
+      await db.insert(issueComments).values({
+        id: commentId, companyId, issueId: heldIssueId, authorType: "user", authorUserId: "responsible-user", body: "Question.",
+      });
+      return heartbeat.wakeup(agentId, {
+        source: "automation", triggerDetail: "system", reason: "issue_commented",
+        payload: { issueId: heldIssueId, commentId },
+        requestedByActorType: "user", requestedByActorId: "responsible-user", idempotencyKey,
+        contextSnapshot: { issueId: heldIssueId, commentId, wakeCommentId: commentId, wakeReason: "issue_commented", source: "issue.comment" },
+      });
+    };
+    const interactionRun = await commentWake(`first-comment:${heldIssueId}`);
+    const queued = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, interactionRun!.id)).then((rows) => rows[0]);
+    await commentWake(`second-comment:${heldIssueId}`);
+    const secondWake = await db.select({ status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
+      .from(agentWakeupRequests).where(eq(agentWakeupRequests.idempotencyKey, `second-comment:${heldIssueId}`));
+    finishBusyRun();
+
+    expect(queued).toMatchObject({ status: "queued", contextSnapshot: expect.objectContaining({ treeHoldInteraction: true }) });
+    expect(secondWake).toEqual([{ status: "coalesced", runId: interactionRun!.id }]);
   });
 
   it("honors maxConcurrentRuns 1 by leaving a second assignment wake queued", async () => {
