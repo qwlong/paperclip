@@ -35,8 +35,9 @@ function callSite(): string {
   const stack = new Error().stack ?? "";
   Error.stackTraceLimit = limit;
   const frames = stack.split("\n").slice(1);
-  return frames.filter(frame => !frame.includes("node_modules") && !frame.includes("node:")
-    && !frame.includes("pool-reentry.ts")).slice(0, 12).join("\n");
+  const applicationFrames = frames.filter(frame => !frame.includes("node_modules") && !frame.includes("node:")
+    && !frame.includes("pool-reentry.ts"));
+  return (applicationFrames.length ? applicationFrames : frames).slice(0, 12).join("\n");
 }
 
 export function setPoolReentryHandler(client: RootClient, handler: PoolReentryHandler) {
