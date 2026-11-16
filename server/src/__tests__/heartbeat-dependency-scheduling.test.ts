@@ -854,7 +854,10 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       .where(eq(heartbeatRuns.id, activeRunId));
   });
 
-  async function seedInteractionScopedIssue(gate: "dependency" | "treeHold", options: { blockerCount?: number } = {}) {
+  async function seedIssueRun(
+    gate: "dependency" | "treeHold" | "none",
+    options: { blockerCount?: number; queued?: boolean } = {},
+  ) {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const sourceIssueId = randomUUID();
@@ -891,11 +894,32 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       await db.insert(issueRelations).values(blockerIssueIds.map((id) => ({
         companyId, issueId: id, relatedIssueId: sourceIssueId, type: "blocks",
       })));
-    } else {
+    } else if (gate === "treeHold") {
       const [hold] = await db.insert(issueTreeHolds).values({
         companyId, rootIssueId: sourceIssueId, mode: "pause", status: "active", reason: "hold", releasePolicy: { strategy: "manual" },
       }).returning();
       holdId = hold.id;
+    }
+
+    let finishBusyRun = () => {};
+    if (options.queued) {
+      const busyIssueId = randomUUID();
+      await db.insert(issues).values({
+        id: busyIssueId, companyId, title: "Busy", status: "todo", priority: "medium",
+        assigneeAgentId: agentId, responsibleUserId: "responsible-user",
+      });
+      const busyRunCanFinish = new Promise<void>((resolve) => { finishBusyRun = resolve; });
+      onTestFinished(() => finishBusyRun());
+      mockAdapterExecute.mockImplementationOnce(async () => {
+        await busyRunCanFinish;
+        await db.update(issues).set({ status: "done" }).where(eq(issues.id, busyIssueId));
+        return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "Busy work finished.", provider: "test", model: "test-model" };
+      });
+      await heartbeat.wakeup(agentId, {
+        source: "assignment", triggerDetail: "system", reason: "issue_assigned",
+        payload: { issueId: busyIssueId }, contextSnapshot: { issueId: busyIssueId, wakeReason: "issue_assigned" },
+      });
+      expect(await waitForCondition(async () => mockAdapterExecute.mock.calls.length === 1, 10_000)).toBe(true);
     }
 
     let finishInteractionRun!: () => void;
@@ -924,24 +948,39 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     expect(interactionRun).not.toBeNull();
     expect(await waitForCondition(async () => {
       const run = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, interactionRun!.id)).then((rows) => rows[0]);
-      return run?.status === "running";
+      return run?.status === (options.queued ? "queued" : "running");
     })).toBe(true);
+    if (!options.queued) {
+      expect(await waitForCondition(async () => mockAdapterExecute.mock.calls.length === 1, 10_000)).toBe(true);
+    }
     const interactionContext = await db.select({ contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, interactionRun!.id)).then((rows) => rows[0]?.contextSnapshot);
-    expect(interactionContext).toMatchObject(
-      gate === "dependency" ? { dependencyBlockedInteraction: true } : { treeHoldInteraction: true },
-    );
+    if (gate === "none") {
+      expect(interactionContext).not.toHaveProperty("dependencyBlockedInteraction");
+      expect(interactionContext).not.toHaveProperty("treeHoldInteraction");
+    } else {
+      expect(interactionContext).toMatchObject(
+        gate === "dependency" ? { dependencyBlockedInteraction: true } : { treeHoldInteraction: true },
+      );
+    }
 
-    return { agentId, sourceIssueId, blockerIssueIds, holdId, interactionRunId: interactionRun!.id, finishInteractionRun };
+    return { companyId, agentId, sourceIssueId, blockerIssueIds, holdId, interactionRunId: interactionRun!.id, finishInteractionRun, finishBusyRun };
   }
 
   it.each([
     { gate: "dependency" as const, scopeKey: "dependencyBlockedInteraction", readyReason: "issue_children_completed" },
     { gate: "treeHold" as const, scopeKey: "treeHoldInteraction", readyReason: "issue_tree_resumed" },
-  ])(
-    "a wake that grants full execution scope is never absorbed by a $scopeKey run; the owner gets a normal execution round",
-    async ({ gate, scopeKey, readyReason }) => {
-      const seeded = await seedInteractionScopedIssue(gate);
+  ].flatMap((gate) => (["running", "queued", "finished"] as const).map((phase) => ({ ...gate, phase }))))(
+    "a wake that grants full execution scope after a $scopeKey run is $phase reaches a normal execution round",
+    async ({ gate, scopeKey, readyReason, phase }) => {
+      const seeded = await seedIssueRun(gate, { queued: phase === "queued" });
+
+      if (phase === "finished") {
+        seeded.finishInteractionRun();
+        await heartbeat.waitForRunExecutionDrain(seeded.interactionRunId);
+        const [finished] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.interactionRunId));
+        expect(finished.status).toBe("succeeded");
+      }
 
       if (gate === "dependency") {
         await db.update(issues).set({ status: "done", updatedAt: new Date() }).where(eq(issues.id, seeded.blockerIssueIds[0]!));
@@ -961,8 +1000,14 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
 
       const readyWake = await db.select({ status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
         .from(agentWakeupRequests).where(eq(agentWakeupRequests.idempotencyKey, readyIdempotencyKey));
+      seeded.finishBusyRun();
       seeded.finishInteractionRun();
-      expect(readyWake).toEqual([{ status: "deferred_issue_execution", runId: null }]);
+      if (phase !== "finished") {
+        expect(readyWake).toEqual([{ status: "deferred_issue_execution", runId: null }]);
+      } else {
+        expect(readyWake).toHaveLength(1);
+        expect(readyWake[0]?.runId).not.toBe(seeded.interactionRunId);
+      }
 
       const followUpRun = async () => db.select().from(heartbeatRuns)
         .where(and(
@@ -975,11 +1020,17 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       const followUp = await followUpRun();
       expect(followUp?.contextSnapshot).toMatchObject({ wakeReason: readyReason });
       expect(followUp?.contextSnapshot).not.toHaveProperty(scopeKey);
+      const [original] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.interactionRunId));
+      expect(original.contextSnapshot).toHaveProperty(scopeKey, true);
+      const adapterContexts = (mockAdapterExecute.mock.calls as unknown as Array<[{ context: Record<string, unknown> }]>)
+        .map(([call]) => call.context);
+      expect(adapterContexts).toContainEqual(expect.objectContaining({ issueId: seeded.sourceIssueId, wakeReason: readyReason }));
+      expect(adapterContexts.find((context) => context.wakeReason === readyReason)).not.toHaveProperty(scopeKey);
     },
   );
 
   it("still coalesces a dependency wake into the dependency-blocked interaction run while other blockers stay unresolved", async () => {
-    const seeded = await seedInteractionScopedIssue("dependency", { blockerCount: 2 });
+    const seeded = await seedIssueRun("dependency", { blockerCount: 2 });
 
     await db.update(issues).set({ status: "done", updatedAt: new Date() }).where(eq(issues.id, seeded.blockerIssueIds[0]!));
     const partialIdempotencyKey = `issue_children_completed:${seeded.sourceIssueId}:${seeded.blockerIssueIds[0]}`;
@@ -996,6 +1047,40 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       .from(agentWakeupRequests).where(eq(agentWakeupRequests.idempotencyKey, partialIdempotencyKey));
     seeded.finishInteractionRun();
     expect(partialWake).toEqual([{ status: "coalesced", runId: seeded.interactionRunId }]);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.interactionRunId));
+    expect(run.contextSnapshot).toHaveProperty("dependencyBlockedInteraction", true);
+  });
+
+  it("preserves normal-run coalescing and defers a real comment to its own follow-up", async () => {
+    const seeded = await seedIssueRun("none");
+    await heartbeat.wakeup(seeded.agentId, {
+      source: "automation", triggerDetail: "system", reason: "issue_children_completed",
+      payload: { issueId: seeded.sourceIssueId }, idempotencyKey: "normal-ready-wake",
+      contextSnapshot: { issueId: seeded.sourceIssueId, wakeReason: "issue_children_completed" },
+    });
+    const commentId = randomUUID();
+    await db.insert(issueComments).values({
+      id: commentId, companyId: seeded.companyId, issueId: seeded.sourceIssueId,
+      authorType: "user", authorUserId: "responsible-user", body: "Follow-up question.",
+    });
+    await heartbeat.wakeup(seeded.agentId, {
+      source: "automation", triggerDetail: "system", reason: "issue_commented",
+      payload: { issueId: seeded.sourceIssueId, commentId }, idempotencyKey: "normal-comment-wake",
+      requestedByActorType: "user", requestedByActorId: "responsible-user",
+      contextSnapshot: { issueId: seeded.sourceIssueId, wakeCommentId: commentId, commentId, wakeReason: "issue_commented", source: "issue.comment" },
+    });
+    const receipts = await db.select({ key: agentWakeupRequests.idempotencyKey, status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
+      .from(agentWakeupRequests).where(inArray(agentWakeupRequests.idempotencyKey, ["normal-ready-wake", "normal-comment-wake"]));
+    seeded.finishInteractionRun();
+    expect(receipts).toEqual(expect.arrayContaining([
+      { key: "normal-ready-wake", status: "coalesced", runId: seeded.interactionRunId },
+      { key: "normal-comment-wake", status: "deferred_issue_execution", runId: null },
+    ]));
+    expect(await waitForCondition(async () => {
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, seeded.agentId));
+      return runs.some((run) => run.id !== seeded.interactionRunId && run.status === "succeeded"
+        && run.contextSnapshot?.wakeCommentId === commentId);
+    }, 10_000)).toBe(true);
   });
 
   it("still coalesces a second comment into a queued tree-hold interaction run while the hold stays active", async () => {

@@ -1331,6 +1331,26 @@ describe("admitWakeBehindIssueExecution", () => {
         expect(merged).toMatchObject(frozenScope);
       },
     );
+
+    it.each([
+      { scopeGates: { dependenciesBlocked: true, treeHoldActive: false }, retained: DEPENDENCY_BLOCKED_SCOPE, removed: TREE_HOLD_SCOPE },
+      { scopeGates: { dependenciesBlocked: false, treeHoldActive: true }, retained: TREE_HOLD_SCOPE, removed: DEPENDENCY_BLOCKED_SCOPE },
+    ])("clears only the open gate in a deferred wake with both scopes: $scopeGates", async ({ scopeGates, retained, removed }) => {
+      const writer = createFakeAdmissionWriter();
+      const deferredContext = { wakeCommentId: "comment-2", ...DEPENDENCY_BLOCKED_SCOPE, ...TREE_HOLD_SCOPE };
+      const reader = createFakeAdmissionReader({
+        isSameExecutionAgent: vi.fn(async () => false),
+        findExistingDeferredWake: vi.fn(async () => ({
+          id: "deferred-comment", payload: { issueId: "issue-1" }, deferredContext, coalescedCount: 0,
+        })),
+      });
+      const admit = createAdmitWakeBehindIssueExecution({ reader, writer, helpers: createFakeAdmissionHelpers() });
+      await admit(SCOPE, admissionInput({ scopeGates, contextSnapshot: { wakeReason: "issue_commented", ...retained } }));
+      const merged = vi.mocked(writer.mergeIntoExistingDeferredWake).mock.calls[0]?.[1].mergedPayload._paperclipWakeContext;
+      expect(merged).toMatchObject({ wakeCommentId: "comment-2", ...retained });
+      for (const key of Object.keys(removed)) expect(merged).not.toHaveProperty(key);
+      expect(deferredContext).toMatchObject({ ...DEPENDENCY_BLOCKED_SCOPE, ...TREE_HOLD_SCOPE });
+    });
   });
 
   it("proceeds, and never reads for an existing deferred wake, when the zombie-run filter leaves no live coalesce target", async () => {

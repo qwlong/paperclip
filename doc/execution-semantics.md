@@ -294,6 +294,14 @@ Use it for:
 
 Blocked issues should stay idle while blockers remain unresolved. Paperclip should not create a queued heartbeat run for that issue until the final blocker is done and the `issue_blockers_resolved` wake can start real work.
 
+Verified interaction wakes may admit a bounded reply/triage run while dependencies
+or a tree pause hold remain active. That run keeps its admitted scope even after
+the gate opens. A newly admitted broader wake must wait for its own execution
+round instead of coalescing into the narrower run, including when that run is
+still queued. Pending deferred wakes may drop scope fields only for gates that
+have opened; unresolved gates and comment context remain intact. Ordinary wake
+coalescing and real-comment follow-up rules are unchanged.
+
 `cancelled` is terminal for the blocker issue itself, but it does not satisfy the dependency. A cancelled blocker edge remains unresolved until the edge is removed or replaced, and Paperclip must surface blocker attention on the dependent regardless of whether that dependent is currently displayed as `blocked`, `todo`, `backlog`, or another non-terminal agent-owned status.
 
 If a parent is truly waiting on a child, model that with blockers. Do not rely on the parent/child relationship alone.

@@ -913,7 +913,7 @@ export function createAdmitWakeBehindIssueExecution(deps: {
           });
 
     if (existingDeferred && !existingDeferred.payload?.interactionId && !existingDeferred.deferredContext.interactionId) {
-      const mergedDeferredContext = ((c: Record<string, unknown>, _g: unknown) => c)(
+      const mergedDeferredContext = withoutScopeOfOpenGates(
         deps.helpers.mergeCoalescedContextSnapshot(
           existingDeferred.deferredContext,
           input.contextSnapshot,
